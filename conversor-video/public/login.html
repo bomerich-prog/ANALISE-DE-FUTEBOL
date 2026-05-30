@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Login — PitchView</title>
+  <link rel="stylesheet" href="/css/style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body class="auth-page" data-page="login">
+  <div class="auth-wrap">
+    <div class="auth-brand">
+      <div class="brand-mark">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="2" y="4" width="20" height="16" rx="1"/>
+          <line x1="12" y1="4" x2="12" y2="20"/>
+          <circle cx="12" cy="12" r="3"/>
+        </svg>
+      </div>
+      <h1>PitchView</h1>
+      <p>Performance Analytics</p>
+    </div>
+
+    <div class="auth-card">
+      <h2>Acesso à plataforma</h2>
+      <p class="auth-lead">Entre com suas credenciais de analista</p>
+
+      <div class="error-box hidden" id="errorBox" role="alert"></div>
+
+      <form id="authForm" class="auth-form">
+        <label class="field">
+          <span>Email</span>
+          <input type="email" id="email" required autocomplete="email" placeholder="analista@clube.com">
+        </label>
+        <label class="field">
+          <span>Senha</span>
+          <input type="password" id="password" required autocomplete="current-password" placeholder="••••••••" minlength="6">
+        </label>
+        <button type="submit" class="btn btn-primary" id="submitBtn">Entrar</button>
+      </form>
+
+      <p class="auth-footer">
+        Sem conta? <a href="/cadastro.html">Solicitar cadastro</a>
+      </p>
+    </div>
+  </div>
+  <script type="module" src="/js/auth.js"></script>
+</body>
+</html>
