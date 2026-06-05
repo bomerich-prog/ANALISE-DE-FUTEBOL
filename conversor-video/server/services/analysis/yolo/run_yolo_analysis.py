@@ -4,6 +4,8 @@
 import argparse
 import json
 import math
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -67,6 +69,36 @@ def open_writer(output_path, fps, width, height):
     return writer
 
 
+def finalize_browser_video(raw_output_path, final_output_path):
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raw_output_path.replace(final_output_path)
+        return
+
+    command = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(raw_output_path),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        "-an",
+        str(final_output_path),
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    if completed.returncode != 0:
+        raw_output_path.replace(final_output_path)
+        return
+
+    raw_output_path.unlink(missing_ok=True)
+
+
 def analyze(args):
     input_path = Path(args.input)
     output_path = Path(args.output)
@@ -82,7 +114,8 @@ def analyze(args):
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    writer = open_writer(output_path, fps, width, height)
+    raw_output_path = output_path.with_name(f"{output_path.stem}.opencv{output_path.suffix}")
+    writer = open_writer(raw_output_path, fps, width, height)
 
     emit(
         {
@@ -169,6 +202,7 @@ def analyze(args):
 
     capture.release()
     writer.release()
+    finalize_browser_video(raw_output_path, output_path)
 
     avg_player_confidence = (
         confidence_sum["Player"] / confidence_count["Player"] if confidence_count["Player"] else 0
