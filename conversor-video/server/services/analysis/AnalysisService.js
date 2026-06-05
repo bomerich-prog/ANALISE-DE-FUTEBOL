@@ -1,5 +1,6 @@
 const { db } = require('../../db');
 const MockAnalysisProvider = require('./MockAnalysisProvider');
+const YoloAnalysisProvider = require('./yolo/YoloAnalysisProvider');
 const progressStore = require('./progressStore');
 const {
   setAnalysisStatus,
@@ -19,12 +20,105 @@ class AnalysisService {
   }
 
   getProvider() {
-    const type = process.env.ANALYSIS_PROVIDER || 'mock';
+    const type = process.env.ANALYSIS_PROVIDER || 'yolo';
     switch (type) {
       case 'mock':
-      default:
         return new MockAnalysisProvider();
+      case 'yolo':
+      case 'ultralytics':
+        return new YoloAnalysisProvider();
+      default:
+        throw new Error(`Provider de análise inválido: ${type}`);
     }
+  }
+
+  getProgressStatsFromResult(result) {
+    const metrics = result?.metrics || {};
+    return {
+      frames_processed: metrics.frames_processed || 0,
+      players_detected: metrics.players_detected || 0,
+      ball_detected: Boolean(metrics.ball_detected),
+    };
+  }
+
+  sanitizeAnalysisResult(resultJson, analysisId) {
+    if (!resultJson || typeof resultJson !== 'object') return {};
+    const result = JSON.parse(JSON.stringify(resultJson));
+    if (result.artifacts?.processed_video_path) {
+      delete result.artifacts.processed_video_path;
+      result.artifacts.processed_video_url = `/api/analyses/${analysisId}/video`;
+    }
+    return result;
+  }
+
+  getAnalysisVideoPath(userId, analysisId) {
+    const row = db
+      .prepare(
+        `SELECT a.result_json
+         FROM analyses a
+         WHERE a.id = ? AND a.user_id = ?`
+      )
+      .get(analysisId, userId);
+
+    if (!row?.result_json) return null;
+
+    const result = JSON.parse(row.result_json);
+    return result?.artifacts?.processed_video_path || null;
+  }
+
+  getVideoForAnalysis(userId, videoId) {
+    return db
+      .prepare(
+        `SELECT id, video_name, pipeline_status
+         FROM conversions
+         WHERE id = ? AND user_id = ?`
+      )
+      .get(videoId, userId);
+  }
+
+  getLatestAnalysisForVideo(userId, videoId) {
+    const row = db
+      .prepare(
+        `SELECT a.*, c.video_name
+         FROM analyses a
+         JOIN conversions c ON c.id = a.video_id
+         WHERE a.video_id = ? AND a.user_id = ?
+         ORDER BY a.created_at DESC
+         LIMIT 1`
+      )
+      .get(videoId, userId);
+
+    return this.mapAnalysisRow(row);
+  }
+
+  mapAnalysisRow(row) {
+    if (!row) return null;
+
+    const progress = progressStore.get(row.id);
+    const resultJson = row.result_json ? JSON.parse(row.result_json) : {};
+    const progressStats = progress.progress_stats || this.getProgressStatsFromResult(resultJson);
+    const resolvedProgress =
+      progress.message || progress.progress
+        ? progress.progress
+        : row.status === ANALYSIS_STATUS.COMPLETED
+          ? 100
+          : 0;
+    const resolvedMessage =
+      progress.message ||
+      (row.status === ANALYSIS_STATUS.COMPLETED ? 'Análise concluída com sucesso.' : '');
+
+    return {
+      id: row.id,
+      video_id: row.video_id,
+      video_name: row.video_name,
+      status: row.status,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      result_json: this.sanitizeAnalysisResult(resultJson, row.id),
+      progress: resolvedProgress,
+      message: resolvedMessage,
+      progress_stats: progressStats,
+    };
   }
 
   /**
@@ -71,9 +165,11 @@ class AnalysisService {
     return {
       id: analysisId,
       video_id: videoId,
+      video_name: video.video_name,
       status: ANALYSIS_STATUS.ANALYZING,
       progress: 0,
       message: 'Iniciando análise...',
+      progress_stats: { frames_processed: 0, players_detected: 0, ball_detected: false },
     };
   }
 
@@ -82,13 +178,17 @@ class AnalysisService {
     this.running.add(analysisId);
 
     this.provider
-      .analyze(analysisId, videoId, userId, (progress, message) => {
-        progressStore.set(analysisId, { progress, message });
+      .analyze(analysisId, videoId, userId, (progress, message, details = {}) => {
+        progressStore.set(analysisId, { progress, message, ...details });
       })
       .then((result) => {
         setAnalysisStatus(analysisId, ANALYSIS_STATUS.COMPLETED, result);
         setVideoPipelineStatus(videoId, userId, PIPELINE_STATUS.ANALYSIS_COMPLETE);
-        progressStore.set(analysisId, { progress: 100, message: 'Análise concluída com sucesso.' });
+        progressStore.set(analysisId, {
+          progress: 100,
+          message: 'Análise concluída com sucesso.',
+          progress_stats: this.getProgressStatsFromResult(result),
+        });
       })
       .catch((err) => {
         console.error('Erro na análise:', err);
@@ -113,21 +213,7 @@ class AnalysisService {
       )
       .get(analysisId, userId);
 
-    if (!row) return null;
-
-    const progress = progressStore.get(analysisId);
-
-    return {
-      id: row.id,
-      video_id: row.video_id,
-      video_name: row.video_name,
-      status: row.status,
-      created_at: row.created_at,
-      updated_at: row.updated_at,
-      result_json: row.result_json ? JSON.parse(row.result_json) : {},
-      progress: progress.progress,
-      message: progress.message,
-    };
+    return this.mapAnalysisRow(row);
   }
 
   listAnalyses(userId) {

@@ -2,6 +2,7 @@ import { FFmpeg } from 'https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist
 import { fetchFile, toBlobURL } from 'https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/dist/esm/index.js';
 import { escapeHtml, formatSize } from './utils.js';
 import { startAnalysis } from './analysisClient.js';
+import { openAnalysisVisualization } from './analysisViewer.js';
 import {
   PIPELINE_STATUS,
   PIPELINE_STEPS,
@@ -220,6 +221,9 @@ async function runAnalysis(cardId) {
 
   try {
     await startAnalysis(video.videoId, {
+      onStarted: (analysis) => {
+        openAnalysisVisualization({ analysisId: analysis.id });
+      },
       onProgress: (pct, msg) => {
         updateAnalysisProgress(cardId, pct, msg);
         setPipelineStatus(cardId, PIPELINE_STATUS.ANALYZING);

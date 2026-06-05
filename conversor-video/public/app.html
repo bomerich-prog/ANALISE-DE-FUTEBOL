@@ -318,6 +318,7 @@
                   <th>Data</th>
                   <th>Status</th>
                   <th>Formato original</th>
+                  <th>Ações</th>
                 </tr>
               </thead>
               <tbody id="analysesTableBody"></tbody>
@@ -367,9 +368,71 @@
     </main>
   </div>
 
+  <div class="analysis-modal hidden" id="analysisVisualization" role="dialog" aria-modal="true" aria-labelledby="analysisVisualizationTitle">
+    <div class="analysis-modal-backdrop" data-analysis-close></div>
+    <section class="analysis-modal-panel">
+      <header class="analysis-modal-header">
+        <div>
+          <p class="analysis-kicker">YOLOv8 · Ultralytics</p>
+          <h2 id="analysisVisualizationTitle">Visualização da Análise</h2>
+          <p id="analysisVideoName">Aguardando vídeo...</p>
+        </div>
+        <button type="button" class="btn-icon" data-analysis-close aria-label="Fechar visualização">&times;</button>
+      </header>
+
+      <div class="analysis-visual-grid">
+        <div class="analysis-player-card">
+          <div class="analysis-video-placeholder" id="analysisVideoPlaceholder">
+            <div class="spinner"></div>
+            <span>O vídeo processado aparecerá quando a análise terminar.</span>
+          </div>
+          <video class="analysis-video hidden" id="analysisProcessedVideo" controls playsinline></video>
+        </div>
+
+        <aside class="analysis-sidebar">
+          <div class="analysis-status-card">
+            <span class="analysis-status-label">Status da análise</span>
+            <strong id="analysisStatusText">Aguardando</strong>
+            <p id="analysisStatusMessage">Pronto para iniciar YOLO.</p>
+            <div class="progress-track progress-track--analysis">
+              <div class="progress-bar-fill progress-bar-fill--analysis" id="analysisViewerProgress"></div>
+            </div>
+            <span class="analysis-progress-text" id="analysisViewerProgressText">0%</span>
+          </div>
+
+          <div class="analysis-metrics-grid">
+            <article>
+              <span>Jogadores detectados</span>
+              <strong id="analysisPlayersCount">0</strong>
+            </article>
+            <article>
+              <span>Bola detectada</span>
+              <strong id="analysisBallFound">Não</strong>
+            </article>
+            <article>
+              <span>Frames processados</span>
+              <strong id="analysisFramesProcessed">0</strong>
+            </article>
+          </div>
+
+          <div class="analysis-pipeline-card">
+            <h3>Arquitetura modular</h3>
+            <ol>
+              <li class="done">YOLO</li>
+              <li>Tracking</li>
+              <li>Extração de Features</li>
+              <li>Machine Learning</li>
+            </ol>
+          </div>
+        </aside>
+      </div>
+    </section>
+  </div>
+
   <script type="module" src="/js/layout.js"></script>
   <script type="module" src="/js/dashboard.js"></script>
   <script type="module" src="/js/settings.js"></script>
+  <script type="module" src="/js/analysisViewer.js"></script>
   <script type="module" src="/js/analyses.js"></script>
   <script type="module" src="/js/app.js"></script>
   <script type="module" src="/js/history.js"></script>

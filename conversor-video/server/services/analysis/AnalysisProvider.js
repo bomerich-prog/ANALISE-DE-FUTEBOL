@@ -8,8 +8,10 @@ const { PIPELINE_STATUS, ANALYSIS_STATUS } = require('../../constants/pipelineSt
  * @typedef {Object} AnalysisResult
  * @property {string} version
  * @property {Object} metrics
- * @property {Object} [tracks]
- * @property {Object} [events]
+ * @property {Object} [detections]
+ * @property {Object} [tracking]
+ * @property {Object} [features]
+ * @property {Object} [machine_learning]
  */
 
 class AnalysisProvider {
@@ -26,9 +28,9 @@ class AnalysisProvider {
   }
 }
 
-function updateAnalysisProgress(analysisId, progress, message) {
+function updateAnalysisProgress(analysisId, progress, message, details = {}) {
   const progressStore = require('./progressStore');
-  progressStore.set(analysisId, { progress, message });
+  progressStore.set(analysisId, { progress, message, ...details });
 }
 
 function setAnalysisStatus(analysisId, status, resultJson = null) {
