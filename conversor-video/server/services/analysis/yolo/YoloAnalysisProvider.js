@@ -4,15 +4,23 @@ const path = require('path');
 
 const { db, dataDir } = require('../../../db');
 const { AnalysisProvider, updateAnalysisProgress } = require('../AnalysisProvider');
+const { resolvePythonCached } = require('./pythonResolver');
+
+const WINDOWS_STORE_ALIAS_HINT =
+  'O Windows tentou abrir o atalho da Microsoft Store para Python. Instale o Python a partir de https://www.python.org/downloads/ (marcando "Add Python to PATH") ou desabilite o alias em Configurações > Aplicativos > Configurações avançadas do aplicativo > Aliases de execução do aplicativo, e reinicie o servidor. Alternativamente, defina YOLO_PYTHON_BIN apontando para um python.exe válido (ex.: "py -3").';
 
 class YoloAnalysisProvider extends AnalysisProvider {
   constructor(options = {}) {
     super();
-    this.pythonBin = options.pythonBin || process.env.YOLO_PYTHON_BIN || 'python3';
+    this.pythonBinOption = options.pythonBin || process.env.YOLO_PYTHON_BIN || null;
     this.model = options.model || process.env.YOLO_MODEL || 'yolov8n.pt';
     this.confidence = options.confidence || process.env.YOLO_CONFIDENCE || '0.25';
     this.imageSize = options.imageSize || process.env.YOLO_IMAGE_SIZE || '640';
     this.workerPath = options.workerPath || path.join(__dirname, 'run_yolo_analysis.py');
+  }
+
+  resolvePython() {
+    return resolvePythonCached({ pythonBin: this.pythonBinOption });
   }
 
   async analyze(analysisId, videoId, userId, onProgress) {
@@ -32,7 +40,7 @@ class YoloAnalysisProvider extends AnalysisProvider {
     fs.mkdirSync(outputDir, { recursive: true });
     const outputPath = path.join(outputDir, 'annotated.mp4');
 
-    const args = [
+    const workerArgs = [
       this.workerPath,
       '--input',
       video.file_path,
@@ -46,21 +54,31 @@ class YoloAnalysisProvider extends AnalysisProvider {
       String(this.imageSize),
     ];
 
-    return this.runWorker(args, analysisId, onProgress).then((result) => ({
+    return this.runWorker(workerArgs, analysisId, onProgress).then((result) => ({
       ...result,
       video_id: videoId,
       source_video_name: video.video_name,
     }));
   }
 
-  runWorker(args, analysisId, onProgress) {
+  runWorker(workerArgs, analysisId, onProgress) {
     return new Promise((resolve, reject) => {
-      const child = spawn(this.pythonBin, args, {
+      let python;
+      try {
+        python = this.resolvePython();
+      } catch (err) {
+        reject(err);
+        return;
+      }
+
+      const spawnArgs = [...python.args, ...workerArgs];
+      const child = spawn(python.command, spawnArgs, {
         cwd: path.join(__dirname, '..', '..', '..', '..'),
         env: {
           ...process.env,
           PYTHONUNBUFFERED: '1',
         },
+        windowsHide: true,
       });
 
       let stdoutBuffer = '';
@@ -111,6 +129,14 @@ class YoloAnalysisProvider extends AnalysisProvider {
       });
 
       child.on('error', (err) => {
+        if (err && (err.code === 'ENOENT' || err.code === 'EACCES')) {
+          reject(
+            new Error(
+              `Não foi possível iniciar o Python (${python.command}). ${WINDOWS_STORE_ALIAS_HINT}`
+            )
+          );
+          return;
+        }
         reject(new Error(`Não foi possível iniciar o YOLO: ${err.message}`));
       });
 
@@ -118,7 +144,17 @@ class YoloAnalysisProvider extends AnalysisProvider {
         if (stdoutBuffer) handleLine(stdoutBuffer);
 
         if (code !== 0 || workerError) {
-          const detail = workerError || stderrBuffer.trim() || `Processo YOLO finalizou com código ${code}.`;
+          const combined = `${stdoutBuffer}\n${stderrBuffer}`;
+          const looksLikeStoreAlias = /Microsoft Store|Aliases de execução|App execution aliases|Python (?:was not found|não foi encontrado)/i.test(
+            combined
+          );
+
+          let detail;
+          if (looksLikeStoreAlias) {
+            detail = WINDOWS_STORE_ALIAS_HINT;
+          } else {
+            detail = workerError || stderrBuffer.trim() || `Processo YOLO finalizou com código ${code}.`;
+          }
           reject(new Error(detail));
           return;
         }
