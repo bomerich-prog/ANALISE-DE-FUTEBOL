@@ -1,4 +1,5 @@
 import { listAnalyses } from './analysisClient.js';
+import { openAnalysisVisualization } from './analysisViewer.js';
 import { escapeHtml, formatDate } from './utils.js';
 import { getAnalysisLabel, pipelinePillClass, getPipelineLabel } from './pipelineStatus.js';
 import { ANALYSIS_STATUS } from './pipelineStatus.js';
@@ -43,7 +44,11 @@ function renderAnalyses(items) {
       <td>${formatDate(item.created_at)}</td>
       <td><span class="status-pill status-pill--${analysisStatusClass(item.status)}">${getAnalysisLabel(item.status)}</span></td>
       <td><span class="cell-format">${escapeHtml(item.original_format || '—')}</span></td>
+      <td><button type="button" class="btn btn-secondary" style="width:auto;padding:0.4rem 0.85rem;font-size:0.8rem" data-view-analysis="${item.id}">Visualizar</button></td>
     `;
+    tr.querySelector('[data-view-analysis]')?.addEventListener('click', () => {
+      openAnalysisVisualization({ analysisId: item.id });
+    });
     analysesTableBody.appendChild(tr);
   });
 }
@@ -65,7 +70,7 @@ async function loadAnalysesPage() {
     allAnalyses = await listAnalyses();
     applyFilter();
   } catch (err) {
-    analysesTableBody.innerHTML = `<tr><td colspan="4" class="table-empty">${escapeHtml(err.message)}</td></tr>`;
+    analysesTableBody.innerHTML = `<tr><td colspan="5" class="table-empty">${escapeHtml(err.message)}</td></tr>`;
     analysesTable.classList.remove('hidden');
   } finally {
     analysesLoading?.classList.add('hidden');
@@ -74,5 +79,6 @@ async function loadAnalysesPage() {
 
 analysesSearch?.addEventListener('input', applyFilter);
 window.addEventListener('analyses:load', loadAnalysesPage);
+window.addEventListener('analysis:finished', () => loadAnalysesPage());
 
 export { getPipelineLabel, pipelinePillClass };

@@ -29,14 +29,26 @@ class MockAnalysisProvider extends AnalysisProvider {
       provider: 'MockAnalysisProvider',
       message: 'Análise simulada concluída. Módulos OpenCV/YOLO serão integrados futuramente.',
       video_id: videoId,
+      architecture: {
+        yolo: 'mocked',
+        tracking: 'pending',
+        feature_extraction: 'pending',
+        machine_learning: 'pending',
+      },
       metrics: {
         frames_processed: 0,
         players_detected: 0,
-        ball_tracks: 0,
-        events_extracted: 0,
+        ball_detected: false,
+        total_player_detections: 0,
+        total_ball_detections: 0,
       },
-      tracks: {},
-      events: {},
+      detections: {
+        classes: ['Player', 'Ball'],
+        labels: 'mock result',
+      },
+      tracking: { status: 'pending' },
+      features: { status: 'pending' },
+      machine_learning: { status: 'pending' },
     };
   }
 }

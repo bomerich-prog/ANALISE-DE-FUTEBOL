@@ -1,5 +1,5 @@
 import { api } from './api.js';
-import { startAnalysis } from './analysisClient.js';
+import { openAnalysisVisualization, startAnalysisInVisualization } from './analysisViewer.js';
 import { escapeHtml, formatSize, formatDate } from './utils.js';
 import {
   PIPELINE_STATUS,
@@ -20,6 +20,10 @@ let allItems = [];
 function canAnalyze(item) {
   const s = item.pipeline_status;
   return s === PIPELINE_STATUS.CONVERTED || s === PIPELINE_STATUS.ERROR;
+}
+
+function canViewAnalysis(item) {
+  return item.pipeline_status === PIPELINE_STATUS.ANALYSIS_COMPLETE;
 }
 
 function displayStatus(item) {
@@ -52,15 +56,9 @@ function filterItems(items, query) {
 
 async function analyzeFromHistory(videoId, btn) {
   btn.disabled = true;
-  btn.textContent = 'Analisando...';
+  btn.textContent = 'Abrindo análise...';
   try {
-    await startAnalysis(videoId, {
-      onProgress: () => {},
-      onComplete: () => {},
-      onError: (msg) => {
-        throw new Error(msg);
-      },
-    });
+    await startAnalysisInVisualization(videoId);
     await loadHistory();
     window.dispatchEvent(new CustomEvent('dashboard:refresh'));
     window.dispatchEvent(new CustomEvent('analyses:load'));
@@ -98,6 +96,7 @@ function renderTable(items) {
       <td>
         <div class="table-actions">
           ${canAnalyze(item) ? `<button type="button" class="btn btn-primary" style="width:auto;padding:0.4rem 0.85rem;font-size:0.8rem" data-analyze="${item.id}">Analisar Vídeo</button>` : ''}
+          ${canViewAnalysis(item) ? `<button type="button" class="btn btn-primary" style="width:auto;padding:0.4rem 0.85rem;font-size:0.8rem" data-view-analysis="${item.id}">Visualizar análise</button>` : ''}
           <a href="/api/history/${item.id}/download" class="btn btn-secondary" style="width:auto;padding:0.4rem 0.85rem;font-size:0.8rem" download>Baixar</a>
           <button type="button" class="btn btn-ghost" data-delete="${item.id}">Excluir</button>
         </div>
@@ -106,6 +105,10 @@ function renderTable(items) {
 
     tr.querySelector('[data-analyze]')?.addEventListener('click', (e) => {
       analyzeFromHistory(item.id, e.target);
+    });
+
+    tr.querySelector('[data-view-analysis]')?.addEventListener('click', () => {
+      openAnalysisVisualization({ videoId: item.id });
     });
 
     tr.querySelector('[data-delete]')?.addEventListener('click', async () => {
@@ -148,3 +151,4 @@ async function loadHistory() {
 historySearch?.addEventListener('input', applyFilters);
 historySort?.addEventListener('change', applyFilters);
 window.addEventListener('history:load', loadHistory);
+window.addEventListener('analysis:finished', () => loadHistory());
