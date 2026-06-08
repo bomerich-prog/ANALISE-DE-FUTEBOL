@@ -17,6 +17,7 @@ const playersEl = document.getElementById('analysisPlayersCount');
 const ballEl = document.getElementById('analysisBallFound');
 const framesEl = document.getElementById('analysisFramesProcessed');
 const processedVideoEl = document.getElementById('analysisProcessedVideo');
+const liveFrameEl = document.getElementById('analysisLiveFrame');
 const placeholderEl = document.getElementById('analysisVideoPlaceholder');
 
 let pollTimer = null;
@@ -40,6 +41,12 @@ function stopPolling() {
   pollTimer = null;
 }
 
+function hideLiveFrame() {
+  if (!liveFrameEl) return;
+  liveFrameEl.removeAttribute('src');
+  liveFrameEl.classList.add('hidden');
+}
+
 function resetViewer() {
   activeAnalysisId = null;
   stopPolling();
@@ -56,6 +63,7 @@ function resetViewer() {
     processedVideoEl.load();
     processedVideoEl.classList.add('hidden');
   }
+  hideLiveFrame();
   placeholderEl?.classList.remove('hidden');
 }
 
@@ -66,6 +74,8 @@ function getMetrics(analysis) {
     frames_processed: progressStats.frames_processed ?? metrics.frames_processed ?? 0,
     players_detected: progressStats.players_detected ?? metrics.players_detected ?? 0,
     ball_detected: progressStats.ball_detected ?? metrics.ball_detected ?? false,
+    debug_frame_url:
+      progressStats.debug_frame_url ?? analysis?.result_json?.artifacts?.debug_live_frame_url ?? null,
   };
 }
 
@@ -78,7 +88,18 @@ function showProcessedVideo(analysis) {
     processedVideoEl.load();
   }
   placeholderEl?.classList.add('hidden');
+  hideLiveFrame();
   processedVideoEl.classList.remove('hidden');
+}
+
+function showLiveFrame(metrics) {
+  if (!metrics.debug_frame_url || !liveFrameEl || !processedVideoEl?.classList.contains('hidden')) return;
+
+  if (liveFrameEl.getAttribute('src') !== metrics.debug_frame_url) {
+    liveFrameEl.src = metrics.debug_frame_url;
+  }
+  placeholderEl?.classList.add('hidden');
+  liveFrameEl.classList.remove('hidden');
 }
 
 function renderAnalysis(analysis) {
@@ -99,6 +120,8 @@ function renderAnalysis(analysis) {
 
   if (analysis.status === ANALYSIS_STATUS.COMPLETED) {
     showProcessedVideo(analysis);
+  } else {
+    showLiveFrame(metrics);
   }
 }
 

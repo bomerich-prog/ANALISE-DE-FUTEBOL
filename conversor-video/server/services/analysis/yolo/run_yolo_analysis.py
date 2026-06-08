@@ -15,10 +15,41 @@ from ultralytics import YOLO
 
 PERSON_CLASS_ID = 0
 SPORTS_BALL_CLASS_ID = 32
+PERSON_DUPLICATE_IOU_THRESHOLD = 0.85
+LIVE_DEBUG_FRAME_NAME = "live-frame.jpg"
 
 
 def emit(payload):
     print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def box_iou(box_a, box_b):
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    intersection_width = max(0, min(ax2, bx2) - max(ax1, bx1))
+    intersection_height = max(0, min(ay2, by2) - max(ay1, by1))
+    intersection = intersection_width * intersection_height
+    if intersection <= 0:
+        return 0.0
+
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = area_a + area_b - intersection
+    return intersection / union if union else 0.0
+
+
+def suppress_duplicate_person_detections(detections):
+    kept = []
+    suppressed = 0
+    for detection in sorted(detections, key=lambda item: item["confidence"], reverse=True):
+        if any(
+            box_iou(detection["box"], kept_detection["box"]) >= PERSON_DUPLICATE_IOU_THRESHOLD
+            for kept_detection in kept
+        ):
+            suppressed += 1
+            continue
+        kept.append(detection)
+    return kept, suppressed
 
 
 def clamp(value, lower, upper):
@@ -67,6 +98,27 @@ def open_writer(output_path, fps, width, height):
     if not writer.isOpened():
         raise RuntimeError("Não foi possível criar o vídeo processado.")
     return writer
+
+
+def write_live_debug_frame(debug_frame_dir, frame):
+    if not debug_frame_dir:
+        return False
+
+    frame_dir = Path(debug_frame_dir)
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    final_path = frame_dir / LIVE_DEBUG_FRAME_NAME
+    temp_path = frame_dir / f".{LIVE_DEBUG_FRAME_NAME}.tmp.jpg"
+    if not cv2.imwrite(str(temp_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82]):
+        return False
+
+    temp_path.replace(final_path)
+    return True
+
+
+def should_write_live_debug_frame(debug_frame_dir, frames_processed, interval):
+    if not debug_frame_dir:
+        return False
+    return frames_processed == 1 or frames_processed % max(1, interval) == 0
 
 
 def finalize_browser_video(raw_output_path, final_output_path):
@@ -130,8 +182,10 @@ def analyze(args):
 
     frames_processed = 0
     max_players_detected = 0
+    raw_player_detections = 0
     total_player_detections = 0
     total_ball_detections = 0
+    duplicate_player_detections_suppressed = 0
     ball_detected = False
     confidence_sum = {"Player": 0.0, "Ball": 0.0}
     confidence_count = {"Player": 0, "Ball": 0}
@@ -150,8 +204,8 @@ def analyze(args):
             classes=[PERSON_CLASS_ID, SPORTS_BALL_CLASS_ID],
         )[0]
 
-        frame_players = 0
-        frame_ball = False
+        player_detections = []
+        ball_detections = []
 
         if result.boxes is not None:
             for detected_box in result.boxes:
@@ -160,20 +214,31 @@ def analyze(args):
                 box = detected_box.xyxy[0].tolist()
 
                 if class_id == PERSON_CLASS_ID:
-                    class_name = "Player"
-                    frame_players += 1
-                    total_player_detections += 1
+                    raw_player_detections += 1
+                    player_detections.append({"box": box, "confidence": confidence})
                 elif class_id == SPORTS_BALL_CLASS_ID:
-                    class_name = "Ball"
-                    frame_ball = True
-                    ball_detected = True
-                    total_ball_detections += 1
-                else:
-                    continue
+                    ball_detections.append({"box": box, "confidence": confidence})
 
-                confidence_sum[class_name] += confidence
-                confidence_count[class_name] += 1
-                draw_detection(frame, box, class_name, confidence)
+        player_detections, suppressed = suppress_duplicate_person_detections(player_detections)
+        duplicate_player_detections_suppressed += suppressed
+
+        for detection in player_detections:
+            confidence = detection["confidence"]
+            confidence_sum["Player"] += confidence
+            confidence_count["Player"] += 1
+            draw_detection(frame, detection["box"], "Player", confidence)
+
+        for detection in ball_detections:
+            confidence = detection["confidence"]
+            ball_detected = True
+            confidence_sum["Ball"] += confidence
+            confidence_count["Ball"] += 1
+            draw_detection(frame, detection["box"], "Ball", confidence)
+
+        frame_players = len(player_detections)
+        frame_ball = bool(ball_detections)
+        total_player_detections += frame_players
+        total_ball_detections += len(ball_detections)
 
         frames_processed += 1
         max_players_detected = max(max_players_detected, frame_players)
@@ -187,18 +252,22 @@ def analyze(args):
         should_emit = progress != last_emitted_progress and (
             frames_processed == 1 or progress % 5 == 0 or frames_processed == total_frames
         )
-        if should_emit:
+        should_emit_debug_frame = should_write_live_debug_frame(
+            args.debug_frame_dir, frames_processed, args.debug_frame_interval
+        )
+        if should_emit or should_emit_debug_frame:
             last_emitted_progress = progress
-            emit(
-                {
-                    "type": "progress",
-                    "progress": progress,
-                    "message": f"YOLO processou {frames_processed} frame(s).",
-                    "framesProcessed": frames_processed,
-                    "playersDetected": max_players_detected,
-                    "ballDetected": ball_detected or frame_ball,
-                }
-            )
+            payload = {
+                "type": "progress",
+                "progress": progress,
+                "message": f"YOLO processou {frames_processed} frame(s).",
+                "framesProcessed": frames_processed,
+                "playersDetected": max_players_detected,
+                "ballDetected": ball_detected or frame_ball,
+            }
+            if should_emit_debug_frame and write_live_debug_frame(args.debug_frame_dir, frame):
+                payload["debugFrameUpdated"] = True
+            emit(payload)
 
     capture.release()
     writer.release()
@@ -226,6 +295,8 @@ def analyze(args):
             "players_detected": max_players_detected,
             "ball_detected": ball_detected,
             "total_player_detections": total_player_detections,
+            "raw_player_detections": raw_player_detections,
+            "duplicate_player_detections_suppressed": duplicate_player_detections_suppressed,
             "total_ball_detections": total_ball_detections,
             "avg_player_confidence": avg_player_confidence,
             "avg_ball_confidence": avg_ball_confidence,
@@ -235,6 +306,7 @@ def analyze(args):
             "player_class": "person",
             "ball_class": "sports ball",
             "confidence_threshold": args.conf,
+            "player_duplicate_iou_threshold": PERSON_DUPLICATE_IOU_THRESHOLD,
             "labels": "class name and confidence are burned into the annotated video",
         },
         "tracking": {"status": "pending"},
@@ -244,6 +316,10 @@ def analyze(args):
             "processed_video_path": str(output_path),
         },
     }
+    if args.debug_frame_dir:
+        result["artifacts"]["debug_live_frame_path"] = str(
+            Path(args.debug_frame_dir) / LIVE_DEBUG_FRAME_NAME
+        )
 
     emit(
         {
@@ -265,6 +341,13 @@ def parse_args():
     parser.add_argument("--model", default="yolov8n.pt", help="Ultralytics YOLO model")
     parser.add_argument("--imgsz", type=int, default=640, help="YOLO inference image size")
     parser.add_argument("--conf", type=float, default=0.25, help="YOLO confidence threshold")
+    parser.add_argument("--debug-frame-dir", default=None, help="Directory for opt-in live debug frames")
+    parser.add_argument(
+        "--debug-frame-interval",
+        type=int,
+        default=1,
+        help="Write one live debug frame every N processed frames when debug mode is enabled",
+    )
     return parser.parse_args()
 
 

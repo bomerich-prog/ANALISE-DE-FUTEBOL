@@ -1189,6 +1189,7 @@ body {
   display: block;
   max-height: 620px;
   background: #000;
+  object-fit: contain;
 }
 
 .analysis-video-placeholder {
