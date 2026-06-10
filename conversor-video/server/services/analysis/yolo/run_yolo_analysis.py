@@ -4,9 +4,11 @@
 import argparse
 import json
 import math
+import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import cv2
@@ -19,6 +21,11 @@ SPORTS_BALL_CLASS_ID = 32
 PERSON_DUPLICATE_IOU_THRESHOLD = 0.85
 LIVE_DEBUG_FRAME_NAME = "live-frame.jpg"
 MIN_FIELD_AREA_RATIO = 0.12
+<<<<<<< HEAD
+=======
+LIVE_DEBUG_FRAME_REPLACE_RETRIES = 6
+LIVE_DEBUG_FRAME_RETRY_BASE_DELAY_SECONDS = 0.03
+>>>>>>> origin/cursor/winerror5-live-frame-retry-c65c
 
 
 def emit(payload):
@@ -186,8 +193,17 @@ def write_live_debug_frame(debug_frame_dir, frame):
     if not cv2.imwrite(str(temp_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82]):
         return False
 
-    temp_path.replace(final_path)
-    return True
+    for attempt in range(LIVE_DEBUG_FRAME_REPLACE_RETRIES):
+        try:
+            os.replace(temp_path, final_path)
+            return True
+        except PermissionError:
+            if attempt == LIVE_DEBUG_FRAME_REPLACE_RETRIES - 1:
+                temp_path.unlink(missing_ok=True)
+                return False
+            time.sleep(LIVE_DEBUG_FRAME_RETRY_BASE_DELAY_SECONDS * (attempt + 1))
+
+    return False
 
 
 def should_write_live_debug_frame(debug_frame_dir, frames_processed, interval):
