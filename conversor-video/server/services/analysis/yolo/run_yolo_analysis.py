@@ -21,11 +21,9 @@ SPORTS_BALL_CLASS_ID = 32
 PERSON_DUPLICATE_IOU_THRESHOLD = 0.85
 LIVE_DEBUG_FRAME_NAME = "live-frame.jpg"
 MIN_FIELD_AREA_RATIO = 0.12
-<<<<<<< HEAD
-=======
 LIVE_DEBUG_FRAME_REPLACE_RETRIES = 6
 LIVE_DEBUG_FRAME_RETRY_BASE_DELAY_SECONDS = 0.03
->>>>>>> origin/cursor/winerror5-live-frame-retry-c65c
+
 
 
 def emit(payload):
