@@ -8,6 +8,7 @@ const { resolvePythonCached } = require('./pythonResolver');
 
 const WINDOWS_STORE_ALIAS_HINT =
   'O Windows tentou abrir o atalho da Microsoft Store para Python. Instale o Python a partir de https://www.python.org/downloads/ (marcando "Add Python to PATH") ou desabilite o alias em Configurações > Aplicativos > Configurações avançadas do aplicativo > Aliases de execução do aplicativo, e reinicie o servidor. Alternativamente, defina YOLO_PYTHON_BIN apontando para um python.exe válido (ex.: "py -3").';
+const DEFAULT_DEBUG_LIVE_FRAMES_ENABLED = true;
 
 function parseOptionalBoolean(value) {
   if (value === undefined || value === null) return undefined;
@@ -27,7 +28,8 @@ class YoloAnalysisProvider extends AnalysisProvider {
     this.imageSize = options.imageSize || process.env.YOLO_IMAGE_SIZE || '640';
     this.workerPath = options.workerPath || path.join(__dirname, 'run_yolo_analysis.py');
     const envDebugLiveFrames = parseOptionalBoolean(process.env.YOLO_DEBUG_LIVE_FRAMES);
-    this.debugLiveFrames = options.debugLiveFrames ?? envDebugLiveFrames ?? true;
+    this.debugLiveFrames =
+      options.debugLiveFrames ?? envDebugLiveFrames ?? DEFAULT_DEBUG_LIVE_FRAMES_ENABLED;
     this.debugFrameInterval =
       options.debugFrameInterval || process.env.YOLO_DEBUG_FRAME_INTERVAL || '1';
   }
