@@ -152,7 +152,12 @@ class YoloAnalysisProvider extends AnalysisProvider {
       });
 
       child.stderr.on('data', (chunk) => {
-        stderrBuffer += chunk.toString();
+        const text = chunk.toString();
+        stderrBuffer += text;
+        const trimmed = text.trim();
+        if (trimmed) {
+          console.error(`[YOLO STDERR] ${trimmed}`);
+        }
       });
 
       child.on('error', (err) => {

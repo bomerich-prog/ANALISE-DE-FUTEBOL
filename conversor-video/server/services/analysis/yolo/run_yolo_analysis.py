@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
 import cv2
@@ -27,6 +28,10 @@ LIVE_DEBUG_FRAME_RETRY_BASE_DELAY_SECONDS = 0.03
 
 def emit(payload):
     print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def log_live_frame_debug(message):
+    print(f"[live-frame-debug] {message}", file=sys.stderr, flush=True)
 
 
 def box_iou(box_a, box_b):
@@ -187,18 +192,30 @@ def write_live_debug_frame(debug_frame_dir, frame):
     frame_dir.mkdir(parents=True, exist_ok=True)
     final_path = frame_dir / LIVE_DEBUG_FRAME_NAME
     temp_path = frame_dir / f".{LIVE_DEBUG_FRAME_NAME}.tmp.jpg"
-    if not cv2.imwrite(str(temp_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82]):
+    log_live_frame_debug(f"write_live_debug_frame temp_path={temp_path.resolve()} final_path={final_path.resolve()}")
+    write_ok = cv2.imwrite(str(temp_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+    log_live_frame_debug(f"cv2.imwrite returned {write_ok}")
+    if not write_ok:
         return False
 
     for attempt in range(LIVE_DEBUG_FRAME_REPLACE_RETRIES):
         try:
             os.replace(temp_path, final_path)
+            log_live_frame_debug(f"os.replace succeeded attempt={attempt + 1}")
             return True
-        except PermissionError:
+        except PermissionError as exc:
+            log_live_frame_debug(
+                f"PermissionError on os.replace attempt={attempt + 1} errno={getattr(exc, 'errno', None)} message={exc}"
+            )
             if attempt == LIVE_DEBUG_FRAME_REPLACE_RETRIES - 1:
                 temp_path.unlink(missing_ok=True)
                 return False
             time.sleep(LIVE_DEBUG_FRAME_RETRY_BASE_DELAY_SECONDS * (attempt + 1))
+        except Exception:
+            log_live_frame_debug(
+                "Unexpected exception during live-frame replace:\n" + traceback.format_exc().rstrip()
+            )
+            raise
 
     return False
 
@@ -388,6 +405,9 @@ def analyze(args):
                 "ballDetected": ball_detected or frame_ball,
             }
             if should_emit_debug_frame and write_live_debug_frame(args.debug_frame_dir, debug_frame):
+                log_live_frame_debug(
+                    f"debugFrameUpdated sent to Node framesProcessed={frames_processed} debugFrameDir={args.debug_frame_dir}"
+                )
                 payload["debugFrameUpdated"] = True
             emit(payload)
 
