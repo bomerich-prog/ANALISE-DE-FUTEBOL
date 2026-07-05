@@ -873,7 +873,16 @@ body {
   margin-bottom: 1.25rem;
 }
 
-.btn-upload-trigger { width: auto; padding: 0.6rem 1.25rem; }
+.btn-upload-trigger {
+  width: auto;
+  padding: 0.6rem 1.25rem;
+  background: #e53935;
+  color: #fff;
+}
+
+.btn-upload-trigger:hover:not(:disabled) {
+  background: #c62828;
+}
 
 /* Alert */
 .alert {
