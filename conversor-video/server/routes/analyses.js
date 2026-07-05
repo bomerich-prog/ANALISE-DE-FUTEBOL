@@ -80,15 +80,23 @@ router.get('/:id/video', requireAuth, (req, res) => {
 
 router.get('/:id/debug-frame', requireAuth, (req, res) => {
   const analysisId = Number(req.params.id);
-  const framePath = analysisService.getAnalysisDebugFramePath(req.session.userId, analysisId);
+  const frame = analysisService.getAnalysisDebugFrame(req.session.userId, analysisId);
 
-  if (!framePath || !fs.existsSync(framePath)) {
+  if (!frame) {
     return res.status(404).json({ error: 'Frame de debug não encontrado.' });
   }
 
   res.setHeader('Cache-Control', 'no-store');
-  res.setHeader('Content-Type', 'image/jpeg');
-  fs.createReadStream(framePath).pipe(res);
+  res.setHeader('Content-Type', frame.contentType || 'image/jpeg');
+  if (frame.data) {
+    res.end(frame.data);
+    return;
+  }
+  if (frame.path && fs.existsSync(frame.path)) {
+    fs.createReadStream(frame.path).pipe(res);
+    return;
+  }
+  res.status(404).json({ error: 'Frame de debug não encontrado.' });
 });
 
 router.get('/:id', requireAuth, (req, res) => {

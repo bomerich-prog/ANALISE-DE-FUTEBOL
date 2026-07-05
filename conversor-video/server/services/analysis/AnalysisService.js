@@ -1,6 +1,4 @@
-const path = require('path');
-
-const { db, dataDir } = require('../../db');
+const { db } = require('../../db');
 const MockAnalysisProvider = require('./MockAnalysisProvider');
 const YoloAnalysisProvider = require('./yolo/YoloAnalysisProvider');
 const progressStore = require('./progressStore');
@@ -76,17 +74,32 @@ class AnalysisService {
     return result?.artifacts?.processed_video_path || null;
   }
 
-  getAnalysisDebugFramePath(userId, analysisId) {
+  getAnalysisDebugFrame(userId, analysisId) {
     const row = db
       .prepare(
-        `SELECT id
+        `SELECT id, result_json
          FROM analyses
          WHERE id = ? AND user_id = ?`
       )
       .get(analysisId, userId);
 
     if (!row) return null;
-    return path.join(dataDir, 'analyses', String(userId), String(analysisId), 'live-frame.jpg');
+
+    const progress = progressStore.get(analysisId);
+    if (progress.debug_frame?.data) {
+      return progress.debug_frame;
+    }
+
+    const result = row.result_json ? JSON.parse(row.result_json) : {};
+    const legacyPath = result?.artifacts?.debug_live_frame_path;
+    if (legacyPath) {
+      return {
+        contentType: 'image/jpeg',
+        path: legacyPath,
+      };
+    }
+
+    return null;
   }
 
   getVideoForAnalysis(userId, videoId) {

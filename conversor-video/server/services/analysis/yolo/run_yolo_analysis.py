@@ -2,13 +2,12 @@
 """Run YOLOv8 detections over a soccer video and write an annotated MP4."""
 
 import argparse
+import base64
 import json
 import math
-import os
 import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import cv2
@@ -19,10 +18,9 @@ from ultralytics import YOLO
 PERSON_CLASS_ID = 0
 SPORTS_BALL_CLASS_ID = 32
 PERSON_DUPLICATE_IOU_THRESHOLD = 0.85
-LIVE_DEBUG_FRAME_NAME = "live-frame.jpg"
 MIN_FIELD_AREA_RATIO = 0.12
-LIVE_DEBUG_FRAME_REPLACE_RETRIES = 6
-LIVE_DEBUG_FRAME_RETRY_BASE_DELAY_SECONDS = 0.03
+LIVE_DEBUG_FRAME_MAX_WIDTH = 960
+LIVE_DEBUG_FRAME_JPEG_QUALITY = 72
 
 
 
@@ -180,28 +178,23 @@ def open_writer(output_path, fps, width, height):
     return writer
 
 
-def write_live_debug_frame(debug_frame_dir, frame):
-    if not debug_frame_dir:
-        return False
+def encode_live_debug_frame(frame):
+    if frame is None:
+        return None
 
-    frame_dir = Path(debug_frame_dir)
-    frame_dir.mkdir(parents=True, exist_ok=True)
-    final_path = frame_dir / LIVE_DEBUG_FRAME_NAME
-    temp_path = frame_dir / f".{LIVE_DEBUG_FRAME_NAME}.tmp.jpg"
-    if not cv2.imwrite(str(temp_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82]):
-        return False
+    height, width = frame.shape[:2]
+    if width > LIVE_DEBUG_FRAME_MAX_WIDTH:
+        scale = LIVE_DEBUG_FRAME_MAX_WIDTH / width
+        frame = cv2.resize(frame, (LIVE_DEBUG_FRAME_MAX_WIDTH, int(height * scale)))
 
-    for attempt in range(LIVE_DEBUG_FRAME_REPLACE_RETRIES):
-        try:
-            os.replace(temp_path, final_path)
-            return True
-        except PermissionError:
-            if attempt == LIVE_DEBUG_FRAME_REPLACE_RETRIES - 1:
-                temp_path.unlink(missing_ok=True)
-                return False
-            time.sleep(LIVE_DEBUG_FRAME_RETRY_BASE_DELAY_SECONDS * (attempt + 1))
-
-    return False
+    ok, buffer = cv2.imencode(
+        ".jpg",
+        frame,
+        [int(cv2.IMWRITE_JPEG_QUALITY), LIVE_DEBUG_FRAME_JPEG_QUALITY],
+    )
+    if not ok:
+        return None
+    return base64.b64encode(buffer).decode("ascii")
 
 
 def should_write_live_debug_frame(debug_frame_dir, frames_processed, interval):
@@ -388,8 +381,11 @@ def analyze(args):
                 "playersDetected": max_players_detected,
                 "ballDetected": ball_detected or frame_ball,
             }
-            if should_emit_debug_frame and write_live_debug_frame(args.debug_frame_dir, debug_frame):
-                payload["debugFrameUpdated"] = True
+            if should_emit_debug_frame:
+                debug_frame_jpeg = encode_live_debug_frame(debug_frame)
+                if debug_frame_jpeg:
+                    payload["debugFrameUpdated"] = True
+                    payload["debugFrameJpeg"] = debug_frame_jpeg
             emit(payload)
 
     capture.release()
@@ -443,11 +439,6 @@ def analyze(args):
             "processed_video_path": str(output_path),
         },
     }
-    if args.debug_frame_dir:
-        result["artifacts"]["debug_live_frame_path"] = str(
-            Path(args.debug_frame_dir) / LIVE_DEBUG_FRAME_NAME
-        )
-
     emit(
         {
             "type": "progress",
