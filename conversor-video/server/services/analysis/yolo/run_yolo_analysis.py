@@ -18,7 +18,9 @@ from ultralytics import YOLO
 PERSON_CLASS_ID = 0
 SPORTS_BALL_CLASS_ID = 32
 PERSON_DUPLICATE_IOU_THRESHOLD = 0.85
-MIN_FIELD_AREA_RATIO = 0.12
+MIN_FIELD_AREA_RATIO = 0.10
+MIN_WHITE_LINE_PIXELS = 80
+FIELD_LINE_OVERLAP_DILATION = 31
 LIVE_DEBUG_FRAME_MAX_WIDTH = 960
 LIVE_DEBUG_FRAME_JPEG_QUALITY = 72
 
@@ -57,7 +59,7 @@ def suppress_duplicate_person_detections(detections):
     return kept, suppressed
 
 
-def detect_field_region(frame, previous_mask=None):
+def build_grass_support_mask(frame):
     height, width = frame.shape[:2]
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     lower_green = (25, 25, 35)
@@ -76,7 +78,7 @@ def detect_field_region(frame, previous_mask=None):
     grass_mask = cv2.morphologyEx(
         grass_mask,
         cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35)),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17)),
     )
     grass_mask = cv2.morphologyEx(
         grass_mask,
@@ -85,22 +87,125 @@ def detect_field_region(frame, previous_mask=None):
     )
     grass_mask = cv2.dilate(
         grass_mask,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
         iterations=1,
     )
+    return grass_mask
 
+
+def build_white_line_mask(frame, grass_mask):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    white_mask = cv2.inRange(hsv, (0, 0, 135), (180, 80, 255))
+    nearby_grass = cv2.dilate(
+        grass_mask,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)),
+        iterations=1,
+    )
+    white_mask = cv2.bitwise_and(white_mask, nearby_grass)
+    white_mask = cv2.morphologyEx(
+        white_mask,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+    )
+    white_mask = cv2.morphologyEx(
+        white_mask,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (9, 3)),
+    )
+    return white_mask
+
+
+def detect_field_line_segments(white_line_mask):
+    height, width = white_line_mask.shape[:2]
+    edges = cv2.Canny(white_line_mask, 50, 150)
+    segments = cv2.HoughLinesP(
+        edges,
+        1,
+        np.pi / 180,
+        threshold=45,
+        minLineLength=max(60, int(width * 0.05)),
+        maxLineGap=max(12, int(width * 0.018)),
+    )
+    if segments is None:
+        return []
+
+    min_length = max(50, min(width, height) * 0.055)
+    long_segments = []
+    for segment in np.asarray(segments).reshape(-1, 4):
+        x1, y1, x2, y2 = [int(value) for value in segment]
+        length = math.hypot(x2 - x1, y2 - y1)
+        if length >= min_length:
+            long_segments.append((x1, y1, x2, y2))
+    return long_segments
+
+
+def build_segment_mask(shape, segments):
+    mask = np.zeros(shape, dtype=np.uint8)
+    for x1, y1, x2, y2 in segments:
+        cv2.line(mask, (x1, y1), (x2, y2), 255, 8)
+    return mask
+
+
+def select_grass_contour_by_field_lines(grass_mask, line_reference_mask):
+    height, width = grass_mask.shape[:2]
     contours, _ = cv2.findContours(grass_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     min_area = width * height * MIN_FIELD_AREA_RATIO
     large_contours = [contour for contour in contours if cv2.contourArea(contour) >= min_area]
 
     if not large_contours:
+        return None, False
+
+    if cv2.countNonZero(line_reference_mask) < MIN_WHITE_LINE_PIXELS:
+        return max(large_contours, key=cv2.contourArea), False
+
+    line_reference_mask = cv2.dilate(
+        line_reference_mask,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (FIELD_LINE_OVERLAP_DILATION, FIELD_LINE_OVERLAP_DILATION),
+        ),
+        iterations=1,
+    )
+
+    best_contour = None
+    best_score = 0
+    for contour in large_contours:
+        contour_mask = np.zeros_like(grass_mask)
+        cv2.drawContours(contour_mask, [contour], -1, 255, -1)
+        overlap = cv2.countNonZero(cv2.bitwise_and(contour_mask, line_reference_mask))
+        score = overlap * (1 + cv2.contourArea(contour) / (width * height))
+        if score > best_score:
+            best_score = score
+            best_contour = contour
+
+    if best_contour is None or best_score < MIN_WHITE_LINE_PIXELS:
+        return max(large_contours, key=cv2.contourArea), False
+    return best_contour, True
+
+
+def detect_field_region(frame, previous_mask=None):
+    height, width = frame.shape[:2]
+    grass_mask = build_grass_support_mask(frame)
+    white_line_mask = build_white_line_mask(frame, grass_mask)
+    line_segments = detect_field_line_segments(white_line_mask)
+    line_reference_mask = build_segment_mask(white_line_mask.shape, line_segments)
+    if cv2.countNonZero(line_reference_mask) < MIN_WHITE_LINE_PIXELS:
+        line_reference_mask = white_line_mask
+
+    selected_contour, line_guided = select_grass_contour_by_field_lines(
+        grass_mask, line_reference_mask
+    )
+
+    if selected_contour is None:
         if previous_mask is not None:
-            return previous_mask, [], False
+            previous_contours, _ = cv2.findContours(
+                previous_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            return previous_mask, previous_contours, False
         full_mask = np.full((height, width), 255, dtype=np.uint8)
         return full_mask, [], False
 
-    merged_points = np.vstack(large_contours)
-    hull = cv2.convexHull(merged_points)
+    hull = cv2.convexHull(selected_contour)
     field_mask = np.zeros((height, width), dtype=np.uint8)
     cv2.fillConvexPoly(field_mask, hull, 255)
 
@@ -110,7 +215,7 @@ def detect_field_region(frame, previous_mask=None):
         iterations=1,
     )
     field_contours, _ = cv2.findContours(field_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    return field_mask, field_contours, True
+    return field_mask, field_contours, line_guided
 
 
 def detection_center(box):
@@ -118,11 +223,16 @@ def detection_center(box):
     return int((x1 + x2) / 2), int((y1 + y2) / 2)
 
 
+def detection_foot_point(box):
+    x1, _, x2, y2 = box
+    return int((x1 + x2) / 2), int(y2)
+
+
 def is_detection_inside_field(detection, field_mask):
-    center_x, center_y = detection_center(detection["box"])
-    center_x = clamp(center_x, 0, field_mask.shape[1] - 1)
-    center_y = clamp(center_y, 0, field_mask.shape[0] - 1)
-    return field_mask[center_y, center_x] > 0
+    foot_x, foot_y = detection_foot_point(detection["box"])
+    foot_x = clamp(foot_x, 0, field_mask.shape[1] - 1)
+    foot_y = clamp(foot_y, 0, field_mask.shape[0] - 1)
+    return field_mask[foot_y, foot_x] > 0
 
 
 def draw_field_debug_overlay(frame, field_contours):
@@ -327,6 +437,7 @@ def analyze(args):
         output_frame = frame.copy()
         debug_frame = output_frame.copy() if args.debug_frame_dir else None
 
+        draw_field_debug_overlay(output_frame, field_contours)
         if debug_frame is not None:
             draw_field_debug_overlay(debug_frame, field_contours)
 
@@ -429,7 +540,7 @@ def analyze(args):
             "ball_class": "sports ball",
             "confidence_threshold": args.conf,
             "player_duplicate_iou_threshold": PERSON_DUPLICATE_IOU_THRESHOLD,
-            "field_filter": "person bbox center must be inside detected grass mask",
+            "field_filter": "person bbox bottom-center foot point must be inside white-line-guided playable-field polygon",
             "labels": "class name and confidence are burned into the annotated video",
         },
         "tracking": {"status": "pending"},
