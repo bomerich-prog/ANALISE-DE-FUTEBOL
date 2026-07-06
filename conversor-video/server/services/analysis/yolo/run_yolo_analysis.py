@@ -218,35 +218,63 @@ def find_field_boundary_constraints(grass_mask, selected_contour, line_segments)
         else:
             continue
 
+        inward_normal = normal * keep_sign
+        center_distance = float(
+            np.dot(contour_center - np.array([x1, y1], dtype=np.float32), inward_normal)
+        )
+        if center_distance <= 0:
+            continue
+
         constraints.append(
             {
                 "point": np.array([x1, y1], dtype=np.float32),
                 "normal": normal,
                 "keep_sign": keep_sign,
+                "inward_normal": inward_normal,
+                "center_distance": center_distance,
+                "midpoint": np.array(midpoint, dtype=np.float32),
                 "score": score,
             }
         )
 
-    constraints.sort(key=lambda item: item["score"], reverse=True)
+    constraints = filter_external_boundary_constraints(constraints, width, height)
+    constraints.sort(key=lambda item: item["center_distance"], reverse=True)
     selected_constraints = []
     for constraint in constraints:
         duplicate = False
         for selected in selected_constraints:
-            same_direction = abs(float(np.dot(constraint["normal"], selected["normal"]))) > 0.95
-            same_side = constraint["keep_sign"] == selected["keep_sign"]
-            offset = abs(
-                float(np.dot(constraint["point"], constraint["normal"]))
-                - float(np.dot(selected["point"], selected["normal"]))
+            same_boundary_side = (
+                float(np.dot(constraint["inward_normal"], selected["inward_normal"])) > 0.90
             )
-            if same_direction and same_side and offset < 50:
+            if same_boundary_side:
                 duplicate = True
                 break
         if not duplicate:
             selected_constraints.append(constraint)
-        if len(selected_constraints) >= 6:
+        if len(selected_constraints) >= 4:
             break
 
     return selected_constraints
+
+
+def filter_external_boundary_constraints(constraints, width, height):
+    external_constraints = []
+    for constraint in constraints:
+        midpoint = constraint["midpoint"]
+        inward_normal = constraint["inward_normal"]
+        horizontal_boundary = abs(inward_normal[1]) >= abs(inward_normal[0])
+
+        if horizontal_boundary:
+            if not (midpoint[1] <= height * 0.45 or midpoint[1] >= height * 0.55):
+                continue
+        else:
+            # Goal posts, nets and most inner vertical markings live near the center of the image.
+            if width * 0.20 < midpoint[0] < width * 0.80:
+                continue
+
+        external_constraints.append(constraint)
+
+    return external_constraints
 
 
 def clip_polygon_with_constraint(polygon, constraint):
