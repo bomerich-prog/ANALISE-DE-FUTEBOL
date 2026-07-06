@@ -21,6 +21,8 @@ PERSON_DUPLICATE_IOU_THRESHOLD = 0.85
 MIN_FIELD_AREA_RATIO = 0.10
 MIN_WHITE_LINE_PIXELS = 80
 FIELD_LINE_OVERLAP_DILATION = 31
+FIELD_BOUNDARY_LINE_MIN_GRASS_DELTA = 0.35
+FIELD_BOUNDARY_LINE_SAMPLE_OFFSET = 24
 LIVE_DEBUG_FRAME_MAX_WIDTH = 960
 LIVE_DEBUG_FRAME_JPEG_QUALITY = 72
 
@@ -146,6 +148,153 @@ def build_segment_mask(shape, segments):
     return mask
 
 
+def sample_grass_ratio_along_line_side(grass_mask, segment, normal, side):
+    x1, y1, x2, y2 = segment
+    length = max(1, int(math.hypot(x2 - x1, y2 - y1)))
+    sample_count = max(12, min(80, length // 12))
+    grass_hits = 0
+    valid_samples = 0
+    height, width = grass_mask.shape[:2]
+
+    for index in range(sample_count):
+        t = index / max(1, sample_count - 1)
+        x = x1 + (x2 - x1) * t + normal[0] * FIELD_BOUNDARY_LINE_SAMPLE_OFFSET * side
+        y = y1 + (y2 - y1) * t + normal[1] * FIELD_BOUNDARY_LINE_SAMPLE_OFFSET * side
+        px = int(round(x))
+        py = int(round(y))
+        if 0 <= px < width and 0 <= py < height:
+            valid_samples += 1
+            if grass_mask[py, px] > 0:
+                grass_hits += 1
+
+    return grass_hits / valid_samples if valid_samples else 0.0
+
+
+def distance_to_contour_boundary(contour, point):
+    return abs(cv2.pointPolygonTest(contour, (float(point[0]), float(point[1])), True))
+
+
+def find_field_boundary_constraints(grass_mask, selected_contour, line_segments):
+    height, width = grass_mask.shape[:2]
+    min_length = max(100, width * 0.12)
+    min_centroid_guided_length = max(140, width * 0.18)
+    max_boundary_distance = max(70, height * 0.10)
+    constraints = []
+    moments = cv2.moments(selected_contour)
+    if moments["m00"]:
+        contour_center = np.array(
+            [moments["m10"] / moments["m00"], moments["m01"] / moments["m00"]],
+            dtype=np.float32,
+        )
+    else:
+        contour_center = np.array([width / 2, height / 2], dtype=np.float32)
+
+    for segment in line_segments:
+        x1, y1, x2, y2 = segment
+        dx = x2 - x1
+        dy = y2 - y1
+        length = math.hypot(dx, dy)
+        if length < min_length:
+            continue
+
+        normal = np.array([-dy / length, dx / length], dtype=np.float32)
+        positive_grass = sample_grass_ratio_along_line_side(grass_mask, segment, normal, 1)
+        negative_grass = sample_grass_ratio_along_line_side(grass_mask, segment, normal, -1)
+        grass_delta = abs(positive_grass - negative_grass)
+
+        midpoint = ((x1 + x2) / 2, (y1 + y2) / 2)
+        boundary_distance = distance_to_contour_boundary(selected_contour, midpoint)
+
+        if grass_delta >= FIELD_BOUNDARY_LINE_MIN_GRASS_DELTA:
+            if boundary_distance > max_boundary_distance:
+                continue
+            keep_sign = 1 if positive_grass > negative_grass else -1
+            score = length * grass_delta
+        elif length >= min_centroid_guided_length and boundary_distance <= max_boundary_distance:
+            signed_center = float(np.dot(contour_center - np.array([x1, y1], dtype=np.float32), normal))
+            keep_sign = 1 if signed_center >= 0 else -1
+            distance_weight = max(0.1, 1 - boundary_distance / (max_boundary_distance + 1))
+            score = length * 0.5 * distance_weight
+        else:
+            continue
+
+        constraints.append(
+            {
+                "point": np.array([x1, y1], dtype=np.float32),
+                "normal": normal,
+                "keep_sign": keep_sign,
+                "score": score,
+            }
+        )
+
+    constraints.sort(key=lambda item: item["score"], reverse=True)
+    selected_constraints = []
+    for constraint in constraints:
+        duplicate = False
+        for selected in selected_constraints:
+            same_direction = abs(float(np.dot(constraint["normal"], selected["normal"]))) > 0.95
+            same_side = constraint["keep_sign"] == selected["keep_sign"]
+            offset = abs(
+                float(np.dot(constraint["point"], constraint["normal"]))
+                - float(np.dot(selected["point"], selected["normal"]))
+            )
+            if same_direction and same_side and offset < 50:
+                duplicate = True
+                break
+        if not duplicate:
+            selected_constraints.append(constraint)
+        if len(selected_constraints) >= 6:
+            break
+
+    return selected_constraints
+
+
+def clip_polygon_with_constraint(polygon, constraint):
+    if len(polygon) < 3:
+        return polygon
+
+    point = constraint["point"]
+    normal = constraint["normal"]
+    keep_sign = constraint["keep_sign"]
+
+    def signed_distance(vertex):
+        return float(np.dot(vertex - point, normal) * keep_sign)
+
+    clipped = []
+    previous = polygon[-1]
+    previous_distance = signed_distance(previous)
+    previous_inside = previous_distance >= -1.0
+
+    for current in polygon:
+        current_distance = signed_distance(current)
+        current_inside = current_distance >= -1.0
+
+        if current_inside != previous_inside:
+            denominator = previous_distance - current_distance
+            if abs(denominator) > 1e-6:
+                t = previous_distance / denominator
+                clipped.append(previous + (current - previous) * t)
+
+        if current_inside:
+            clipped.append(current)
+
+        previous = current
+        previous_distance = current_distance
+        previous_inside = current_inside
+
+    return np.array(clipped, dtype=np.float32)
+
+
+def apply_field_line_constraints(hull, grass_mask, selected_contour, line_segments):
+    polygon = hull.reshape(-1, 2).astype(np.float32)
+    constraints = find_field_boundary_constraints(grass_mask, selected_contour, line_segments)
+    for constraint in constraints:
+        clipped = clip_polygon_with_constraint(polygon, constraint)
+        if len(clipped) >= 3:
+            polygon = clipped
+    return polygon.astype(np.int32), bool(constraints)
+
+
 def select_grass_contour_by_field_lines(grass_mask, line_reference_mask):
     height, width = grass_mask.shape[:2]
     contours, _ = cv2.findContours(grass_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -206,8 +355,11 @@ def detect_field_region(frame, previous_mask=None):
         return full_mask, [], False
 
     hull = cv2.convexHull(selected_contour)
+    playable_polygon, constraints_applied = apply_field_line_constraints(
+        hull, grass_mask, selected_contour, line_segments
+    )
     field_mask = np.zeros((height, width), dtype=np.uint8)
-    cv2.fillConvexPoly(field_mask, hull, 255)
+    cv2.fillPoly(field_mask, [playable_polygon], 255)
 
     field_mask = cv2.erode(
         field_mask,
@@ -215,7 +367,7 @@ def detect_field_region(frame, previous_mask=None):
         iterations=1,
     )
     field_contours, _ = cv2.findContours(field_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    return field_mask, field_contours, line_guided
+    return field_mask, field_contours, line_guided or constraints_applied
 
 
 def detection_center(box):
