@@ -25,6 +25,11 @@ FIELD_BOUNDARY_LINE_MIN_GRASS_DELTA = 0.35
 FIELD_BOUNDARY_LINE_SAMPLE_OFFSET = 24
 LIVE_DEBUG_FRAME_MAX_WIDTH = 960
 LIVE_DEBUG_FRAME_JPEG_QUALITY = 72
+PITCH_MODEL_RELATIVE_PATH = Path("models/football-pitch-detection.pt")
+PITCH_KEYPOINT_MIN_CONFIDENCE = 0.25
+PITCH_KEYPOINT_COLOR = (255, 0, 255)
+PITCH_KEYPOINT_OUTLINE_COLOR = (255, 255, 255)
+PITCH_KEYPOINT_RADIUS = 4
 
 
 
@@ -420,6 +425,79 @@ def draw_field_debug_overlay(frame, field_contours):
         cv2.drawContours(frame, field_contours, -1, (0, 255, 255), 3)
 
 
+def resolve_pitch_model_path(pitch_model_arg):
+    candidate = Path(pitch_model_arg)
+    if not candidate.is_absolute():
+        candidate = Path(__file__).resolve().parent / candidate
+    return candidate.resolve()
+
+
+def extract_pitch_keypoints(pitch_result, confidence_threshold):
+    keypoints = getattr(pitch_result, "keypoints", None)
+    if keypoints is None:
+        return []
+
+    xy = getattr(keypoints, "xy", None)
+    if xy is None:
+        return []
+
+    xy_array = xy.cpu().numpy() if hasattr(xy, "cpu") else np.asarray(xy)
+    if xy_array.size == 0:
+        return []
+
+    confidence_array = None
+    confidence = getattr(keypoints, "conf", None)
+    if confidence is not None:
+        confidence_array = (
+            confidence.cpu().numpy() if hasattr(confidence, "cpu") else np.asarray(confidence)
+        )
+
+    visible_keypoints = []
+    for detection_index, detection_keypoints in enumerate(xy_array):
+        for keypoint_index, point in enumerate(detection_keypoints):
+            x, y = float(point[0]), float(point[1])
+            if not np.isfinite(x) or not np.isfinite(y):
+                continue
+
+            keypoint_confidence = None
+            if confidence_array is not None:
+                keypoint_confidence = float(confidence_array[detection_index][keypoint_index])
+                if keypoint_confidence < confidence_threshold:
+                    continue
+
+            visible_keypoints.append(
+                {
+                    "x": x,
+                    "y": y,
+                    "confidence": keypoint_confidence,
+                    "index": keypoint_index,
+                }
+            )
+
+    return visible_keypoints
+
+
+def draw_pitch_keypoints(frame, keypoints):
+    if frame is None:
+        return
+
+    for keypoint in keypoints:
+        x = clamp(int(round(keypoint["x"])), 0, frame.shape[1] - 1)
+        y = clamp(int(round(keypoint["y"])), 0, frame.shape[0] - 1)
+        cv2.circle(frame, (x, y), PITCH_KEYPOINT_RADIUS + 2, PITCH_KEYPOINT_OUTLINE_COLOR, 1)
+        cv2.circle(frame, (x, y), PITCH_KEYPOINT_RADIUS, PITCH_KEYPOINT_COLOR, -1)
+        cv2.putText(
+            frame,
+            str(keypoint["index"] + 1),
+            (x + 5, y - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.35,
+            PITCH_KEYPOINT_OUTLINE_COLOR,
+            1,
+            cv2.LINE_AA,
+        )
+
+
 def clamp(value, lower, upper):
     return max(lower, min(upper, value))
 
@@ -530,6 +608,10 @@ def analyze(args):
         raise FileNotFoundError(f"Vídeo não encontrado: {input_path}")
 
     model = YOLO(args.model)
+    pitch_model_path = resolve_pitch_model_path(args.pitch_model)
+    if not pitch_model_path.exists():
+        raise FileNotFoundError(f"Modelo de detecção de campo não encontrado: {pitch_model_path}")
+    pitch_model = YOLO(str(pitch_model_path))
     capture = cv2.VideoCapture(str(input_path))
     if not capture.isOpened():
         raise RuntimeError("Não foi possível abrir o vídeo para análise.")
@@ -545,7 +627,7 @@ def analyze(args):
         {
             "type": "progress",
             "progress": 1,
-            "message": "YOLOv8 carregado. Iniciando detecção de jogadores e bola...",
+            "message": "YOLOv8 carregado. Iniciando detecção de jogadores, bola e keypoints do campo...",
             "framesProcessed": 0,
             "playersDetected": 0,
             "ballDetected": False,
@@ -584,6 +666,13 @@ def analyze(args):
             verbose=False,
             classes=[PERSON_CLASS_ID, SPORTS_BALL_CLASS_ID],
         )[0]
+        pitch_result = pitch_model.predict(
+            frame,
+            imgsz=args.imgsz,
+            conf=args.pitch_keypoint_conf,
+            verbose=False,
+        )[0]
+        pitch_keypoints = extract_pitch_keypoints(pitch_result, args.pitch_keypoint_conf)
 
         player_detections = []
         ball_detections = []
@@ -616,6 +705,10 @@ def analyze(args):
 
         output_frame = frame.copy()
         debug_frame = output_frame.copy() if args.debug_frame_dir else None
+
+        draw_pitch_keypoints(output_frame, pitch_keypoints)
+        if debug_frame is not None:
+            draw_pitch_keypoints(debug_frame, pitch_keypoints)
 
         draw_field_debug_overlay(output_frame, field_contours)
         if debug_frame is not None:
@@ -744,12 +837,24 @@ def analyze(args):
 
 
 def parse_args():
+    pitch_model_default = Path(__file__).resolve().parent / PITCH_MODEL_RELATIVE_PATH
     parser = argparse.ArgumentParser(description="Analyze a soccer video with YOLOv8.")
     parser.add_argument("--input", required=True, help="Input MP4 path")
     parser.add_argument("--output", required=True, help="Annotated MP4 output path")
     parser.add_argument("--model", default="yolov8n.pt", help="Ultralytics YOLO model")
+    parser.add_argument(
+        "--pitch-model",
+        default=str(pitch_model_default),
+        help="Path to the football pitch keypoint model (.pt)",
+    )
     parser.add_argument("--imgsz", type=int, default=640, help="YOLO inference image size")
     parser.add_argument("--conf", type=float, default=0.25, help="YOLO confidence threshold")
+    parser.add_argument(
+        "--pitch-keypoint-conf",
+        type=float,
+        default=PITCH_KEYPOINT_MIN_CONFIDENCE,
+        help="Confidence threshold for football pitch keypoints",
+    )
     parser.add_argument("--debug-frame-dir", default=None, help="Directory for opt-in live debug frames")
     parser.add_argument(
         "--debug-frame-interval",
