@@ -2,6 +2,7 @@
 """Run YOLOv8 detections over a soccer video and write an annotated MP4."""
 
 import argparse
+import base64
 import json
 import math
 import os
@@ -20,10 +21,21 @@ from ultralytics import YOLO
 PERSON_CLASS_ID = 0
 SPORTS_BALL_CLASS_ID = 32
 PERSON_DUPLICATE_IOU_THRESHOLD = 0.85
+MIN_FIELD_AREA_RATIO = 0.10
+MIN_WHITE_LINE_PIXELS = 80
+FIELD_LINE_OVERLAP_DILATION = 31
+FIELD_BOUNDARY_LINE_MIN_GRASS_DELTA = 0.35
+FIELD_BOUNDARY_LINE_SAMPLE_OFFSET = 24
+LIVE_DEBUG_FRAME_MAX_WIDTH = 960
+LIVE_DEBUG_FRAME_JPEG_QUALITY = 72
 LIVE_DEBUG_FRAME_NAME = "live-frame.jpg"
-MIN_FIELD_AREA_RATIO = 0.12
 LIVE_DEBUG_FRAME_REPLACE_RETRIES = 6
 LIVE_DEBUG_FRAME_RETRY_BASE_DELAY_SECONDS = 0.03
+PITCH_MODEL_RELATIVE_PATH = Path("models/football-pitch-detection.pt")
+PITCH_KEYPOINT_MIN_CONFIDENCE = 0.25
+PITCH_KEYPOINT_COLOR = (255, 0, 255)
+PITCH_KEYPOINT_OUTLINE_COLOR = (255, 255, 255)
+PITCH_KEYPOINT_RADIUS = 4
 
 
 def emit(payload):
@@ -63,7 +75,7 @@ def suppress_duplicate_person_detections(detections):
     return kept, suppressed
 
 
-def detect_field_region(frame, previous_mask=None):
+def build_grass_support_mask(frame):
     height, width = frame.shape[:2]
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     lower_green = (25, 25, 35)
@@ -82,7 +94,7 @@ def detect_field_region(frame, previous_mask=None):
     grass_mask = cv2.morphologyEx(
         grass_mask,
         cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35)),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17)),
     )
     grass_mask = cv2.morphologyEx(
         grass_mask,
@@ -91,24 +103,305 @@ def detect_field_region(frame, previous_mask=None):
     )
     grass_mask = cv2.dilate(
         grass_mask,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
         iterations=1,
     )
+    return grass_mask
 
+
+def build_white_line_mask(frame, grass_mask):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    white_mask = cv2.inRange(hsv, (0, 0, 135), (180, 80, 255))
+    nearby_grass = cv2.dilate(
+        grass_mask,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)),
+        iterations=1,
+    )
+    white_mask = cv2.bitwise_and(white_mask, nearby_grass)
+    white_mask = cv2.morphologyEx(
+        white_mask,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+    )
+    white_mask = cv2.morphologyEx(
+        white_mask,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (9, 3)),
+    )
+    return white_mask
+
+
+def detect_field_line_segments(white_line_mask):
+    height, width = white_line_mask.shape[:2]
+    edges = cv2.Canny(white_line_mask, 50, 150)
+    segments = cv2.HoughLinesP(
+        edges,
+        1,
+        np.pi / 180,
+        threshold=45,
+        minLineLength=max(60, int(width * 0.05)),
+        maxLineGap=max(12, int(width * 0.018)),
+    )
+    if segments is None:
+        return []
+
+    min_length = max(50, min(width, height) * 0.055)
+    long_segments = []
+    for segment in np.asarray(segments).reshape(-1, 4):
+        x1, y1, x2, y2 = [int(value) for value in segment]
+        length = math.hypot(x2 - x1, y2 - y1)
+        if length >= min_length:
+            long_segments.append((x1, y1, x2, y2))
+    return long_segments
+
+
+def build_segment_mask(shape, segments):
+    mask = np.zeros(shape, dtype=np.uint8)
+    for x1, y1, x2, y2 in segments:
+        cv2.line(mask, (x1, y1), (x2, y2), 255, 8)
+    return mask
+
+
+def sample_grass_ratio_along_line_side(grass_mask, segment, normal, side):
+    x1, y1, x2, y2 = segment
+    length = max(1, int(math.hypot(x2 - x1, y2 - y1)))
+    sample_count = max(12, min(80, length // 12))
+    grass_hits = 0
+    valid_samples = 0
+    height, width = grass_mask.shape[:2]
+
+    for index in range(sample_count):
+        t = index / max(1, sample_count - 1)
+        x = x1 + (x2 - x1) * t + normal[0] * FIELD_BOUNDARY_LINE_SAMPLE_OFFSET * side
+        y = y1 + (y2 - y1) * t + normal[1] * FIELD_BOUNDARY_LINE_SAMPLE_OFFSET * side
+        px = int(round(x))
+        py = int(round(y))
+        if 0 <= px < width and 0 <= py < height:
+            valid_samples += 1
+            if grass_mask[py, px] > 0:
+                grass_hits += 1
+
+    return grass_hits / valid_samples if valid_samples else 0.0
+
+
+def distance_to_contour_boundary(contour, point):
+    return abs(cv2.pointPolygonTest(contour, (float(point[0]), float(point[1])), True))
+
+
+def find_field_boundary_constraints(grass_mask, selected_contour, line_segments):
+    height, width = grass_mask.shape[:2]
+    min_length = max(100, width * 0.12)
+    min_centroid_guided_length = max(140, width * 0.18)
+    max_boundary_distance = max(70, height * 0.10)
+    constraints = []
+    moments = cv2.moments(selected_contour)
+    if moments["m00"]:
+        contour_center = np.array(
+            [moments["m10"] / moments["m00"], moments["m01"] / moments["m00"]],
+            dtype=np.float32,
+        )
+    else:
+        contour_center = np.array([width / 2, height / 2], dtype=np.float32)
+
+    for segment in line_segments:
+        x1, y1, x2, y2 = segment
+        dx = x2 - x1
+        dy = y2 - y1
+        length = math.hypot(dx, dy)
+        if length < min_length:
+            continue
+
+        normal = np.array([-dy / length, dx / length], dtype=np.float32)
+        positive_grass = sample_grass_ratio_along_line_side(grass_mask, segment, normal, 1)
+        negative_grass = sample_grass_ratio_along_line_side(grass_mask, segment, normal, -1)
+        grass_delta = abs(positive_grass - negative_grass)
+
+        midpoint = ((x1 + x2) / 2, (y1 + y2) / 2)
+        boundary_distance = distance_to_contour_boundary(selected_contour, midpoint)
+
+        if grass_delta >= FIELD_BOUNDARY_LINE_MIN_GRASS_DELTA:
+            if boundary_distance > max_boundary_distance:
+                continue
+            keep_sign = 1 if positive_grass > negative_grass else -1
+            score = length * grass_delta
+        elif length >= min_centroid_guided_length and boundary_distance <= max_boundary_distance:
+            signed_center = float(np.dot(contour_center - np.array([x1, y1], dtype=np.float32), normal))
+            keep_sign = 1 if signed_center >= 0 else -1
+            distance_weight = max(0.1, 1 - boundary_distance / (max_boundary_distance + 1))
+            score = length * 0.5 * distance_weight
+        else:
+            continue
+
+        inward_normal = normal * keep_sign
+        center_distance = float(
+            np.dot(contour_center - np.array([x1, y1], dtype=np.float32), inward_normal)
+        )
+        if center_distance <= 0:
+            continue
+
+        constraints.append(
+            {
+                "point": np.array([x1, y1], dtype=np.float32),
+                "normal": normal,
+                "keep_sign": keep_sign,
+                "inward_normal": inward_normal,
+                "center_distance": center_distance,
+                "midpoint": np.array(midpoint, dtype=np.float32),
+                "score": score,
+            }
+        )
+
+    constraints = filter_external_boundary_constraints(constraints, width, height)
+    constraints.sort(key=lambda item: item["center_distance"], reverse=True)
+    selected_constraints = []
+    for constraint in constraints:
+        duplicate = False
+        for selected in selected_constraints:
+            same_boundary_side = (
+                float(np.dot(constraint["inward_normal"], selected["inward_normal"])) > 0.90
+            )
+            if same_boundary_side:
+                duplicate = True
+                break
+        if not duplicate:
+            selected_constraints.append(constraint)
+        if len(selected_constraints) >= 4:
+            break
+
+    return selected_constraints
+
+
+def filter_external_boundary_constraints(constraints, width, height):
+    external_constraints = []
+    for constraint in constraints:
+        midpoint = constraint["midpoint"]
+        inward_normal = constraint["inward_normal"]
+        horizontal_boundary = abs(inward_normal[1]) >= abs(inward_normal[0])
+
+        if horizontal_boundary:
+            if not (midpoint[1] <= height * 0.45 or midpoint[1] >= height * 0.55):
+                continue
+        else:
+            # Goal posts, nets and most inner vertical markings live near the center of the image.
+            if width * 0.20 < midpoint[0] < width * 0.80:
+                continue
+
+        external_constraints.append(constraint)
+
+    return external_constraints
+
+
+def clip_polygon_with_constraint(polygon, constraint):
+    if len(polygon) < 3:
+        return polygon
+
+    point = constraint["point"]
+    normal = constraint["normal"]
+    keep_sign = constraint["keep_sign"]
+
+    def signed_distance(vertex):
+        return float(np.dot(vertex - point, normal) * keep_sign)
+
+    clipped = []
+    previous = polygon[-1]
+    previous_distance = signed_distance(previous)
+    previous_inside = previous_distance >= -1.0
+
+    for current in polygon:
+        current_distance = signed_distance(current)
+        current_inside = current_distance >= -1.0
+
+        if current_inside != previous_inside:
+            denominator = previous_distance - current_distance
+            if abs(denominator) > 1e-6:
+                t = previous_distance / denominator
+                clipped.append(previous + (current - previous) * t)
+
+        if current_inside:
+            clipped.append(current)
+
+        previous = current
+        previous_distance = current_distance
+        previous_inside = current_inside
+
+    return np.array(clipped, dtype=np.float32)
+
+
+def apply_field_line_constraints(hull, grass_mask, selected_contour, line_segments):
+    polygon = hull.reshape(-1, 2).astype(np.float32)
+    constraints = find_field_boundary_constraints(grass_mask, selected_contour, line_segments)
+    for constraint in constraints:
+        clipped = clip_polygon_with_constraint(polygon, constraint)
+        if len(clipped) >= 3:
+            polygon = clipped
+    return polygon.astype(np.int32), bool(constraints)
+
+
+def select_grass_contour_by_field_lines(grass_mask, line_reference_mask):
+    height, width = grass_mask.shape[:2]
     contours, _ = cv2.findContours(grass_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     min_area = width * height * MIN_FIELD_AREA_RATIO
     large_contours = [contour for contour in contours if cv2.contourArea(contour) >= min_area]
 
     if not large_contours:
+        return None, False
+
+    if cv2.countNonZero(line_reference_mask) < MIN_WHITE_LINE_PIXELS:
+        return max(large_contours, key=cv2.contourArea), False
+
+    line_reference_mask = cv2.dilate(
+        line_reference_mask,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (FIELD_LINE_OVERLAP_DILATION, FIELD_LINE_OVERLAP_DILATION),
+        ),
+        iterations=1,
+    )
+
+    best_contour = None
+    best_score = 0
+    for contour in large_contours:
+        contour_mask = np.zeros_like(grass_mask)
+        cv2.drawContours(contour_mask, [contour], -1, 255, -1)
+        overlap = cv2.countNonZero(cv2.bitwise_and(contour_mask, line_reference_mask))
+        score = overlap * (1 + cv2.contourArea(contour) / (width * height))
+        if score > best_score:
+            best_score = score
+            best_contour = contour
+
+    if best_contour is None or best_score < MIN_WHITE_LINE_PIXELS:
+        return max(large_contours, key=cv2.contourArea), False
+    return best_contour, True
+
+
+def detect_field_region(frame, previous_mask=None):
+    height, width = frame.shape[:2]
+    grass_mask = build_grass_support_mask(frame)
+    white_line_mask = build_white_line_mask(frame, grass_mask)
+    line_segments = detect_field_line_segments(white_line_mask)
+    line_reference_mask = build_segment_mask(white_line_mask.shape, line_segments)
+    if cv2.countNonZero(line_reference_mask) < MIN_WHITE_LINE_PIXELS:
+        line_reference_mask = white_line_mask
+
+    selected_contour, line_guided = select_grass_contour_by_field_lines(
+        grass_mask, line_reference_mask
+    )
+
+    if selected_contour is None:
         if previous_mask is not None:
-            return previous_mask, [], False
+            previous_contours, _ = cv2.findContours(
+                previous_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            return previous_mask, previous_contours, False
         full_mask = np.full((height, width), 255, dtype=np.uint8)
         return full_mask, [], False
 
-    merged_points = np.vstack(large_contours)
-    hull = cv2.convexHull(merged_points)
+    hull = cv2.convexHull(selected_contour)
+    playable_polygon, constraints_applied = apply_field_line_constraints(
+        hull, grass_mask, selected_contour, line_segments
+    )
     field_mask = np.zeros((height, width), dtype=np.uint8)
-    cv2.fillConvexPoly(field_mask, hull, 255)
+    cv2.fillPoly(field_mask, [playable_polygon], 255)
 
     field_mask = cv2.erode(
         field_mask,
@@ -116,7 +409,7 @@ def detect_field_region(frame, previous_mask=None):
         iterations=1,
     )
     field_contours, _ = cv2.findContours(field_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    return field_mask, field_contours, True
+    return field_mask, field_contours, line_guided or constraints_applied
 
 
 def detection_center(box):
@@ -124,16 +417,94 @@ def detection_center(box):
     return int((x1 + x2) / 2), int((y1 + y2) / 2)
 
 
+def detection_foot_point(box):
+    x1, _, x2, y2 = box
+    return int((x1 + x2) / 2), int(y2)
+
+
 def is_detection_inside_field(detection, field_mask):
-    center_x, center_y = detection_center(detection["box"])
-    center_x = clamp(center_x, 0, field_mask.shape[1] - 1)
-    center_y = clamp(center_y, 0, field_mask.shape[0] - 1)
-    return field_mask[center_y, center_x] > 0
+    foot_x, foot_y = detection_foot_point(detection["box"])
+    foot_x = clamp(foot_x, 0, field_mask.shape[1] - 1)
+    foot_y = clamp(foot_y, 0, field_mask.shape[0] - 1)
+    return field_mask[foot_y, foot_x] > 0
 
 
 def draw_field_debug_overlay(frame, field_contours):
     if field_contours:
         cv2.drawContours(frame, field_contours, -1, (0, 255, 255), 3)
+
+
+def resolve_pitch_model_path(pitch_model_arg):
+    candidate = Path(pitch_model_arg)
+    if not candidate.is_absolute():
+        candidate = Path(__file__).resolve().parent / candidate
+    return candidate.resolve()
+
+
+def extract_pitch_keypoints(pitch_result, confidence_threshold):
+    keypoints = getattr(pitch_result, "keypoints", None)
+    if keypoints is None:
+        return []
+
+    xy = getattr(keypoints, "xy", None)
+    if xy is None:
+        return []
+
+    xy_array = xy.cpu().numpy() if hasattr(xy, "cpu") else np.asarray(xy)
+    if xy_array.size == 0:
+        return []
+
+    confidence_array = None
+    confidence = getattr(keypoints, "conf", None)
+    if confidence is not None:
+        confidence_array = (
+            confidence.cpu().numpy() if hasattr(confidence, "cpu") else np.asarray(confidence)
+        )
+
+    visible_keypoints = []
+    for detection_index, detection_keypoints in enumerate(xy_array):
+        for keypoint_index, point in enumerate(detection_keypoints):
+            x, y = float(point[0]), float(point[1])
+            if not np.isfinite(x) or not np.isfinite(y):
+                continue
+
+            keypoint_confidence = None
+            if confidence_array is not None:
+                keypoint_confidence = float(confidence_array[detection_index][keypoint_index])
+                if keypoint_confidence < confidence_threshold:
+                    continue
+
+            visible_keypoints.append(
+                {
+                    "x": x,
+                    "y": y,
+                    "confidence": keypoint_confidence,
+                    "index": keypoint_index,
+                }
+            )
+
+    return visible_keypoints
+
+
+def draw_pitch_keypoints(frame, keypoints):
+    if frame is None:
+        return
+
+    for keypoint in keypoints:
+        x = clamp(int(round(keypoint["x"])), 0, frame.shape[1] - 1)
+        y = clamp(int(round(keypoint["y"])), 0, frame.shape[0] - 1)
+        cv2.circle(frame, (x, y), PITCH_KEYPOINT_RADIUS + 2, PITCH_KEYPOINT_OUTLINE_COLOR, 1)
+        cv2.circle(frame, (x, y), PITCH_KEYPOINT_RADIUS, PITCH_KEYPOINT_COLOR, -1)
+        cv2.putText(
+            frame,
+            str(keypoint["index"] + 1),
+            (x + 5, y - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.35,
+            PITCH_KEYPOINT_OUTLINE_COLOR,
+            1,
+            cv2.LINE_AA,
+        )
 
 
 def clamp(value, lower, upper):
@@ -184,8 +555,27 @@ def open_writer(output_path, fps, width, height):
     return writer
 
 
+def encode_live_debug_frame(frame):
+    if frame is None:
+        return None
+
+    height, width = frame.shape[:2]
+    if width > LIVE_DEBUG_FRAME_MAX_WIDTH:
+        scale = LIVE_DEBUG_FRAME_MAX_WIDTH / width
+        frame = cv2.resize(frame, (LIVE_DEBUG_FRAME_MAX_WIDTH, int(height * scale)))
+
+    ok, buffer = cv2.imencode(
+        ".jpg",
+        frame,
+        [int(cv2.IMWRITE_JPEG_QUALITY), LIVE_DEBUG_FRAME_JPEG_QUALITY],
+    )
+    if not ok:
+        return None
+    return base64.b64encode(buffer).decode("ascii")
+
+
 def write_live_debug_frame(debug_frame_dir, frame):
-    if not debug_frame_dir:
+    if frame is None or not debug_frame_dir:
         return False
 
     frame_dir = Path(debug_frame_dir)
@@ -263,6 +653,10 @@ def analyze(args):
         raise FileNotFoundError(f"Vídeo não encontrado: {input_path}")
 
     model = YOLO(args.model)
+    pitch_model_path = resolve_pitch_model_path(args.pitch_model)
+    if not pitch_model_path.exists():
+        raise FileNotFoundError(f"Modelo de detecção de campo não encontrado: {pitch_model_path}")
+    pitch_model = YOLO(str(pitch_model_path))
     capture = cv2.VideoCapture(str(input_path))
     if not capture.isOpened():
         raise RuntimeError("Não foi possível abrir o vídeo para análise.")
@@ -278,7 +672,7 @@ def analyze(args):
         {
             "type": "progress",
             "progress": 1,
-            "message": "YOLOv8 carregado. Iniciando detecção de jogadores e bola...",
+            "message": "YOLOv8 carregado. Iniciando detecção de jogadores, bola e keypoints do campo...",
             "framesProcessed": 0,
             "playersDetected": 0,
             "ballDetected": False,
@@ -317,6 +711,13 @@ def analyze(args):
             verbose=False,
             classes=[PERSON_CLASS_ID, SPORTS_BALL_CLASS_ID],
         )[0]
+        pitch_result = pitch_model.predict(
+            frame,
+            imgsz=args.imgsz,
+            conf=args.pitch_keypoint_conf,
+            verbose=False,
+        )[0]
+        pitch_keypoints = extract_pitch_keypoints(pitch_result, args.pitch_keypoint_conf)
 
         player_detections = []
         ball_detections = []
@@ -350,6 +751,11 @@ def analyze(args):
         output_frame = frame.copy()
         debug_frame = output_frame.copy() if args.debug_frame_dir else None
 
+        draw_pitch_keypoints(output_frame, pitch_keypoints)
+        if debug_frame is not None:
+            draw_pitch_keypoints(debug_frame, pitch_keypoints)
+
+        draw_field_debug_overlay(output_frame, field_contours)
         if debug_frame is not None:
             draw_field_debug_overlay(debug_frame, field_contours)
 
@@ -404,11 +810,17 @@ def analyze(args):
                 "playersDetected": max_players_detected,
                 "ballDetected": ball_detected or frame_ball,
             }
-            if should_emit_debug_frame and write_live_debug_frame(args.debug_frame_dir, debug_frame):
-                log_live_frame_debug(
-                    f"debugFrameUpdated sent to Node framesProcessed={frames_processed} debugFrameDir={args.debug_frame_dir}"
-                )
-                payload["debugFrameUpdated"] = True
+            if should_emit_debug_frame:
+                debug_frame_written = write_live_debug_frame(args.debug_frame_dir, debug_frame)
+                debug_frame_jpeg = encode_live_debug_frame(debug_frame)
+                if debug_frame_written:
+                    log_live_frame_debug(
+                        f"debugFrameUpdated sent to Node framesProcessed={frames_processed} debugFrameDir={args.debug_frame_dir}"
+                    )
+                if debug_frame_written or debug_frame_jpeg:
+                    payload["debugFrameUpdated"] = True
+                if debug_frame_jpeg:
+                    payload["debugFrameJpeg"] = debug_frame_jpeg
             emit(payload)
 
     capture.release()
@@ -452,7 +864,7 @@ def analyze(args):
             "ball_class": "sports ball",
             "confidence_threshold": args.conf,
             "player_duplicate_iou_threshold": PERSON_DUPLICATE_IOU_THRESHOLD,
-            "field_filter": "person bbox center must be inside detected grass mask",
+            "field_filter": "person bbox bottom-center foot point must be inside white-line-guided playable-field polygon",
             "labels": "class name and confidence are burned into the annotated video",
         },
         "tracking": {"status": "pending"},
@@ -462,11 +874,6 @@ def analyze(args):
             "processed_video_path": str(output_path),
         },
     }
-    if args.debug_frame_dir:
-        result["artifacts"]["debug_live_frame_path"] = str(
-            Path(args.debug_frame_dir) / LIVE_DEBUG_FRAME_NAME
-        )
-
     emit(
         {
             "type": "progress",
@@ -481,12 +888,24 @@ def analyze(args):
 
 
 def parse_args():
+    pitch_model_default = Path(__file__).resolve().parent / PITCH_MODEL_RELATIVE_PATH
     parser = argparse.ArgumentParser(description="Analyze a soccer video with YOLOv8.")
     parser.add_argument("--input", required=True, help="Input MP4 path")
     parser.add_argument("--output", required=True, help="Annotated MP4 output path")
     parser.add_argument("--model", default="yolov8n.pt", help="Ultralytics YOLO model")
+    parser.add_argument(
+        "--pitch-model",
+        default=str(pitch_model_default),
+        help="Path to the football pitch keypoint model (.pt)",
+    )
     parser.add_argument("--imgsz", type=int, default=640, help="YOLO inference image size")
     parser.add_argument("--conf", type=float, default=0.25, help="YOLO confidence threshold")
+    parser.add_argument(
+        "--pitch-keypoint-conf",
+        type=float,
+        default=PITCH_KEYPOINT_MIN_CONFIDENCE,
+        help="Confidence threshold for football pitch keypoints",
+    )
     parser.add_argument("--debug-frame-dir", default=None, help="Directory for opt-in live debug frames")
     parser.add_argument(
         "--debug-frame-interval",

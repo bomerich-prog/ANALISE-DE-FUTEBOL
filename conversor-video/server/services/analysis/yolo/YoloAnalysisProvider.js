@@ -130,6 +130,12 @@ class YoloAnalysisProvider extends AnalysisProvider {
           };
           if (payload.debugFrameUpdated) {
             details.progress_stats.debug_frame_url = `/api/analyses/${analysisId}/debug-frame?t=${Date.now()}`;
+            if (payload.debugFrameJpeg) {
+              details.debug_frame = {
+                contentType: 'image/jpeg',
+                data: Buffer.from(payload.debugFrameJpeg, 'base64'),
+              };
+            }
           }
           updateAnalysisProgress(analysisId, payload.progress, payload.message, details);
           onProgress?.(payload.progress, payload.message, details);
