@@ -5,9 +5,12 @@ import argparse
 import base64
 import json
 import math
+import os
 import shutil
 import subprocess
 import sys
+import time
+import traceback
 from pathlib import Path
 
 import cv2
@@ -25,6 +28,9 @@ FIELD_BOUNDARY_LINE_MIN_GRASS_DELTA = 0.35
 FIELD_BOUNDARY_LINE_SAMPLE_OFFSET = 24
 LIVE_DEBUG_FRAME_MAX_WIDTH = 960
 LIVE_DEBUG_FRAME_JPEG_QUALITY = 72
+LIVE_DEBUG_FRAME_NAME = "live-frame.jpg"
+LIVE_DEBUG_FRAME_REPLACE_RETRIES = 6
+LIVE_DEBUG_FRAME_RETRY_BASE_DELAY_SECONDS = 0.03
 PITCH_MODEL_RELATIVE_PATH = Path("models/football-pitch-detection.pt")
 PITCH_KEYPOINT_MIN_CONFIDENCE = 0.25
 PITCH_KEYPOINT_COLOR = (255, 0, 255)
@@ -32,9 +38,12 @@ PITCH_KEYPOINT_OUTLINE_COLOR = (255, 255, 255)
 PITCH_KEYPOINT_RADIUS = 4
 
 
-
 def emit(payload):
     print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def log_live_frame_debug(message):
+    print(f"[live-frame-debug] {message}", file=sys.stderr, flush=True)
 
 
 def box_iou(box_a, box_b):
@@ -565,6 +574,42 @@ def encode_live_debug_frame(frame):
     return base64.b64encode(buffer).decode("ascii")
 
 
+def write_live_debug_frame(debug_frame_dir, frame):
+    if frame is None or not debug_frame_dir:
+        return False
+
+    frame_dir = Path(debug_frame_dir)
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    final_path = frame_dir / LIVE_DEBUG_FRAME_NAME
+    temp_path = frame_dir / f".{LIVE_DEBUG_FRAME_NAME}.tmp.jpg"
+    log_live_frame_debug(f"write_live_debug_frame temp_path={temp_path.resolve()} final_path={final_path.resolve()}")
+    write_ok = cv2.imwrite(str(temp_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+    log_live_frame_debug(f"cv2.imwrite returned {write_ok}")
+    if not write_ok:
+        return False
+
+    for attempt in range(LIVE_DEBUG_FRAME_REPLACE_RETRIES):
+        try:
+            os.replace(temp_path, final_path)
+            log_live_frame_debug(f"os.replace succeeded attempt={attempt + 1}")
+            return True
+        except PermissionError as exc:
+            log_live_frame_debug(
+                f"PermissionError on os.replace attempt={attempt + 1} errno={getattr(exc, 'errno', None)} message={exc}"
+            )
+            if attempt == LIVE_DEBUG_FRAME_REPLACE_RETRIES - 1:
+                temp_path.unlink(missing_ok=True)
+                return False
+            time.sleep(LIVE_DEBUG_FRAME_RETRY_BASE_DELAY_SECONDS * (attempt + 1))
+        except Exception:
+            log_live_frame_debug(
+                "Unexpected exception during live-frame replace:\n" + traceback.format_exc().rstrip()
+            )
+            raise
+
+    return False
+
+
 def should_write_live_debug_frame(debug_frame_dir, frames_processed, interval):
     if not debug_frame_dir:
         return False
@@ -766,9 +811,15 @@ def analyze(args):
                 "ballDetected": ball_detected or frame_ball,
             }
             if should_emit_debug_frame:
+                debug_frame_written = write_live_debug_frame(args.debug_frame_dir, debug_frame)
                 debug_frame_jpeg = encode_live_debug_frame(debug_frame)
-                if debug_frame_jpeg:
+                if debug_frame_written:
+                    log_live_frame_debug(
+                        f"debugFrameUpdated sent to Node framesProcessed={frames_processed} debugFrameDir={args.debug_frame_dir}"
+                    )
+                if debug_frame_written or debug_frame_jpeg:
                     payload["debugFrameUpdated"] = True
+                if debug_frame_jpeg:
                     payload["debugFrameJpeg"] = debug_frame_jpeg
             emit(payload)
 
