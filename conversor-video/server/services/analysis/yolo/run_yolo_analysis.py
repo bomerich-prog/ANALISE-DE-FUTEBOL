@@ -32,7 +32,10 @@ LIVE_DEBUG_FRAME_NAME = "live-frame.jpg"
 LIVE_DEBUG_FRAME_REPLACE_RETRIES = 6
 LIVE_DEBUG_FRAME_RETRY_BASE_DELAY_SECONDS = 0.03
 PITCH_MODEL_RELATIVE_PATH = Path("models/football-pitch-detection.pt")
+BALL_MODEL_RELATIVE_PATH = Path("models/football-ball-detection.pt")
 PITCH_KEYPOINT_MIN_CONFIDENCE = 0.25
+BALL_MODEL_MIN_CONFIDENCE = 0.25
+BALL_DETECTION_CONFIDENCE_MARGIN = 0.15
 PITCH_KEYPOINT_COLOR = (255, 0, 255)
 PITCH_KEYPOINT_OUTLINE_COLOR = (255, 255, 255)
 PITCH_KEYPOINT_RADIUS = 4
@@ -434,11 +437,19 @@ def draw_field_debug_overlay(frame, field_contours):
         cv2.drawContours(frame, field_contours, -1, (0, 255, 255), 3)
 
 
-def resolve_pitch_model_path(pitch_model_arg):
-    candidate = Path(pitch_model_arg)
+def resolve_model_path(model_arg):
+    candidate = Path(model_arg)
     if not candidate.is_absolute():
         candidate = Path(__file__).resolve().parent / candidate
     return candidate.resolve()
+
+
+def resolve_pitch_model_path(pitch_model_arg):
+    return resolve_model_path(pitch_model_arg)
+
+
+def resolve_ball_model_path(ball_model_arg):
+    return resolve_model_path(ball_model_arg)
 
 
 def extract_pitch_keypoints(pitch_result, confidence_threshold):
@@ -505,6 +516,59 @@ def draw_pitch_keypoints(frame, keypoints):
             1,
             cv2.LINE_AA,
         )
+
+
+def extract_ball_detections(ball_result, confidence_threshold):
+    detections = []
+    boxes = getattr(ball_result, "boxes", None)
+    if boxes is None:
+        return detections
+
+    for detected_box in boxes:
+        confidence = float(detected_box.conf[0])
+        if confidence < confidence_threshold:
+            continue
+        detections.append(
+            {
+                "box": detected_box.xyxy[0].tolist(),
+                "confidence": confidence,
+                "source": "ball_model",
+            }
+        )
+    return detections
+
+
+def box_area(box):
+    x1, y1, x2, y2 = box
+    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+
+def pick_best_detection(detections):
+    if not detections:
+        return None
+    return sorted(detections, key=lambda item: (-item["confidence"], box_area(item["box"])))[0]
+
+
+def select_ball_detection(dedicated_model_detections, base_model_detections):
+    dedicated_best = pick_best_detection(dedicated_model_detections)
+    base_best = pick_best_detection(base_model_detections)
+
+    if dedicated_best is None and base_best is None:
+        return []
+    if dedicated_best is not None and base_best is None:
+        return [dedicated_best]
+    if base_best is not None and dedicated_best is None:
+        return [base_best]
+
+    confidence_delta = abs(dedicated_best["confidence"] - base_best["confidence"])
+    if confidence_delta >= BALL_DETECTION_CONFIDENCE_MARGIN:
+        return [dedicated_best if dedicated_best["confidence"] > base_best["confidence"] else base_best]
+
+    dedicated_area = box_area(dedicated_best["box"])
+    base_area = box_area(base_best["box"])
+    if dedicated_area <= base_area:
+        return [dedicated_best]
+    return [base_best]
 
 
 def clamp(value, lower, upper):
@@ -657,6 +721,10 @@ def analyze(args):
     if not pitch_model_path.exists():
         raise FileNotFoundError(f"Modelo de detecção de campo não encontrado: {pitch_model_path}")
     pitch_model = YOLO(str(pitch_model_path))
+    ball_model_path = resolve_ball_model_path(args.ball_model)
+    if not ball_model_path.exists():
+        raise FileNotFoundError(f"Modelo de detecção da bola não encontrado: {ball_model_path}")
+    ball_model = YOLO(str(ball_model_path))
     capture = cv2.VideoCapture(str(input_path))
     if not capture.isOpened():
         raise RuntimeError("Não foi possível abrir o vídeo para análise.")
@@ -717,10 +785,17 @@ def analyze(args):
             conf=args.pitch_keypoint_conf,
             verbose=False,
         )[0]
+        ball_result = ball_model.predict(
+            frame,
+            imgsz=args.imgsz,
+            conf=args.ball_conf,
+            verbose=False,
+        )[0]
         pitch_keypoints = extract_pitch_keypoints(pitch_result, args.pitch_keypoint_conf)
+        dedicated_ball_detections = extract_ball_detections(ball_result, args.ball_conf)
 
         player_detections = []
-        ball_detections = []
+        base_model_ball_detections = []
 
         if result.boxes is not None:
             for detected_box in result.boxes:
@@ -732,7 +807,11 @@ def analyze(args):
                     raw_player_detections += 1
                     player_detections.append({"box": box, "confidence": confidence})
                 elif class_id == SPORTS_BALL_CLASS_ID:
-                    ball_detections.append({"box": box, "confidence": confidence})
+                    base_model_ball_detections.append(
+                        {"box": box, "confidence": confidence, "source": "base_model"}
+                    )
+
+        ball_detections = select_ball_detection(dedicated_ball_detections, base_model_ball_detections)
 
         player_detections, suppressed = suppress_duplicate_person_detections(player_detections)
         duplicate_player_detections_suppressed += suppressed
@@ -889,6 +968,7 @@ def analyze(args):
 
 def parse_args():
     pitch_model_default = Path(__file__).resolve().parent / PITCH_MODEL_RELATIVE_PATH
+    ball_model_default = Path(__file__).resolve().parent / BALL_MODEL_RELATIVE_PATH
     parser = argparse.ArgumentParser(description="Analyze a soccer video with YOLOv8.")
     parser.add_argument("--input", required=True, help="Input MP4 path")
     parser.add_argument("--output", required=True, help="Annotated MP4 output path")
@@ -898,8 +978,19 @@ def parse_args():
         default=str(pitch_model_default),
         help="Path to the football pitch keypoint model (.pt)",
     )
+    parser.add_argument(
+        "--ball-model",
+        default=str(ball_model_default),
+        help="Path to the football ball detection model (.pt)",
+    )
     parser.add_argument("--imgsz", type=int, default=640, help="YOLO inference image size")
     parser.add_argument("--conf", type=float, default=0.25, help="YOLO confidence threshold")
+    parser.add_argument(
+        "--ball-conf",
+        type=float,
+        default=BALL_MODEL_MIN_CONFIDENCE,
+        help="Confidence threshold for football ball detections",
+    )
     parser.add_argument(
         "--pitch-keypoint-conf",
         type=float,

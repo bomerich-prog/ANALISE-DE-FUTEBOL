@@ -4,9 +4,17 @@ const { spawnSync } = require('child_process');
 
 const { resolvePython } = require('../server/services/analysis/yolo/pythonResolver');
 
-const MODEL_URL = 'https://drive.google.com/uc?id=1Ma5Kt86tgpdjCTKfum79YMgNnSjcoOyf';
 const MODEL_DIR = path.join(__dirname, '..', 'server', 'services', 'analysis', 'yolo', 'models');
-const MODEL_PATH = path.join(MODEL_DIR, 'football-pitch-detection.pt');
+const MODELS = [
+  {
+    name: 'football-pitch-detection.pt',
+    url: 'https://drive.google.com/uc?id=1Ma5Kt86tgpdjCTKfum79YMgNnSjcoOyf',
+  },
+  {
+    name: 'football-ball-detection.pt',
+    url: 'https://drive.google.com/uc?id=1isw4wx-MK9h9LMr36VvIWlJD6ppUvw7V',
+  },
+];
 
 function runPythonModule(python, args, options = {}) {
   const commandArgs = [...python.args, ...args];
@@ -33,36 +41,37 @@ function ensureGdownInstalled(python) {
   }
 }
 
-function downloadModel(python) {
+function downloadModel(python, model) {
+  const modelPath = path.join(MODEL_DIR, model.name);
   fs.mkdirSync(MODEL_DIR, { recursive: true });
 
-  if (fs.existsSync(MODEL_PATH) && fs.statSync(MODEL_PATH).size > 0) {
-    console.log(`[pitch-model] Model already exists: ${MODEL_PATH}`);
+  if (fs.existsSync(modelPath) && fs.statSync(modelPath).size > 0) {
+    console.log(`[models] Model already exists: ${modelPath}`);
     return;
   }
 
-  console.log(`[pitch-model] Downloading ${MODEL_URL}`);
+  console.log(`[models] Downloading ${model.name} from ${model.url}`);
   const download = runPythonModule(
     python,
-    ['-m', 'gdown', '-O', MODEL_PATH, MODEL_URL],
+    ['-m', 'gdown', '-O', modelPath, model.url],
     { stdio: 'inherit' }
   );
   if (download.error || download.status !== 0) {
-    throw new Error('[pitch-model] Failed to download football-pitch-detection.pt.');
+    throw new Error(`[models] Failed to download ${model.name}.`);
   }
 
-  if (!fs.existsSync(MODEL_PATH) || fs.statSync(MODEL_PATH).size === 0) {
-    throw new Error('[pitch-model] Model download finished but file is missing or empty.');
+  if (!fs.existsSync(modelPath) || fs.statSync(modelPath).size === 0) {
+    throw new Error(`[models] ${model.name} download finished but file is missing or empty.`);
   }
 
-  console.log(`[pitch-model] Model saved at: ${MODEL_PATH}`);
+  console.log(`[models] Model saved at: ${modelPath}`);
 }
 
 function main() {
   const python = resolvePython();
-  console.log(`[pitch-model] Using Python: ${python.command} ${python.args.join(' ')}`.trim());
+  console.log(`[models] Using Python: ${python.command} ${python.args.join(' ')}`.trim());
   ensureGdownInstalled(python);
-  downloadModel(python);
+  MODELS.forEach((model) => downloadModel(python, model));
 }
 
 try {
