@@ -35,7 +35,6 @@ PITCH_MODEL_RELATIVE_PATH = Path("models/football-pitch-detection.pt")
 BALL_MODEL_RELATIVE_PATH = Path("models/football-ball-detection.pt")
 PITCH_KEYPOINT_MIN_CONFIDENCE = 0.25
 BALL_MODEL_MIN_CONFIDENCE = 0.25
-BALL_DETECTION_CONFIDENCE_MARGIN = 0.15
 PITCH_KEYPOINT_COLOR = (255, 0, 255)
 PITCH_KEYPOINT_OUTLINE_COLOR = (255, 255, 255)
 PITCH_KEYPOINT_RADIUS = 4
@@ -538,39 +537,6 @@ def extract_ball_detections(ball_result, confidence_threshold):
     return detections
 
 
-def box_area(box):
-    x1, y1, x2, y2 = box
-    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
-
-
-def pick_best_detection(detections):
-    if not detections:
-        return None
-    return sorted(detections, key=lambda item: (-item["confidence"], box_area(item["box"])))[0]
-
-
-def select_ball_detection(dedicated_model_detections, base_model_detections):
-    dedicated_best = pick_best_detection(dedicated_model_detections)
-    base_best = pick_best_detection(base_model_detections)
-
-    if dedicated_best is None and base_best is None:
-        return []
-    if dedicated_best is not None and base_best is None:
-        return [dedicated_best]
-    if base_best is not None and dedicated_best is None:
-        return [base_best]
-
-    confidence_delta = abs(dedicated_best["confidence"] - base_best["confidence"])
-    if confidence_delta >= BALL_DETECTION_CONFIDENCE_MARGIN:
-        return [dedicated_best if dedicated_best["confidence"] > base_best["confidence"] else base_best]
-
-    dedicated_area = box_area(dedicated_best["box"])
-    base_area = box_area(base_best["box"])
-    if dedicated_area <= base_area:
-        return [dedicated_best]
-    return [base_best]
-
-
 def clamp(value, lower, upper):
     return max(lower, min(upper, value))
 
@@ -777,7 +743,7 @@ def analyze(args):
             imgsz=args.imgsz,
             conf=args.conf,
             verbose=False,
-            classes=[PERSON_CLASS_ID, SPORTS_BALL_CLASS_ID],
+            classes=[PERSON_CLASS_ID],
         )[0]
         pitch_result = pitch_model.predict(
             frame,
@@ -795,7 +761,6 @@ def analyze(args):
         dedicated_ball_detections = extract_ball_detections(ball_result, args.ball_conf)
 
         player_detections = []
-        base_model_ball_detections = []
 
         if result.boxes is not None:
             for detected_box in result.boxes:
@@ -806,12 +771,8 @@ def analyze(args):
                 if class_id == PERSON_CLASS_ID:
                     raw_player_detections += 1
                     player_detections.append({"box": box, "confidence": confidence})
-                elif class_id == SPORTS_BALL_CLASS_ID:
-                    base_model_ball_detections.append(
-                        {"box": box, "confidence": confidence, "source": "base_model"}
-                    )
 
-        ball_detections = select_ball_detection(dedicated_ball_detections, base_model_ball_detections)
+        ball_detections = dedicated_ball_detections
 
         player_detections, suppressed = suppress_duplicate_person_detections(player_detections)
         duplicate_player_detections_suppressed += suppressed
