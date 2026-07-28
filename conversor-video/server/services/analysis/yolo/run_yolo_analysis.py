@@ -15,7 +15,10 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import supervision as sv
 from ultralytics import YOLO
+
+from roboflow_ball import BallTracker
 
 
 PERSON_CLASS_ID = 0
@@ -35,6 +38,7 @@ PITCH_MODEL_RELATIVE_PATH = Path("models/football-pitch-detection.pt")
 BALL_MODEL_RELATIVE_PATH = Path("models/football-ball-detection.pt")
 PITCH_KEYPOINT_MIN_CONFIDENCE = 0.25
 BALL_MODEL_MIN_CONFIDENCE = 0.25
+BALL_TRACKER_BUFFER_SIZE = 20
 PITCH_KEYPOINT_COLOR = (255, 0, 255)
 PITCH_KEYPOINT_OUTLINE_COLOR = (255, 255, 255)
 PITCH_KEYPOINT_RADIUS = 4
@@ -517,24 +521,32 @@ def draw_pitch_keypoints(frame, keypoints):
         )
 
 
-def extract_ball_detections(ball_result, confidence_threshold):
-    detections = []
-    boxes = getattr(ball_result, "boxes", None)
-    if boxes is None:
-        return detections
+def extract_ball_detections(ball_result):
+    return sv.Detections.from_ultralytics(ball_result)
 
-    for detected_box in boxes:
-        confidence = float(detected_box.conf[0])
-        if confidence < confidence_threshold:
-            continue
-        detections.append(
-            {
-                "box": detected_box.xyxy[0].tolist(),
-                "confidence": confidence,
-                "source": "ball_model",
-            }
-        )
-    return detections
+
+def filter_ball_detections_by_confidence(detections, confidence_threshold):
+    if len(detections) == 0 or detections.confidence is None:
+        return detections
+    return detections[detections.confidence >= confidence_threshold]
+
+
+def ball_detections_to_dicts(detections):
+    if len(detections) == 0:
+        return []
+
+    confidence_values = detections.confidence
+    if confidence_values is None:
+        confidence_values = np.zeros(len(detections), dtype=np.float32)
+
+    return [
+        {
+            "box": detections.xyxy[index].tolist(),
+            "confidence": float(confidence_values[index]),
+            "source": "ball_model",
+        }
+        for index in range(len(detections))
+    ]
 
 
 def clamp(value, lower, upper):
@@ -691,6 +703,7 @@ def analyze(args):
     if not ball_model_path.exists():
         raise FileNotFoundError(f"Modelo de detecção da bola não encontrado: {ball_model_path}")
     ball_model = YOLO(str(ball_model_path))
+    ball_tracker = BallTracker(buffer_size=BALL_TRACKER_BUFFER_SIZE)
     capture = cv2.VideoCapture(str(input_path))
     if not capture.isOpened():
         raise RuntimeError("Não foi possível abrir o vídeo para análise.")
@@ -758,7 +771,11 @@ def analyze(args):
             verbose=False,
         )[0]
         pitch_keypoints = extract_pitch_keypoints(pitch_result, args.pitch_keypoint_conf)
-        dedicated_ball_detections = extract_ball_detections(ball_result, args.ball_conf)
+        dedicated_ball_detections = extract_ball_detections(ball_result)
+        dedicated_ball_detections = filter_ball_detections_by_confidence(
+            dedicated_ball_detections, args.ball_conf
+        )
+        dedicated_ball_detections = ball_tracker.update(dedicated_ball_detections)
 
         player_detections = []
 
@@ -772,7 +789,7 @@ def analyze(args):
                     raw_player_detections += 1
                     player_detections.append({"box": box, "confidence": confidence})
 
-        ball_detections = dedicated_ball_detections
+        ball_detections = ball_detections_to_dicts(dedicated_ball_detections)
 
         player_detections, suppressed = suppress_duplicate_person_detections(player_detections)
         duplicate_player_detections_suppressed += suppressed
