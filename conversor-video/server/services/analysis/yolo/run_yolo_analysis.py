@@ -37,7 +37,6 @@ LIVE_DEBUG_FRAME_RETRY_BASE_DELAY_SECONDS = 0.03
 PITCH_MODEL_RELATIVE_PATH = Path("models/football-pitch-detection.pt")
 BALL_MODEL_RELATIVE_PATH = Path("models/football-ball-detection.pt")
 PITCH_KEYPOINT_MIN_CONFIDENCE = 0.25
-BALL_MODEL_MIN_CONFIDENCE = 0.25
 BALL_TRACKER_BUFFER_SIZE = 20
 PITCH_KEYPOINT_COLOR = (255, 0, 255)
 PITCH_KEYPOINT_OUTLINE_COLOR = (255, 255, 255)
@@ -525,12 +524,6 @@ def extract_ball_detections(ball_result):
     return sv.Detections.from_ultralytics(ball_result)
 
 
-def filter_ball_detections_by_confidence(detections, confidence_threshold):
-    if len(detections) == 0 or detections.confidence is None:
-        return detections
-    return detections[detections.confidence >= confidence_threshold]
-
-
 def ball_detections_to_dicts(detections):
     if len(detections) == 0:
         return []
@@ -704,6 +697,16 @@ def analyze(args):
         raise FileNotFoundError(f"Modelo de detecção da bola não encontrado: {ball_model_path}")
     ball_model = YOLO(str(ball_model_path))
     ball_tracker = BallTracker(buffer_size=BALL_TRACKER_BUFFER_SIZE)
+
+    def ball_slicer_callback(image_slice):
+        ball_slice_result = ball_model(image_slice, imgsz=640, verbose=False)[0]
+        return extract_ball_detections(ball_slice_result)
+
+    ball_slicer = sv.InferenceSlicer(
+        callback=ball_slicer_callback,
+        overlap_filter_strategy=sv.OverlapFilter.NONE,
+        slice_wh=(640, 640),
+    )
     capture = cv2.VideoCapture(str(input_path))
     if not capture.isOpened():
         raise RuntimeError("Não foi possível abrir o vídeo para análise.")
@@ -764,17 +767,8 @@ def analyze(args):
             conf=args.pitch_keypoint_conf,
             verbose=False,
         )[0]
-        ball_result = ball_model.predict(
-            frame,
-            imgsz=args.imgsz,
-            conf=args.ball_conf,
-            verbose=False,
-        )[0]
         pitch_keypoints = extract_pitch_keypoints(pitch_result, args.pitch_keypoint_conf)
-        dedicated_ball_detections = extract_ball_detections(ball_result)
-        dedicated_ball_detections = filter_ball_detections_by_confidence(
-            dedicated_ball_detections, args.ball_conf
-        )
+        dedicated_ball_detections = ball_slicer(frame).with_nms(threshold=0.1)
         dedicated_ball_detections = ball_tracker.update(dedicated_ball_detections)
 
         player_detections = []
@@ -963,12 +957,6 @@ def parse_args():
     )
     parser.add_argument("--imgsz", type=int, default=640, help="YOLO inference image size")
     parser.add_argument("--conf", type=float, default=0.25, help="YOLO confidence threshold")
-    parser.add_argument(
-        "--ball-conf",
-        type=float,
-        default=BALL_MODEL_MIN_CONFIDENCE,
-        help="Confidence threshold for football ball detections",
-    )
     parser.add_argument(
         "--pitch-keypoint-conf",
         type=float,
