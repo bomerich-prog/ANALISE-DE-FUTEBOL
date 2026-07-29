@@ -704,7 +704,7 @@ def analyze(args):
 
     ball_slicer = sv.InferenceSlicer(
         callback=ball_slicer_callback,
-        overlap_filter_strategy=sv.OverlapFilter.NONE,
+        overlap_filter=sv.OverlapFilter.NONE,
         slice_wh=(640, 640),
     )
     capture = cv2.VideoCapture(str(input_path))
