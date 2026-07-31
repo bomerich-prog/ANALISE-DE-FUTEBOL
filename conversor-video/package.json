@@ -6,6 +6,7 @@
   "scripts": {
     "postinstall": "node scripts/download-pitch-model.js",
     "setup:pitch-model": "node scripts/download-pitch-model.js",
+    "setup:roboflow-models": "node scripts/download-pitch-model.js",
     "start": "node server/index.js",
     "dev": "node server/index.js"
   },

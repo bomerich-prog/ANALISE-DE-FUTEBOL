@@ -9,6 +9,11 @@ const { resolvePythonCached } = require('./pythonResolver');
 const WINDOWS_STORE_ALIAS_HINT =
   'O Windows tentou abrir o atalho da Microsoft Store para Python. Instale o Python a partir de https://www.python.org/downloads/ (marcando "Add Python to PATH") ou desabilite o alias em Configurações > Aplicativos > Configurações avançadas do aplicativo > Aliases de execução do aplicativo, e reinicie o servidor. Alternativamente, defina YOLO_PYTHON_BIN apontando para um python.exe válido (ex.: "py -3").';
 const DEFAULT_DEBUG_LIVE_FRAMES_ENABLED = true;
+const DEFAULT_PLAYER_MODEL_PATH = path.join(
+  __dirname,
+  'models',
+  'football-player-detection.pt'
+);
 
 function parseOptionalBoolean(value) {
   if (value === undefined || value === null) return undefined;
@@ -23,9 +28,9 @@ class YoloAnalysisProvider extends AnalysisProvider {
   constructor(options = {}) {
     super();
     this.pythonBinOption = options.pythonBin || process.env.YOLO_PYTHON_BIN || null;
-    this.model = options.model || process.env.YOLO_MODEL || 'yolov8n.pt';
+    this.model = options.model || process.env.YOLO_MODEL || DEFAULT_PLAYER_MODEL_PATH;
     this.confidence = options.confidence || process.env.YOLO_CONFIDENCE || '0.25';
-    this.imageSize = options.imageSize || process.env.YOLO_IMAGE_SIZE || '640';
+    this.imageSize = options.imageSize || process.env.YOLO_IMAGE_SIZE || '1280';
     this.workerPath = options.workerPath || path.join(__dirname, 'run_yolo_analysis.py');
     const envDebugLiveFrames = parseOptionalBoolean(process.env.YOLO_DEBUG_LIVE_FRAMES);
     this.debugLiveFrames =
