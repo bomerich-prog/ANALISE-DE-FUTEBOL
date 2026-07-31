@@ -7,6 +7,10 @@ const { resolvePython } = require('../server/services/analysis/yolo/pythonResolv
 const MODEL_DIR = path.join(__dirname, '..', 'server', 'services', 'analysis', 'yolo', 'models');
 const MODELS = [
   {
+    name: 'football-player-detection.pt',
+    url: 'https://drive.google.com/uc?id=17PXFNlx-jI7VjVo_vQnB1sONjRyvoB-q',
+  },
+  {
     name: 'football-pitch-detection.pt',
     url: 'https://drive.google.com/uc?id=1Ma5Kt86tgpdjCTKfum79YMgNnSjcoOyf',
   },
@@ -30,14 +34,14 @@ function ensureGdownInstalled(python) {
   const check = runPythonModule(python, ['-m', 'gdown', '--version']);
   if (check.status === 0) return;
 
-  console.log('[pitch-model] Installing gdown...');
+  console.log('[roboflow-models] Installing gdown...');
   const install = runPythonModule(
     python,
     ['-m', 'pip', 'install', 'gdown'],
     { stdio: 'inherit' }
   );
   if (install.error || install.status !== 0) {
-    throw new Error('[pitch-model] Failed to install gdown.');
+    throw new Error('[roboflow-models] Failed to install gdown.');
   }
 }
 
