@@ -4,9 +4,17 @@ const { spawnSync } = require('child_process');
 
 const { resolvePython } = require('../server/services/analysis/yolo/pythonResolver');
 
-const MODEL_URL = 'https://drive.google.com/uc?id=1Ma5Kt86tgpdjCTKfum79YMgNnSjcoOyf';
 const MODEL_DIR = path.join(__dirname, '..', 'server', 'services', 'analysis', 'yolo', 'models');
-const MODEL_PATH = path.join(MODEL_DIR, 'football-pitch-detection.pt');
+const MODELS_TO_DOWNLOAD = [
+  {
+    name: 'football-player-detection.pt',
+    url: 'https://drive.google.com/uc?id=17PXFNlx-jI7VjVo_vQnB1sONjRyvoB-q',
+  },
+  {
+    name: 'football-pitch-detection.pt',
+    url: 'https://drive.google.com/uc?id=1Ma5Kt86tgpdjCTKfum79YMgNnSjcoOyf',
+  },
+];
 
 function runPythonModule(python, args, options = {}) {
   const commandArgs = [...python.args, ...args];
@@ -22,47 +30,50 @@ function ensureGdownInstalled(python) {
   const check = runPythonModule(python, ['-m', 'gdown', '--version']);
   if (check.status === 0) return;
 
-  console.log('[pitch-model] Installing gdown...');
+  console.log('[roboflow-models] Installing gdown...');
   const install = runPythonModule(
     python,
     ['-m', 'pip', 'install', 'gdown'],
     { stdio: 'inherit' }
   );
   if (install.error || install.status !== 0) {
-    throw new Error('[pitch-model] Failed to install gdown.');
+    throw new Error('[roboflow-models] Failed to install gdown.');
   }
 }
 
-function downloadModel(python) {
+function downloadModels(python) {
   fs.mkdirSync(MODEL_DIR, { recursive: true });
 
-  if (fs.existsSync(MODEL_PATH) && fs.statSync(MODEL_PATH).size > 0) {
-    console.log(`[pitch-model] Model already exists: ${MODEL_PATH}`);
-    return;
-  }
+  for (const model of MODELS_TO_DOWNLOAD) {
+    const modelPath = path.join(MODEL_DIR, model.name);
+    if (fs.existsSync(modelPath) && fs.statSync(modelPath).size > 0) {
+      console.log(`[roboflow-models] Model already exists: ${modelPath}`);
+      continue;
+    }
 
-  console.log(`[pitch-model] Downloading ${MODEL_URL}`);
-  const download = runPythonModule(
-    python,
-    ['-m', 'gdown', '-O', MODEL_PATH, MODEL_URL],
-    { stdio: 'inherit' }
-  );
-  if (download.error || download.status !== 0) {
-    throw new Error('[pitch-model] Failed to download football-pitch-detection.pt.');
-  }
+    console.log(`[roboflow-models] Downloading ${model.url}`);
+    const download = runPythonModule(
+      python,
+      ['-m', 'gdown', '-O', modelPath, model.url],
+      { stdio: 'inherit' }
+    );
+    if (download.error || download.status !== 0) {
+      throw new Error(`[roboflow-models] Failed to download ${model.name}.`);
+    }
 
-  if (!fs.existsSync(MODEL_PATH) || fs.statSync(MODEL_PATH).size === 0) {
-    throw new Error('[pitch-model] Model download finished but file is missing or empty.');
-  }
+    if (!fs.existsSync(modelPath) || fs.statSync(modelPath).size === 0) {
+      throw new Error(`[roboflow-models] Download finished but file is missing or empty: ${model.name}`);
+    }
 
-  console.log(`[pitch-model] Model saved at: ${MODEL_PATH}`);
+    console.log(`[roboflow-models] Model saved at: ${modelPath}`);
+  }
 }
 
 function main() {
   const python = resolvePython();
-  console.log(`[pitch-model] Using Python: ${python.command} ${python.args.join(' ')}`.trim());
+  console.log(`[roboflow-models] Using Python: ${python.command} ${python.args.join(' ')}`.trim());
   ensureGdownInstalled(python);
-  downloadModel(python);
+  downloadModels(python);
 }
 
 try {

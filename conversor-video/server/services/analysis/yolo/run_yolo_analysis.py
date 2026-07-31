@@ -18,8 +18,10 @@ import numpy as np
 from ultralytics import YOLO
 
 
-PERSON_CLASS_ID = 0
-SPORTS_BALL_CLASS_ID = 32
+BALL_CLASS_ID = 0
+GOALKEEPER_CLASS_ID = 1
+PLAYER_CLASS_ID = 2
+REFEREE_CLASS_ID = 3
 PERSON_DUPLICATE_IOU_THRESHOLD = 0.85
 MIN_FIELD_AREA_RATIO = 0.10
 MIN_WHITE_LINE_PIXELS = 80
@@ -31,11 +33,24 @@ LIVE_DEBUG_FRAME_JPEG_QUALITY = 72
 LIVE_DEBUG_FRAME_NAME = "live-frame.jpg"
 LIVE_DEBUG_FRAME_REPLACE_RETRIES = 6
 LIVE_DEBUG_FRAME_RETRY_BASE_DELAY_SECONDS = 0.03
+PLAYER_MODEL_RELATIVE_PATH = Path("models/football-player-detection.pt")
 PITCH_MODEL_RELATIVE_PATH = Path("models/football-pitch-detection.pt")
 PITCH_KEYPOINT_MIN_CONFIDENCE = 0.25
 PITCH_KEYPOINT_COLOR = (255, 0, 255)
 PITCH_KEYPOINT_OUTLINE_COLOR = (255, 255, 255)
 PITCH_KEYPOINT_RADIUS = 4
+DETECTION_LABEL_BY_CLASS_ID = {
+    PLAYER_CLASS_ID: "Player",
+    GOALKEEPER_CLASS_ID: "Goalkeeper",
+    REFEREE_CLASS_ID: "Referee",
+    BALL_CLASS_ID: "Ball",
+}
+CLASS_COLOR_OVERRIDES = {
+    "Player": (0, 200, 83),
+    "Goalkeeper": (255, 193, 7),
+    "Referee": (138, 43, 226),
+    "Ball": (0, 179, 255),
+}
 
 
 def emit(payload):
@@ -441,6 +456,13 @@ def resolve_pitch_model_path(pitch_model_arg):
     return candidate.resolve()
 
 
+def resolve_player_model_path(player_model_arg):
+    candidate = Path(player_model_arg)
+    if not candidate.is_absolute():
+        candidate = Path(__file__).resolve().parent / candidate
+    return candidate.resolve()
+
+
 def extract_pitch_keypoints(pitch_result, confidence_threshold):
     keypoints = getattr(pitch_result, "keypoints", None)
     if keypoints is None:
@@ -540,7 +562,7 @@ def draw_detection(frame, box, class_name, confidence, color=None):
     y1 = clamp(y1, 0, frame.shape[0] - 1)
     y2 = clamp(y2, 0, frame.shape[0] - 1)
 
-    color = color or ((0, 200, 83) if class_name == "Player" else (0, 179, 255))
+    color = color or CLASS_COLOR_OVERRIDES.get(class_name, (0, 179, 255))
     label = f"{class_name} - {round(confidence * 100)}%"
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
     draw_label(frame, x1, y1, label, color)
@@ -652,7 +674,12 @@ def analyze(args):
     if not input_path.exists():
         raise FileNotFoundError(f"Vídeo não encontrado: {input_path}")
 
-    model = YOLO(args.model)
+    player_model_path = resolve_player_model_path(args.model)
+    if not player_model_path.exists():
+        raise FileNotFoundError(
+            f"Modelo oficial de detecção de jogadores não encontrado: {player_model_path}"
+        )
+    model = YOLO(str(player_model_path))
     pitch_model_path = resolve_pitch_model_path(args.pitch_model)
     if not pitch_model_path.exists():
         raise FileNotFoundError(f"Modelo de detecção de campo não encontrado: {pitch_model_path}")
@@ -672,7 +699,7 @@ def analyze(args):
         {
             "type": "progress",
             "progress": 1,
-            "message": "YOLOv8 carregado. Iniciando detecção de jogadores, bola e keypoints do campo...",
+            "message": "YOLOv8 carregado. Iniciando detecção de player/goalkeeper/referee/ball e keypoints do campo...",
             "framesProcessed": 0,
             "playersDetected": 0,
             "ballDetected": False,
@@ -709,7 +736,7 @@ def analyze(args):
             imgsz=args.imgsz,
             conf=args.conf,
             verbose=False,
-            classes=[PERSON_CLASS_ID, SPORTS_BALL_CLASS_ID],
+            classes=[BALL_CLASS_ID, GOALKEEPER_CLASS_ID, PLAYER_CLASS_ID, REFEREE_CLASS_ID],
         )[0]
         pitch_result = pitch_model.predict(
             frame,
@@ -720,6 +747,8 @@ def analyze(args):
         pitch_keypoints = extract_pitch_keypoints(pitch_result, args.pitch_keypoint_conf)
 
         player_detections = []
+        goalkeeper_detections = []
+        referee_detections = []
         ball_detections = []
 
         if result.boxes is not None:
@@ -728,20 +757,38 @@ def analyze(args):
                 confidence = float(detected_box.conf[0])
                 box = detected_box.xyxy[0].tolist()
 
-                if class_id == PERSON_CLASS_ID:
+                if class_id == PLAYER_CLASS_ID:
                     raw_player_detections += 1
                     player_detections.append({"box": box, "confidence": confidence})
-                elif class_id == SPORTS_BALL_CLASS_ID:
+                elif class_id == GOALKEEPER_CLASS_ID:
+                    goalkeeper_detections.append({"box": box, "confidence": confidence})
+                elif class_id == REFEREE_CLASS_ID:
+                    referee_detections.append({"box": box, "confidence": confidence})
+                elif class_id == BALL_CLASS_ID:
                     ball_detections.append({"box": box, "confidence": confidence})
 
         player_detections, suppressed = suppress_duplicate_person_detections(player_detections)
         duplicate_player_detections_suppressed += suppressed
+        goalkeeper_detections, _ = suppress_duplicate_person_detections(goalkeeper_detections)
+        referee_detections, _ = suppress_duplicate_person_detections(referee_detections)
 
         accepted_player_detections = []
+        accepted_goalkeeper_detections = []
+        accepted_referee_detections = []
         rejected_player_detections = []
         for detection in player_detections:
             if is_detection_inside_field(detection, field_mask):
                 accepted_player_detections.append(detection)
+            else:
+                rejected_player_detections.append(detection)
+        for detection in goalkeeper_detections:
+            if is_detection_inside_field(detection, field_mask):
+                accepted_goalkeeper_detections.append(detection)
+            else:
+                rejected_player_detections.append(detection)
+        for detection in referee_detections:
+            if is_detection_inside_field(detection, field_mask):
+                accepted_referee_detections.append(detection)
             else:
                 rejected_player_detections.append(detection)
 
@@ -765,7 +812,17 @@ def analyze(args):
             confidence_count["Player"] += 1
             draw_detection(output_frame, detection["box"], "Player", confidence)
             if debug_frame is not None:
-                draw_detection(debug_frame, detection["box"], "Player", confidence, (0, 200, 83))
+                draw_detection(debug_frame, detection["box"], "Player", confidence)
+
+        for detection in accepted_goalkeeper_detections:
+            draw_detection(output_frame, detection["box"], "Goalkeeper", detection["confidence"])
+            if debug_frame is not None:
+                draw_detection(debug_frame, detection["box"], "Goalkeeper", detection["confidence"])
+
+        for detection in accepted_referee_detections:
+            draw_detection(output_frame, detection["box"], "Referee", detection["confidence"])
+            if debug_frame is not None:
+                draw_detection(debug_frame, detection["box"], "Referee", detection["confidence"])
 
         if debug_frame is not None:
             for detection in rejected_player_detections:
@@ -837,7 +894,7 @@ def analyze(args):
     result = {
         "version": "yolo-1.0",
         "provider": "YoloAnalysisProvider",
-        "model": args.model,
+        "model": str(player_model_path),
         "architecture": {
             "yolo": "implemented",
             "tracking": "pending",
@@ -859,12 +916,12 @@ def analyze(args):
             "avg_ball_confidence": avg_ball_confidence,
         },
         "detections": {
-            "classes": ["Player", "Ball"],
-            "player_class": "person",
-            "ball_class": "sports ball",
+            "classes": ["Player", "Goalkeeper", "Referee", "Ball"],
+            "class_id_map": DETECTION_LABEL_BY_CLASS_ID,
+            "player_detection_model": str(player_model_path),
             "confidence_threshold": args.conf,
             "player_duplicate_iou_threshold": PERSON_DUPLICATE_IOU_THRESHOLD,
-            "field_filter": "person bbox bottom-center foot point must be inside white-line-guided playable-field polygon",
+            "field_filter": "player/goalkeeper/referee bbox bottom-center foot point must be inside white-line-guided playable-field polygon",
             "labels": "class name and confidence are burned into the annotated video",
         },
         "tracking": {"status": "pending"},
@@ -888,17 +945,22 @@ def analyze(args):
 
 
 def parse_args():
+    player_model_default = Path(__file__).resolve().parent / PLAYER_MODEL_RELATIVE_PATH
     pitch_model_default = Path(__file__).resolve().parent / PITCH_MODEL_RELATIVE_PATH
     parser = argparse.ArgumentParser(description="Analyze a soccer video with YOLOv8.")
     parser.add_argument("--input", required=True, help="Input MP4 path")
     parser.add_argument("--output", required=True, help="Annotated MP4 output path")
-    parser.add_argument("--model", default="yolov8n.pt", help="Ultralytics YOLO model")
+    parser.add_argument(
+        "--model",
+        default=str(player_model_default),
+        help="Path to the official football player detector model (.pt)",
+    )
     parser.add_argument(
         "--pitch-model",
         default=str(pitch_model_default),
         help="Path to the football pitch keypoint model (.pt)",
     )
-    parser.add_argument("--imgsz", type=int, default=640, help="YOLO inference image size")
+    parser.add_argument("--imgsz", type=int, default=1280, help="YOLO inference image size")
     parser.add_argument("--conf", type=float, default=0.25, help="YOLO confidence threshold")
     parser.add_argument(
         "--pitch-keypoint-conf",
