@@ -42,7 +42,10 @@ PITCH_MODEL_RELATIVE_PATH = Path("models/football-pitch-detection.pt")
 BALL_MODEL_RELATIVE_PATH = Path("models/football-ball-detection.pt")
 PITCH_KEYPOINT_MIN_CONFIDENCE = 0.25
 BALL_TRACKER_BUFFER_SIZE = 20
-TEAM_CLASSIFIER_STRIDE = 60
+TEAM_CLASSIFIER_STRIDE = 15
+TEAM_CLASSIFIER_MIN_CROP_HEIGHT = 80
+TEAM_CLASSIFIER_MIN_CROP_WIDTH = 30
+TEAM_CLASSIFIER_BORDER_MARGIN = 2
 PITCH_KEYPOINT_COLOR = (255, 0, 255)
 PITCH_KEYPOINT_OUTLINE_COLOR = (255, 255, 255)
 PITCH_KEYPOINT_RADIUS = 4
@@ -467,6 +470,29 @@ def get_player_crops_from_payload(frame, detections):
     return crops
 
 
+def classify_training_crop_quality(box, frame_width, frame_height):
+    x1, y1, x2, y2 = [float(value) for value in box]
+    if not all(np.isfinite([x1, y1, x2, y2])):
+        return False, "empty"
+
+    crop_width = x2 - x1
+    crop_height = y2 - y1
+    if crop_width <= 0 or crop_height <= 0:
+        return False, "empty"
+    if crop_height < TEAM_CLASSIFIER_MIN_CROP_HEIGHT or crop_width < TEAM_CLASSIFIER_MIN_CROP_WIDTH:
+        return False, "small"
+
+    if (
+        x1 <= TEAM_CLASSIFIER_BORDER_MARGIN
+        or y1 <= TEAM_CLASSIFIER_BORDER_MARGIN
+        or x2 >= frame_width - TEAM_CLASSIFIER_BORDER_MARGIN
+        or y2 >= frame_height - TEAM_CLASSIFIER_BORDER_MARGIN
+    ):
+        return False, "border"
+
+    return True, "ok"
+
+
 def resolve_model_path(model_arg):
     candidate = Path(model_arg)
     if not candidate.is_absolute():
@@ -759,11 +785,22 @@ def analyze(args):
     # for easy reactivation, but temporarily disabled from the runtime flow.
     ball_slicer = None
     team_classifier_crops = []
+    team_training_stats = {
+        "stride": TEAM_CLASSIFIER_STRIDE,
+        "frames_scanned": 0,
+        "player_detections_seen": 0,
+        "crops_used_for_fit": 0,
+        "discarded_small": 0,
+        "discarded_empty": 0,
+        "discarded_border": 0,
+    }
     team_training_frames = sv.get_video_frames_generator(
         source_path=str(input_path),
         stride=TEAM_CLASSIFIER_STRIDE,
     )
     for training_frame in team_training_frames:
+        team_training_stats["frames_scanned"] += 1
+        frame_height, frame_width = training_frame.shape[:2]
         team_training_result = model.predict(
             training_frame,
             imgsz=args.imgsz,
@@ -772,14 +809,48 @@ def analyze(args):
             classes=[PLAYER_CLASS_ID],
         )[0]
         team_training_detections = sv.Detections.from_ultralytics(team_training_result)
-        team_classifier_crops += get_crops(
-            training_frame,
-            team_training_detections[team_training_detections.class_id == PLAYER_CLASS_ID],
-        )
+        player_training_detections = team_training_detections[
+            team_training_detections.class_id == PLAYER_CLASS_ID
+        ]
+        team_training_stats["player_detections_seen"] += len(player_training_detections)
+        for player_box in player_training_detections.xyxy:
+            can_use_crop, reason = classify_training_crop_quality(
+                player_box,
+                frame_width,
+                frame_height,
+            )
+            if not can_use_crop:
+                if reason == "small":
+                    team_training_stats["discarded_small"] += 1
+                elif reason == "border":
+                    team_training_stats["discarded_border"] += 1
+                else:
+                    team_training_stats["discarded_empty"] += 1
+                continue
+
+            team_classifier_crops.append(sv.crop_image(training_frame, player_box))
+            team_training_stats["crops_used_for_fit"] += 1
 
     if len(team_classifier_crops) == 0:
         raise RuntimeError("TeamClassifier: nenhum crop de jogador encontrado para treinamento.")
     team_classifier.fit(team_classifier_crops)
+    total_discarded_training_crops = (
+        team_training_stats["discarded_small"]
+        + team_training_stats["discarded_empty"]
+        + team_training_stats["discarded_border"]
+    )
+    emit(
+        {
+            "type": "teamClassifierTraining",
+            "samplesUsed": team_training_stats["crops_used_for_fit"],
+            "playerDetectionsSeen": team_training_stats["player_detections_seen"],
+            "discarded": total_discarded_training_crops,
+            "discardedSmall": team_training_stats["discarded_small"],
+            "discardedEmpty": team_training_stats["discarded_empty"],
+            "discardedBorder": team_training_stats["discarded_border"],
+            "stride": TEAM_CLASSIFIER_STRIDE,
+        }
+    )
 
     capture = cv2.VideoCapture(str(input_path))
     if not capture.isOpened():
@@ -816,6 +887,8 @@ def analyze(args):
     ball_detected = False
     confidence_sum = {"Player": 0.0, "Ball": 0.0}
     confidence_count = {"Player": 0, "Ball": 0}
+    team_prediction_counts = {0: 0, 1: 0}
+    team_classification_frame_examples = []
     last_emitted_progress = -1
 
     while True:
@@ -909,6 +982,21 @@ def analyze(args):
         for idx, detection in enumerate(accepted_player_detections):
             team_id = int(players_team_id[idx]) if idx < len(players_team_id) else 0
             detection["team_id"] = team_id
+            if team_id in team_prediction_counts:
+                team_prediction_counts[team_id] += 1
+        if accepted_player_detections and len(team_classification_frame_examples) < 3:
+            team_classification_frame_examples.append(
+                {
+                    "frame": frames_processed + 1,
+                    "players": [
+                        {
+                            "track_id": int(detection.get("track_id", -1)),
+                            "team_id": int(detection.get("team_id", 0)),
+                        }
+                        for detection in accepted_player_detections[:5]
+                    ],
+                }
+            )
 
         discarded_outside_field += len(rejected_player_detections)
         filtered_player_detections += len(accepted_player_detections)
@@ -1086,6 +1174,24 @@ def analyze(args):
             "method": "sv.ByteTrack(minimum_consecutive_frames=3)",
             "id_storage": "track_id is stored per detection dict for player/goalkeeper/referee and rendered in labels",
             "team_classifier": "TeamClassifier predicts team_id (0/1) for players based on crops",
+        },
+        "team_classifier": {
+            "training": {
+                "architecture": "SigLIP + UMAP + KMeans",
+                "stride": team_training_stats["stride"],
+                "frames_scanned": team_training_stats["frames_scanned"],
+                "player_detections_seen": team_training_stats["player_detections_seen"],
+                "samples_used_for_fit": team_training_stats["crops_used_for_fit"],
+                "discarded_small": team_training_stats["discarded_small"],
+                "discarded_empty": team_training_stats["discarded_empty"],
+                "discarded_border": team_training_stats["discarded_border"],
+                "discarded_total": total_discarded_training_crops,
+            },
+            "prediction_counts": {
+                "team_0": team_prediction_counts[0],
+                "team_1": team_prediction_counts[1],
+            },
+            "frame_examples": team_classification_frame_examples,
         },
         "features": {"status": "pending"},
         "machine_learning": {"status": "pending"},
