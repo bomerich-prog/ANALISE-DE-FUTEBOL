@@ -594,8 +594,15 @@ def draw_detection(frame, box, class_name, confidence, color=None):
     y1 = clamp(y1, 0, frame.shape[0] - 1)
     y2 = clamp(y2, 0, frame.shape[0] - 1)
 
-    color = color or CLASS_COLOR_OVERRIDES.get(class_name, (0, 179, 255))
-    label = f"{class_name} - {round(confidence * 100)}%"
+    track_id = None
+    display_name = class_name
+    if isinstance(class_name, tuple):
+        display_name, track_id = class_name
+    color = color or CLASS_COLOR_OVERRIDES.get(display_name, (0, 179, 255))
+    if track_id is not None:
+        label = f"{display_name} #{track_id} - {round(confidence * 100)}%"
+    else:
+        label = f"{display_name} - {round(confidence * 100)}%"
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
     draw_label(frame, x1, y1, label, color)
 
@@ -721,6 +728,7 @@ def analyze(args):
         raise FileNotFoundError(f"Modelo de detecção da bola não encontrado: {ball_model_path}")
     ball_model = YOLO(str(ball_model_path))
     ball_tracker = BallTracker(buffer_size=BALL_TRACKER_BUFFER_SIZE)
+    player_tracker = sv.ByteTrack(minimum_consecutive_frames=3)
 
     def ball_slicer_callback(image_slice):
         ball_slice_result = ball_model(image_slice, imgsz=640, verbose=False)[0]
@@ -783,6 +791,8 @@ def analyze(args):
             verbose=False,
             classes=[GOALKEEPER_CLASS_ID, PLAYER_CLASS_ID, REFEREE_CLASS_ID],
         )[0]
+        tracked_human_detections = sv.Detections.from_ultralytics(result)
+        tracked_human_detections = player_tracker.update_with_detections(tracked_human_detections)
         pitch_result = pitch_model.predict(
             frame,
             imgsz=args.imgsz,
@@ -799,20 +809,24 @@ def analyze(args):
         referee_detections = []
         ball_detections = []
 
-        if result.boxes is not None:
-            for detected_box in result.boxes:
-                class_id = int(detected_box.cls[0])
-                confidence = float(detected_box.conf[0])
-                box = detected_box.xyxy[0].tolist()
+        tracker_ids = tracked_human_detections.tracker_id
+        if tracker_ids is None:
+            tracker_ids = np.full(len(tracked_human_detections), -1, dtype=np.int32)
 
-                if class_id == PLAYER_CLASS_ID:
-                    raw_player_detections += 1
-                    player_detections.append({"box": box, "confidence": confidence})
+        for detection_index in range(len(tracked_human_detections)):
+            class_id = int(tracked_human_detections.class_id[detection_index])
+            confidence = float(tracked_human_detections.confidence[detection_index])
+            box = tracked_human_detections.xyxy[detection_index].tolist()
+            track_id = int(tracker_ids[detection_index])
+            detection_payload = {"box": box, "confidence": confidence, "track_id": track_id}
 
-                elif class_id == GOALKEEPER_CLASS_ID:
-                    goalkeeper_detections.append({"box": box, "confidence": confidence})
-                elif class_id == REFEREE_CLASS_ID:
-                    referee_detections.append({"box": box, "confidence": confidence})
+            if class_id == PLAYER_CLASS_ID:
+                raw_player_detections += 1
+                player_detections.append(detection_payload)
+            elif class_id == GOALKEEPER_CLASS_ID:
+                goalkeeper_detections.append(detection_payload)
+            elif class_id == REFEREE_CLASS_ID:
+                referee_detections.append(detection_payload)
 
         ball_detections = ball_detections_to_dicts(dedicated_ball_detections)
 
@@ -859,19 +873,49 @@ def analyze(args):
             confidence = detection["confidence"]
             confidence_sum["Player"] += confidence
             confidence_count["Player"] += 1
-            draw_detection(output_frame, detection["box"], "Player", confidence)
+            draw_detection(
+                output_frame,
+                detection["box"],
+                ("Player", detection.get("track_id")),
+                confidence,
+            )
             if debug_frame is not None:
-                draw_detection(debug_frame, detection["box"], "Player", confidence)
+                draw_detection(
+                    debug_frame,
+                    detection["box"],
+                    ("Player", detection.get("track_id")),
+                    confidence,
+                )
 
         for detection in accepted_goalkeeper_detections:
-            draw_detection(output_frame, detection["box"], "Goalkeeper", detection["confidence"])
+            draw_detection(
+                output_frame,
+                detection["box"],
+                ("Goalkeeper", detection.get("track_id")),
+                detection["confidence"],
+            )
             if debug_frame is not None:
-                draw_detection(debug_frame, detection["box"], "Goalkeeper", detection["confidence"])
+                draw_detection(
+                    debug_frame,
+                    detection["box"],
+                    ("Goalkeeper", detection.get("track_id")),
+                    detection["confidence"],
+                )
 
         for detection in accepted_referee_detections:
-            draw_detection(output_frame, detection["box"], "Referee", detection["confidence"])
+            draw_detection(
+                output_frame,
+                detection["box"],
+                ("Referee", detection.get("track_id")),
+                detection["confidence"],
+            )
             if debug_frame is not None:
-                draw_detection(debug_frame, detection["box"], "Referee", detection["confidence"])
+                draw_detection(
+                    debug_frame,
+                    detection["box"],
+                    ("Referee", detection.get("track_id")),
+                    detection["confidence"],
+                )
 
         if debug_frame is not None:
             for detection in rejected_player_detections:
@@ -946,7 +990,7 @@ def analyze(args):
         "model": str(player_model_path),
         "architecture": {
             "yolo": "implemented",
-            "tracking": "pending",
+            "tracking": "implemented (sv.ByteTrack)",
             "feature_extraction": "pending",
             "machine_learning": "pending",
         },
@@ -973,7 +1017,11 @@ def analyze(args):
             "field_filter": "player/goalkeeper/referee bbox bottom-center foot point must be inside white-line-guided playable-field polygon",
             "labels": "class name and confidence are burned into the annotated video",
         },
-        "tracking": {"status": "pending"},
+        "tracking": {
+            "status": "implemented",
+            "method": "sv.ByteTrack(minimum_consecutive_frames=3)",
+            "id_storage": "track_id is stored per detection dict for player/goalkeeper/referee and rendered in labels",
+        },
         "features": {"status": "pending"},
         "machine_learning": {"status": "pending"},
         "artifacts": {
