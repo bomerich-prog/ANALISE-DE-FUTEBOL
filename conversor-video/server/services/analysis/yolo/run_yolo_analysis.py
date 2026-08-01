@@ -19,6 +19,7 @@ import supervision as sv
 from ultralytics import YOLO
 
 from roboflow_ball import BallTracker
+from roboflow_team import TeamClassifier
 
 
 BALL_CLASS_ID = 0
@@ -41,6 +42,7 @@ PITCH_MODEL_RELATIVE_PATH = Path("models/football-pitch-detection.pt")
 BALL_MODEL_RELATIVE_PATH = Path("models/football-ball-detection.pt")
 PITCH_KEYPOINT_MIN_CONFIDENCE = 0.25
 BALL_TRACKER_BUFFER_SIZE = 20
+TEAM_CLASSIFIER_STRIDE = 60
 PITCH_KEYPOINT_COLOR = (255, 0, 255)
 PITCH_KEYPOINT_OUTLINE_COLOR = (255, 255, 255)
 PITCH_KEYPOINT_RADIUS = 4
@@ -454,6 +456,17 @@ def draw_field_debug_overlay(frame, field_contours):
         cv2.drawContours(frame, field_contours, -1, (0, 255, 255), 3)
 
 
+def get_crops(frame, detections):
+    return [sv.crop_image(frame, xyxy) for xyxy in detections.xyxy]
+
+
+def get_player_crops_from_payload(frame, detections):
+    crops = []
+    for detection in detections:
+        crops.append(sv.crop_image(frame, np.array(detection["box"], dtype=np.int32)))
+    return crops
+
+
 def resolve_model_path(model_arg):
     candidate = Path(model_arg)
     if not candidate.is_absolute():
@@ -595,11 +608,18 @@ def draw_detection(frame, box, class_name, confidence, color=None):
     y2 = clamp(y2, 0, frame.shape[0] - 1)
 
     track_id = None
+    team_id = None
     display_name = class_name
     if isinstance(class_name, tuple):
-        display_name, track_id = class_name
+        display_name = class_name[0]
+        if len(class_name) > 1:
+            track_id = class_name[1]
+        if len(class_name) > 2:
+            team_id = class_name[2]
     color = color or CLASS_COLOR_OVERRIDES.get(display_name, (0, 179, 255))
-    if track_id is not None:
+    if display_name == "Player" and track_id is not None and team_id is not None:
+        label = f"{display_name} #{track_id} [Team {team_id}]"
+    elif track_id is not None:
         label = f"{display_name} #{track_id} - {round(confidence * 100)}%"
     else:
         label = f"{display_name} - {round(confidence * 100)}%"
@@ -729,6 +749,7 @@ def analyze(args):
     ball_model = YOLO(str(ball_model_path))
     ball_tracker = BallTracker(buffer_size=BALL_TRACKER_BUFFER_SIZE)
     player_tracker = sv.ByteTrack(minimum_consecutive_frames=3)
+    team_classifier = TeamClassifier(device="cpu")
 
     def ball_slicer_callback(image_slice):
         ball_slice_result = ball_model(image_slice, imgsz=640, verbose=False)[0]
@@ -737,6 +758,29 @@ def analyze(args):
     # NOTE: InferenceSlicer wiring is intentionally kept in place (callback preserved)
     # for easy reactivation, but temporarily disabled from the runtime flow.
     ball_slicer = None
+    team_classifier_crops = []
+    team_training_frames = sv.get_video_frames_generator(
+        source_path=str(input_path),
+        stride=TEAM_CLASSIFIER_STRIDE,
+    )
+    for training_frame in team_training_frames:
+        team_training_result = model.predict(
+            training_frame,
+            imgsz=args.imgsz,
+            conf=args.conf,
+            verbose=False,
+            classes=[PLAYER_CLASS_ID],
+        )[0]
+        team_training_detections = sv.Detections.from_ultralytics(team_training_result)
+        team_classifier_crops += get_crops(
+            training_frame,
+            team_training_detections[team_training_detections.class_id == PLAYER_CLASS_ID],
+        )
+
+    if len(team_classifier_crops) == 0:
+        raise RuntimeError("TeamClassifier: nenhum crop de jogador encontrado para treinamento.")
+    team_classifier.fit(team_classifier_crops)
+
     capture = cv2.VideoCapture(str(input_path))
     if not capture.isOpened():
         raise RuntimeError("Não foi possível abrir o vídeo para análise.")
@@ -818,7 +862,12 @@ def analyze(args):
             confidence = float(tracked_human_detections.confidence[detection_index])
             box = tracked_human_detections.xyxy[detection_index].tolist()
             track_id = int(tracker_ids[detection_index])
-            detection_payload = {"box": box, "confidence": confidence, "track_id": track_id}
+            detection_payload = {
+                "box": box,
+                "bounding_box": box,
+                "confidence": confidence,
+                "track_id": track_id,
+            }
 
             if class_id == PLAYER_CLASS_ID:
                 raw_player_detections += 1
@@ -855,6 +904,12 @@ def analyze(args):
             else:
                 rejected_player_detections.append(detection)
 
+        player_crops = get_player_crops_from_payload(frame, accepted_player_detections)
+        players_team_id = team_classifier.predict(player_crops) if player_crops else np.array([])
+        for idx, detection in enumerate(accepted_player_detections):
+            team_id = int(players_team_id[idx]) if idx < len(players_team_id) else 0
+            detection["team_id"] = team_id
+
         discarded_outside_field += len(rejected_player_detections)
         filtered_player_detections += len(accepted_player_detections)
 
@@ -876,14 +931,14 @@ def analyze(args):
             draw_detection(
                 output_frame,
                 detection["box"],
-                ("Player", detection.get("track_id")),
+                ("Player", detection.get("track_id"), detection.get("team_id")),
                 confidence,
             )
             if debug_frame is not None:
                 draw_detection(
                     debug_frame,
                     detection["box"],
-                    ("Player", detection.get("track_id")),
+                    ("Player", detection.get("track_id"), detection.get("team_id")),
                     confidence,
                 )
 
@@ -959,6 +1014,15 @@ def analyze(args):
                 "framesProcessed": frames_processed,
                 "playersDetected": max_players_detected,
                 "ballDetected": ball_detected or frame_ball,
+                "playerDetections": [
+                    {
+                        "track_id": int(detection.get("track_id", -1)),
+                        "team_id": int(detection.get("team_id", 0)),
+                        "confidence": float(detection["confidence"]),
+                        "bounding_box": detection["bounding_box"],
+                    }
+                    for detection in accepted_player_detections
+                ],
             }
             if should_emit_debug_frame:
                 debug_frame_written = write_live_debug_frame(args.debug_frame_dir, debug_frame)
@@ -991,7 +1055,7 @@ def analyze(args):
         "architecture": {
             "yolo": "implemented",
             "tracking": "implemented (sv.ByteTrack)",
-            "feature_extraction": "pending",
+            "feature_extraction": "implemented (TeamClassifier/SigLIP)",
             "machine_learning": "pending",
         },
         "metrics": {
@@ -1021,6 +1085,7 @@ def analyze(args):
             "status": "implemented",
             "method": "sv.ByteTrack(minimum_consecutive_frames=3)",
             "id_storage": "track_id is stored per detection dict for player/goalkeeper/referee and rendered in labels",
+            "team_classifier": "TeamClassifier predicts team_id (0/1) for players based on crops",
         },
         "features": {"status": "pending"},
         "machine_learning": {"status": "pending"},
