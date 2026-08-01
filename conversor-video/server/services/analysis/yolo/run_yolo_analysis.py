@@ -726,11 +726,9 @@ def analyze(args):
         ball_slice_result = ball_model(image_slice, imgsz=640, verbose=False)[0]
         return extract_ball_detections(ball_slice_result)
 
-    ball_slicer = sv.InferenceSlicer(
-        callback=ball_slicer_callback,
-        overlap_filter=sv.OverlapFilter.NONE,
-        slice_wh=(640, 640),
-    )
+    # NOTE: InferenceSlicer wiring is intentionally kept in place (callback preserved)
+    # for easy reactivation, but temporarily disabled from the runtime flow.
+    ball_slicer = None
     capture = cv2.VideoCapture(str(input_path))
     if not capture.isOpened():
         raise RuntimeError("Não foi possível abrir o vídeo para análise.")
@@ -792,7 +790,8 @@ def analyze(args):
             verbose=False,
         )[0]
         pitch_keypoints = extract_pitch_keypoints(pitch_result, args.pitch_keypoint_conf)
-        dedicated_ball_detections = ball_slicer(frame).with_nms(threshold=0.1)
+        ball_result = ball_model(frame, imgsz=640, verbose=False)[0]
+        dedicated_ball_detections = extract_ball_detections(ball_result).with_nms(threshold=0.1)
         dedicated_ball_detections = ball_tracker.update(dedicated_ball_detections)
 
         player_detections = []
