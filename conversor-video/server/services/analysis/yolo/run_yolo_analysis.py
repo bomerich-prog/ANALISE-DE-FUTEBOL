@@ -503,6 +503,35 @@ def is_crop_blurry(crop, min_laplacian_variance):
     return cv2.Laplacian(gray_crop, cv2.CV_64F).var() < min_laplacian_variance
 
 
+def resolve_goalkeepers_team_id(players, players_team_id, goalkeepers):
+    if len(goalkeepers) == 0:
+        return np.array([])
+    if len(players) == 0 or len(players_team_id) == 0:
+        return np.full(len(goalkeepers), -1, dtype=np.int32)
+
+    players_xy = np.array(
+        [detection_foot_point(detection["box"]) for detection in players],
+        dtype=np.float32,
+    )
+    goalkeepers_xy = np.array(
+        [detection_foot_point(detection["box"]) for detection in goalkeepers],
+        dtype=np.float32,
+    )
+    team_0_mask = players_team_id == 0
+    team_1_mask = players_team_id == 1
+    if not np.any(team_0_mask) or not np.any(team_1_mask):
+        return np.full(len(goalkeepers), -1, dtype=np.int32)
+
+    team_0_centroid = players_xy[team_0_mask].mean(axis=0)
+    team_1_centroid = players_xy[team_1_mask].mean(axis=0)
+    goalkeepers_team_id = []
+    for goalkeeper_xy in goalkeepers_xy:
+        dist_0 = np.linalg.norm(goalkeeper_xy - team_0_centroid)
+        dist_1 = np.linalg.norm(goalkeeper_xy - team_1_centroid)
+        goalkeepers_team_id.append(0 if dist_0 < dist_1 else 1)
+    return np.array(goalkeepers_team_id)
+
+
 def resolve_model_path(model_arg):
     candidate = Path(model_arg)
     if not candidate.is_absolute():
@@ -653,7 +682,7 @@ def draw_detection(frame, box, class_name, confidence, color=None):
         if len(class_name) > 2:
             team_id = class_name[2]
     color = color or CLASS_COLOR_OVERRIDES.get(display_name, (0, 179, 255))
-    if display_name == "Player" and track_id is not None and team_id is not None:
+    if display_name in {"Player", "Goalkeeper"} and track_id is not None and team_id is not None:
         label = f"{display_name} #{track_id} [Team {team_id}]"
     elif track_id is not None:
         label = f"{display_name} #{track_id} - {round(confidence * 100)}%"
@@ -931,6 +960,7 @@ def analyze(args):
     max_players_detected = 0
     raw_player_detections = 0
     total_player_detections = 0
+    total_goalkeeper_detections = 0
     total_ball_detections = 0
     duplicate_player_detections_suppressed = 0
     filtered_player_detections = 0
@@ -941,6 +971,10 @@ def analyze(args):
     confidence_sum = {"Player": 0.0, "Ball": 0.0}
     confidence_count = {"Player": 0, "Ball": 0}
     team_prediction_counts = {0: 0, 1: 0}
+    goalkeeper_team_prediction_counts = {0: 0, 1: 0}
+    goalkeepers_with_team_id = 0
+    goalkeeper_assignment_frame_examples = []
+    player_team_mutation_violations = 0
     team_classification_frame_examples = []
     last_emitted_progress = -1
 
@@ -1053,6 +1087,41 @@ def analyze(args):
                     ],
                 }
             )
+        player_team_ids_before_goalkeeper_assignment = [
+            int(detection.get("team_id", 0)) for detection in accepted_player_detections
+        ]
+        goalkeepers_team_id = resolve_goalkeepers_team_id(
+            accepted_player_detections,
+            players_team_id,
+            accepted_goalkeeper_detections,
+        )
+        for idx, detection in enumerate(accepted_goalkeeper_detections):
+            goalkeeper_team_id = None
+            if idx < len(goalkeepers_team_id):
+                predicted_team_id = int(goalkeepers_team_id[idx])
+                if predicted_team_id in goalkeeper_team_prediction_counts:
+                    goalkeeper_team_id = predicted_team_id
+                    goalkeeper_team_prediction_counts[goalkeeper_team_id] += 1
+                    goalkeepers_with_team_id += 1
+            detection["team_id"] = goalkeeper_team_id
+        if accepted_goalkeeper_detections and len(goalkeeper_assignment_frame_examples) < 3:
+            goalkeeper_assignment_frame_examples.append(
+                {
+                    "frame": frames_processed + 1,
+                    "goalkeepers": [
+                        {
+                            "track_id": int(detection.get("track_id", -1)),
+                            "team_id": detection.get("team_id"),
+                        }
+                        for detection in accepted_goalkeeper_detections
+                    ],
+                }
+            )
+        player_team_ids_after_goalkeeper_assignment = [
+            int(detection.get("team_id", 0)) for detection in accepted_player_detections
+        ]
+        if player_team_ids_before_goalkeeper_assignment != player_team_ids_after_goalkeeper_assignment:
+            player_team_mutation_violations += 1
 
         discarded_outside_field += len(rejected_player_detections)
         filtered_player_detections += len(accepted_player_detections)
@@ -1090,14 +1159,14 @@ def analyze(args):
             draw_detection(
                 output_frame,
                 detection["box"],
-                ("Goalkeeper", detection.get("track_id")),
+                ("Goalkeeper", detection.get("track_id"), detection.get("team_id")),
                 detection["confidence"],
             )
             if debug_frame is not None:
                 draw_detection(
                     debug_frame,
                     detection["box"],
-                    ("Goalkeeper", detection.get("track_id")),
+                    ("Goalkeeper", detection.get("track_id"), detection.get("team_id")),
                     detection["confidence"],
                 )
 
@@ -1130,8 +1199,10 @@ def analyze(args):
                 draw_detection(debug_frame, detection["box"], "Ball", confidence)
 
         frame_players = len(accepted_player_detections)
+        frame_goalkeepers = len(accepted_goalkeeper_detections)
         frame_ball = bool(ball_detections)
         total_player_detections += frame_players
+        total_goalkeeper_detections += frame_goalkeepers
         total_ball_detections += len(ball_detections)
 
         frames_processed += 1
@@ -1166,6 +1237,19 @@ def analyze(args):
                         "bounding_box": detection["bounding_box"],
                     }
                     for detection in accepted_player_detections
+                ],
+                "goalkeeperDetections": [
+                    {
+                        "track_id": int(detection.get("track_id", -1)),
+                        "team_id": (
+                            int(detection["team_id"])
+                            if detection.get("team_id") is not None
+                            else None
+                        ),
+                        "confidence": float(detection["confidence"]),
+                        "bounding_box": detection["bounding_box"],
+                    }
+                    for detection in accepted_goalkeeper_detections
                 ],
             }
             if should_emit_debug_frame:
@@ -1207,6 +1291,7 @@ def analyze(args):
             "players_detected": max_players_detected,
             "ball_detected": ball_detected,
             "total_player_detections": total_player_detections,
+            "total_goalkeeper_detections": total_goalkeeper_detections,
             "raw_player_detections": raw_player_detections,
             "filtered_player_detections": filtered_player_detections,
             "discarded_outside_field": discarded_outside_field,
@@ -1257,6 +1342,15 @@ def analyze(args):
                 "collecting_after_fit": False,
             },
             "frame_examples": team_classification_frame_examples,
+        },
+        "goalkeeper_assignment": {
+            "method": "official centroid proximity heuristic from roboflow/sports",
+            "goalkeepers_detected": total_goalkeeper_detections,
+            "goalkeepers_with_team_id": goalkeepers_with_team_id,
+            "team_0": goalkeeper_team_prediction_counts[0],
+            "team_1": goalkeeper_team_prediction_counts[1],
+            "player_team_mutation_violations": player_team_mutation_violations,
+            "frame_examples": goalkeeper_assignment_frame_examples,
         },
         "features": {"status": "pending"},
         "machine_learning": {"status": "pending"},
