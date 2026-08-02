@@ -43,9 +43,12 @@ BALL_MODEL_RELATIVE_PATH = Path("models/football-ball-detection.pt")
 PITCH_KEYPOINT_MIN_CONFIDENCE = 0.25
 BALL_TRACKER_BUFFER_SIZE = 20
 TEAM_CLASSIFIER_STRIDE = 10
+TEAM_CLASSIFIER_MAX_TRAINING_FRAMES = 400
+TEAM_CLASSIFIER_TARGET_SAMPLES = 60
 TEAM_CLASSIFIER_MIN_CROP_HEIGHT = 50
 TEAM_CLASSIFIER_MIN_CROP_WIDTH = 30
 TEAM_CLASSIFIER_BORDER_MARGIN = 2
+TEAM_CLASSIFIER_MIN_LAPLACIAN_VARIANCE = 45.0
 PITCH_KEYPOINT_COLOR = (255, 0, 255)
 PITCH_KEYPOINT_OUTLINE_COLOR = (255, 255, 255)
 PITCH_KEYPOINT_RADIUS = 4
@@ -493,6 +496,13 @@ def classify_training_crop_quality(box, frame_width, frame_height):
     return True, "ok"
 
 
+def is_crop_blurry(crop, min_laplacian_variance):
+    if crop is None or crop.size == 0:
+        return True
+    gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    return cv2.Laplacian(gray_crop, cv2.CV_64F).var() < min_laplacian_variance
+
+
 def resolve_model_path(model_arg):
     candidate = Path(model_arg)
     if not candidate.is_absolute():
@@ -787,19 +797,39 @@ def analyze(args):
     team_classifier_crops = []
     team_training_stats = {
         "stride": TEAM_CLASSIFIER_STRIDE,
+        "max_training_frames": TEAM_CLASSIFIER_MAX_TRAINING_FRAMES,
+        "target_samples": TEAM_CLASSIFIER_TARGET_SAMPLES,
+        "fit_called_count": 0,
+        "predict_called_count": 0,
         "frames_scanned": 0,
+        "training_completed_frame": 0,
+        "training_stop_reason": "unknown",
         "player_detections_seen": 0,
         "crops_used_for_fit": 0,
+        "crops_total": 0,
         "discarded_small": 0,
         "discarded_empty": 0,
         "discarded_border": 0,
+        "discarded_blurry": 0,
     }
-    team_training_frames = sv.get_video_frames_generator(
-        source_path=str(input_path),
-        stride=TEAM_CLASSIFIER_STRIDE,
-    )
-    for training_frame in team_training_frames:
+    training_capture = cv2.VideoCapture(str(input_path))
+    if not training_capture.isOpened():
+        raise RuntimeError("Não foi possível abrir o vídeo para treinar TeamClassifier.")
+    training_frame_index = 0
+    while (
+        training_frame_index < TEAM_CLASSIFIER_MAX_TRAINING_FRAMES
+        and team_training_stats["crops_used_for_fit"] < TEAM_CLASSIFIER_TARGET_SAMPLES
+    ):
+        ok, training_frame = training_capture.read()
+        if not ok:
+            team_training_stats["training_stop_reason"] = "video_ended"
+            break
+        training_frame_index += 1
         team_training_stats["frames_scanned"] += 1
+        team_training_stats["training_completed_frame"] = training_frame_index
+        if training_frame_index % TEAM_CLASSIFIER_STRIDE != 0:
+            continue
+
         frame_height, frame_width = training_frame.shape[:2]
         team_training_result = model.predict(
             training_frame,
@@ -813,6 +843,7 @@ def analyze(args):
             team_training_detections.class_id == PLAYER_CLASS_ID
         ]
         team_training_stats["player_detections_seen"] += len(player_training_detections)
+        team_training_stats["crops_total"] += len(player_training_detections)
         for player_box in player_training_detections.xyxy:
             can_use_crop, reason = classify_training_crop_quality(
                 player_box,
@@ -828,27 +859,49 @@ def analyze(args):
                     team_training_stats["discarded_empty"] += 1
                 continue
 
-            team_classifier_crops.append(sv.crop_image(training_frame, player_box))
+            player_crop = sv.crop_image(training_frame, player_box)
+            if is_crop_blurry(player_crop, TEAM_CLASSIFIER_MIN_LAPLACIAN_VARIANCE):
+                team_training_stats["discarded_blurry"] += 1
+                continue
+
+            team_classifier_crops.append(player_crop)
             team_training_stats["crops_used_for_fit"] += 1
+            if team_training_stats["crops_used_for_fit"] >= TEAM_CLASSIFIER_TARGET_SAMPLES:
+                team_training_stats["training_stop_reason"] = "target_samples_reached"
+                break
+
+    if team_training_stats["training_stop_reason"] == "unknown":
+        if training_frame_index >= TEAM_CLASSIFIER_MAX_TRAINING_FRAMES:
+            team_training_stats["training_stop_reason"] = "max_training_frames_reached"
+        else:
+            team_training_stats["training_stop_reason"] = "video_ended"
+    training_capture.release()
 
     if len(team_classifier_crops) == 0:
         raise RuntimeError("TeamClassifier: nenhum crop de jogador encontrado para treinamento.")
     team_classifier.fit(team_classifier_crops)
+    team_training_stats["fit_called_count"] = 1
     total_discarded_training_crops = (
         team_training_stats["discarded_small"]
         + team_training_stats["discarded_empty"]
         + team_training_stats["discarded_border"]
+        + team_training_stats["discarded_blurry"]
     )
     emit(
         {
             "type": "teamClassifierTraining",
             "samplesUsed": team_training_stats["crops_used_for_fit"],
+            "totalCrops": team_training_stats["crops_total"],
             "playerDetectionsSeen": team_training_stats["player_detections_seen"],
             "discarded": total_discarded_training_crops,
             "discardedSmall": team_training_stats["discarded_small"],
             "discardedEmpty": team_training_stats["discarded_empty"],
             "discardedBorder": team_training_stats["discarded_border"],
+            "discardedBlurry": team_training_stats["discarded_blurry"],
             "stride": TEAM_CLASSIFIER_STRIDE,
+            "trainingCompletedFrame": team_training_stats["training_completed_frame"],
+            "trainingStopReason": team_training_stats["training_stop_reason"],
+            "fitCalledCount": team_training_stats["fit_called_count"],
         }
     )
 
@@ -978,7 +1031,10 @@ def analyze(args):
                 rejected_player_detections.append(detection)
 
         player_crops = get_player_crops_from_payload(frame, accepted_player_detections)
-        players_team_id = team_classifier.predict(player_crops) if player_crops else np.array([])
+        players_team_id = np.array([])
+        if player_crops:
+            team_training_stats["predict_called_count"] += 1
+            players_team_id = team_classifier.predict(player_crops)
         for idx, detection in enumerate(accepted_player_detections):
             team_id = int(players_team_id[idx]) if idx < len(players_team_id) else 0
             detection["team_id"] = team_id
@@ -1182,14 +1238,23 @@ def analyze(args):
                 "frames_scanned": team_training_stats["frames_scanned"],
                 "player_detections_seen": team_training_stats["player_detections_seen"],
                 "samples_used_for_fit": team_training_stats["crops_used_for_fit"],
+                "crops_total": team_training_stats["crops_total"],
                 "discarded_small": team_training_stats["discarded_small"],
                 "discarded_empty": team_training_stats["discarded_empty"],
                 "discarded_border": team_training_stats["discarded_border"],
+                "discarded_blurry": team_training_stats["discarded_blurry"],
                 "discarded_total": total_discarded_training_crops,
+                "training_completed_frame": team_training_stats["training_completed_frame"],
+                "training_stop_reason": team_training_stats["training_stop_reason"],
             },
             "prediction_counts": {
                 "team_0": team_prediction_counts[0],
                 "team_1": team_prediction_counts[1],
+            },
+            "runtime": {
+                "fit_called_count": team_training_stats["fit_called_count"],
+                "predict_called_count": team_training_stats["predict_called_count"],
+                "collecting_after_fit": False,
             },
             "frame_examples": team_classification_frame_examples,
         },
