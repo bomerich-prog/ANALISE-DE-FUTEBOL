@@ -7,6 +7,7 @@ from collections import Counter, deque
 import json
 import math
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -73,6 +74,21 @@ CLASS_COLOR_OVERRIDES = {
     "Ball": (0, 179, 255),
 }
 SOCCER_PITCH_CONFIGURATION = SoccerPitchConfiguration()
+PROFILE_STAGE_NAMES = [
+    "player_detection",
+    "ball_detection",
+    "pitch_detection",
+    "bytetrack",
+    "ball_tracker",
+    "team_classifier_fit",
+    "team_classifier_predict",
+    "goalkeeper_assignment",
+    "homography",
+    "render_bounding_boxes",
+    "video_writer",
+    "live_frame_update",
+    "frame_total",
+]
 
 
 def emit(payload):
@@ -865,11 +881,204 @@ def finalize_browser_video(raw_output_path, final_output_path):
     raw_output_path.unlink(missing_ok=True)
 
 
+def create_profile_state():
+    return {
+        "stages": {
+            stage_name: {
+                "total_seconds": 0.0,
+                "calls": 0,
+                "min_seconds": None,
+                "max_seconds": 0.0,
+            }
+            for stage_name in PROFILE_STAGE_NAMES
+        },
+        "frame_total_seconds": [],
+    }
+
+
+def record_profile_stage(profile_state, stage_name, elapsed_seconds):
+    if stage_name not in profile_state["stages"]:
+        profile_state["stages"][stage_name] = {
+            "total_seconds": 0.0,
+            "calls": 0,
+            "min_seconds": None,
+            "max_seconds": 0.0,
+        }
+    stage = profile_state["stages"][stage_name]
+    elapsed = max(0.0, float(elapsed_seconds))
+    stage["total_seconds"] += elapsed
+    stage["calls"] += 1
+    if stage["min_seconds"] is None or elapsed < stage["min_seconds"]:
+        stage["min_seconds"] = elapsed
+    if elapsed > stage["max_seconds"]:
+        stage["max_seconds"] = elapsed
+
+
+def collect_hardware_info():
+    cpu_model = None
+    try:
+        with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as cpuinfo_file:
+            for line in cpuinfo_file:
+                if line.lower().startswith("model name"):
+                    cpu_model = line.split(":", 1)[1].strip()
+                    break
+    except OSError:
+        cpu_model = None
+
+    if not cpu_model:
+        cpu_model = platform.processor() or platform.machine() or "unknown"
+
+    gpu_info = {
+        "available": False,
+        "backend": None,
+        "count": 0,
+        "names": [],
+    }
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            gpu_info["available"] = True
+            gpu_info["backend"] = "torch.cuda"
+            gpu_info["count"] = int(torch.cuda.device_count())
+            gpu_info["names"] = [
+                torch.cuda.get_device_name(index)
+                for index in range(gpu_info["count"])
+            ]
+    except Exception as exc:
+        gpu_info["torch_error"] = str(exc)
+
+    if not gpu_info["available"]:
+        nvidia_smi = shutil.which("nvidia-smi")
+        if nvidia_smi:
+            completed = subprocess.run(
+                [nvidia_smi, "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if completed.returncode == 0:
+                names = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+                if names:
+                    gpu_info["available"] = True
+                    gpu_info["backend"] = "nvidia-smi"
+                    gpu_info["count"] = len(names)
+                    gpu_info["names"] = names
+            else:
+                gpu_info["nvidia_smi_error"] = completed.stderr.strip()
+
+    return {
+        "platform": platform.platform(),
+        "python_version": sys.version.split()[0],
+        "cpu": {
+            "model": cpu_model,
+            "logical_cores": os.cpu_count(),
+            "architecture": platform.machine(),
+        },
+        "gpu": gpu_info,
+    }
+
+
+def build_performance_profile_report(
+    profile_state,
+    analysis_total_seconds,
+    frames_processed,
+    width,
+    height,
+    input_path,
+    output_path,
+    hardware_info,
+):
+    frame_total_seconds = profile_state["frame_total_seconds"]
+    avg_frame_seconds = (
+        sum(frame_total_seconds) / len(frame_total_seconds)
+        if frame_total_seconds
+        else 0.0
+    )
+    min_frame_seconds = min(frame_total_seconds) if frame_total_seconds else 0.0
+    max_frame_seconds = max(frame_total_seconds) if frame_total_seconds else 0.0
+    avg_processing_fps = (
+        frames_processed / analysis_total_seconds
+        if analysis_total_seconds > 0
+        else 0.0
+    )
+
+    stages = {}
+    for stage_name, stage_stats in profile_state["stages"].items():
+        total_seconds = float(stage_stats["total_seconds"])
+        calls = int(stage_stats["calls"])
+        min_seconds = float(stage_stats["min_seconds"] or 0.0)
+        max_seconds = float(stage_stats["max_seconds"])
+        avg_seconds = total_seconds / calls if calls > 0 else 0.0
+        percent_of_total = (
+            (total_seconds / analysis_total_seconds) * 100.0
+            if analysis_total_seconds > 0
+            else 0.0
+        )
+        stages[stage_name] = {
+            "total_seconds": total_seconds,
+            "total_ms": total_seconds * 1000.0,
+            "calls": calls,
+            "avg_seconds_per_call": avg_seconds,
+            "avg_ms_per_call": avg_seconds * 1000.0,
+            "min_seconds_per_call": min_seconds,
+            "max_seconds_per_call": max_seconds,
+            "percent_of_total_analysis_time": percent_of_total,
+        }
+
+    ranking_candidates = [
+        {"stage": stage_name, **stage_report}
+        for stage_name, stage_report in stages.items()
+        if stage_name != "frame_total"
+    ]
+    top_5_slowest_stages = sorted(
+        ranking_candidates,
+        key=lambda item: item["total_seconds"],
+        reverse=True,
+    )[:5]
+
+    return {
+        "analysis": {
+            "input_video_path": str(input_path),
+            "output_video_path": str(output_path),
+            "frames_processed": int(frames_processed),
+            "resolution": {"width": int(width), "height": int(height)},
+            "total_analysis_seconds": float(analysis_total_seconds),
+            "total_analysis_ms": float(analysis_total_seconds * 1000.0),
+            "avg_processing_fps": float(avg_processing_fps),
+            "avg_frame_seconds": float(avg_frame_seconds),
+            "avg_frame_ms": float(avg_frame_seconds * 1000.0),
+            "max_frame_seconds": float(max_frame_seconds),
+            "max_frame_ms": float(max_frame_seconds * 1000.0),
+            "min_frame_seconds": float(min_frame_seconds),
+            "min_frame_ms": float(min_frame_seconds * 1000.0),
+        },
+        "hardware": hardware_info,
+        "stages": stages,
+        "top_5_slowest_stages": top_5_slowest_stages,
+        "frame_total_seconds": frame_total_seconds,
+        "generated_at_unix_seconds": time.time(),
+    }
+
+
+def write_performance_profile_report(report_path, report):
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = report_path.with_suffix(f"{report_path.suffix}.tmp")
+    with temp_path.open("w", encoding="utf-8") as file_pointer:
+        json.dump(report, file_pointer, ensure_ascii=False, indent=2)
+        file_pointer.write("\n")
+    os.replace(temp_path, report_path)
+
+
 def analyze(args):
     input_path = Path(args.input)
     output_path = Path(args.output)
     if not input_path.exists():
         raise FileNotFoundError(f"Vídeo não encontrado: {input_path}")
+    analysis_start_time = time.perf_counter()
+    profile_state = create_profile_state()
+    hardware_info = collect_hardware_info()
+    profile_report_path = output_path.with_suffix(f"{output_path.suffix}.profile.json")
 
     player_model_path = resolve_player_model_path(args.model)
     if not player_model_path.exists():
@@ -980,7 +1189,13 @@ def analyze(args):
 
     if len(team_classifier_crops) == 0:
         raise RuntimeError("TeamClassifier: nenhum crop de jogador encontrado para treinamento.")
+    team_classifier_fit_start = time.perf_counter()
     team_classifier.fit(team_classifier_crops)
+    record_profile_stage(
+        profile_state,
+        "team_classifier_fit",
+        time.perf_counter() - team_classifier_fit_start,
+    )
     team_training_stats["fit_called_count"] = 1
     total_discarded_training_crops = (
         team_training_stats["discarded_small"]
@@ -1072,12 +1287,14 @@ def analyze(args):
         ok, frame = capture.read()
         if not ok:
             break
+        frame_start_time = time.perf_counter()
 
         field_mask, field_contours, field_detected = detect_field_region(frame, previous_field_mask)
         previous_field_mask = field_mask
         if field_detected:
             field_mask_detected_frames += 1
 
+        player_detection_stage_start = time.perf_counter()
         result = model.predict(
             frame,
             imgsz=args.imgsz,
@@ -1086,7 +1303,21 @@ def analyze(args):
             classes=[GOALKEEPER_CLASS_ID, PLAYER_CLASS_ID, REFEREE_CLASS_ID],
         )[0]
         tracked_human_detections = sv.Detections.from_ultralytics(result)
+        record_profile_stage(
+            profile_state,
+            "player_detection",
+            time.perf_counter() - player_detection_stage_start,
+        )
+
+        bytetrack_stage_start = time.perf_counter()
         tracked_human_detections = player_tracker.update_with_detections(tracked_human_detections)
+        record_profile_stage(
+            profile_state,
+            "bytetrack",
+            time.perf_counter() - bytetrack_stage_start,
+        )
+
+        pitch_detection_stage_start = time.perf_counter()
         pitch_result = pitch_model.predict(
             frame,
             imgsz=args.imgsz,
@@ -1095,12 +1326,38 @@ def analyze(args):
         )[0]
         pitch_keypoints = extract_pitch_keypoints(pitch_result, args.pitch_keypoint_conf)
         total_pitch_keypoints_detected += len(pitch_keypoints)
+        record_profile_stage(
+            profile_state,
+            "pitch_detection",
+            time.perf_counter() - pitch_detection_stage_start,
+        )
+
+        homography_stage_start = time.perf_counter()
         view_transformer = build_view_transformer_from_pitch_keypoints(pitch_keypoints)
         if view_transformer is not None:
             homography_valid_frames += 1
+        record_profile_stage(
+            profile_state,
+            "homography",
+            time.perf_counter() - homography_stage_start,
+        )
+
+        ball_detection_stage_start = time.perf_counter()
         ball_result = ball_model(frame, imgsz=640, verbose=False)[0]
         dedicated_ball_detections = extract_ball_detections(ball_result).with_nms(threshold=0.1)
+        record_profile_stage(
+            profile_state,
+            "ball_detection",
+            time.perf_counter() - ball_detection_stage_start,
+        )
+
+        ball_tracker_stage_start = time.perf_counter()
         dedicated_ball_detections = ball_tracker.update(dedicated_ball_detections)
+        record_profile_stage(
+            profile_state,
+            "ball_tracker",
+            time.perf_counter() - ball_tracker_stage_start,
+        )
 
         player_detections = []
         goalkeeper_detections = []
@@ -1205,11 +1462,17 @@ def analyze(args):
             else:
                 rejected_player_detections.append(detection)
 
+        team_classifier_predict_stage_start = time.perf_counter()
         player_crops = get_player_crops_from_payload(frame, accepted_player_detections)
         players_team_id = np.array([])
         if player_crops:
             team_training_stats["predict_called_count"] += 1
             players_team_id = team_classifier.predict(player_crops)
+        record_profile_stage(
+            profile_state,
+            "team_classifier_predict",
+            time.perf_counter() - team_classifier_predict_stage_start,
+        )
         for idx, detection in enumerate(accepted_player_detections):
             team_id = int(players_team_id[idx]) if idx < len(players_team_id) else 0
             detection["team_id"] = team_id
@@ -1228,6 +1491,7 @@ def analyze(args):
                     ],
                 }
             )
+        goalkeeper_assignment_stage_start = time.perf_counter()
         player_team_ids_before_goalkeeper_assignment = [
             int(detection.get("team_id", 0)) for detection in accepted_player_detections
         ]
@@ -1263,7 +1527,13 @@ def analyze(args):
         ]
         if player_team_ids_before_goalkeeper_assignment != player_team_ids_after_goalkeeper_assignment:
             player_team_mutation_violations += 1
+        record_profile_stage(
+            profile_state,
+            "goalkeeper_assignment",
+            time.perf_counter() - goalkeeper_assignment_stage_start,
+        )
 
+        homography_stage_start = time.perf_counter()
         assign_field_coordinates_to_detections(
             accepted_player_detections,
             view_transformer,
@@ -1308,6 +1578,11 @@ def analyze(args):
                         break
                 if len(homography_examples) >= 8:
                     break
+        record_profile_stage(
+            profile_state,
+            "homography",
+            time.perf_counter() - homography_stage_start,
+        )
 
         discarded_outside_field += len(rejected_player_detections)
         filtered_player_detections += len(accepted_player_detections)
@@ -1323,6 +1598,7 @@ def analyze(args):
         if debug_frame is not None:
             draw_field_debug_overlay(debug_frame, field_contours)
 
+        render_bounding_boxes_stage_start = time.perf_counter()
         for detection in accepted_player_detections:
             confidence = detection["confidence"]
             confidence_sum["Player"] += confidence
@@ -1383,6 +1659,11 @@ def analyze(args):
             draw_detection(output_frame, detection["box"], "Ball", confidence)
             if debug_frame is not None:
                 draw_detection(debug_frame, detection["box"], "Ball", confidence)
+        record_profile_stage(
+            profile_state,
+            "render_bounding_boxes",
+            time.perf_counter() - render_bounding_boxes_stage_start,
+        )
 
         frame_players = len(accepted_player_detections)
         frame_goalkeepers = len(accepted_goalkeeper_detections)
@@ -1393,7 +1674,13 @@ def analyze(args):
 
         frames_processed += 1
         max_players_detected = max(max_players_detected, frame_players)
+        video_writer_stage_start = time.perf_counter()
         writer.write(output_frame)
+        record_profile_stage(
+            profile_state,
+            "video_writer",
+            time.perf_counter() - video_writer_stage_start,
+        )
 
         if total_frames:
             progress = int(min(99, max(1, math.floor((frames_processed / total_frames) * 99))))
@@ -1462,6 +1749,7 @@ def analyze(args):
                 ],
             }
             if should_emit_debug_frame:
+                live_frame_update_stage_start = time.perf_counter()
                 debug_frame_written = write_live_debug_frame(args.debug_frame_dir, debug_frame)
                 debug_frame_jpeg = encode_live_debug_frame(debug_frame)
                 if debug_frame_written:
@@ -1472,11 +1760,32 @@ def analyze(args):
                     payload["debugFrameUpdated"] = True
                 if debug_frame_jpeg:
                     payload["debugFrameJpeg"] = debug_frame_jpeg
+                record_profile_stage(
+                    profile_state,
+                    "live_frame_update",
+                    time.perf_counter() - live_frame_update_stage_start,
+                )
             emit(payload)
+
+        frame_total_elapsed = time.perf_counter() - frame_start_time
+        profile_state["frame_total_seconds"].append(frame_total_elapsed)
+        record_profile_stage(profile_state, "frame_total", frame_total_elapsed)
 
     capture.release()
     writer.release()
     finalize_browser_video(raw_output_path, output_path)
+    analysis_total_seconds = time.perf_counter() - analysis_start_time
+    profile_report = build_performance_profile_report(
+        profile_state=profile_state,
+        analysis_total_seconds=analysis_total_seconds,
+        frames_processed=frames_processed,
+        width=width,
+        height=height,
+        input_path=input_path,
+        output_path=output_path,
+        hardware_info=hardware_info,
+    )
+    write_performance_profile_report(profile_report_path, profile_report)
 
     avg_player_confidence = (
         confidence_sum["Player"] / confidence_count["Player"] if confidence_count["Player"] else 0
