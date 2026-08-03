@@ -3,6 +3,7 @@
 
 import argparse
 import base64
+from collections import Counter, deque
 import json
 import math
 import os
@@ -49,6 +50,10 @@ TEAM_CLASSIFIER_MIN_CROP_HEIGHT = 50
 TEAM_CLASSIFIER_MIN_CROP_WIDTH = 30
 TEAM_CLASSIFIER_BORDER_MARGIN = 2
 TEAM_CLASSIFIER_MIN_LAPLACIAN_VARIANCE = 45.0
+BYTE_TRACK_MIN_CONSECUTIVE_FRAMES = 3
+BYTE_TRACK_LOST_TRACK_BUFFER = 60
+BYTE_TRACK_MINIMUM_MATCHING_THRESHOLD = 0.72
+PLAYER_REFEREE_HISTORY_WINDOW = 9
 PITCH_KEYPOINT_COLOR = (255, 0, 255)
 PITCH_KEYPOINT_OUTLINE_COLOR = (255, 255, 255)
 PITCH_KEYPOINT_RADIUS = 4
@@ -503,6 +508,20 @@ def is_crop_blurry(crop, min_laplacian_variance):
     return cv2.Laplacian(gray_crop, cv2.CV_64F).var() < min_laplacian_variance
 
 
+def stabilize_player_referee_class(class_history, fallback_class_id):
+    if not class_history:
+        return fallback_class_id
+    counts = Counter(class_history)
+    most_common_count = max(counts.values())
+    candidates = {class_id for class_id, count in counts.items() if count == most_common_count}
+    if len(candidates) == 1:
+        return next(iter(candidates))
+    for class_id in reversed(class_history):
+        if class_id in candidates:
+            return class_id
+    return fallback_class_id
+
+
 def resolve_goalkeepers_team_id(players, players_team_id, goalkeepers):
     if len(goalkeepers) == 0:
         return np.array([])
@@ -813,7 +832,6 @@ def analyze(args):
         raise FileNotFoundError(f"Modelo de detecção da bola não encontrado: {ball_model_path}")
     ball_model = YOLO(str(ball_model_path))
     ball_tracker = BallTracker(buffer_size=BALL_TRACKER_BUFFER_SIZE)
-    player_tracker = sv.ByteTrack(minimum_consecutive_frames=3)
     team_classifier = TeamClassifier(device="cpu")
 
     def ball_slicer_callback(image_slice):
@@ -942,6 +960,12 @@ def analyze(args):
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    player_tracker = sv.ByteTrack(
+        minimum_consecutive_frames=BYTE_TRACK_MIN_CONSECUTIVE_FRAMES,
+        lost_track_buffer=BYTE_TRACK_LOST_TRACK_BUFFER,
+        minimum_matching_threshold=BYTE_TRACK_MINIMUM_MATCHING_THRESHOLD,
+        frame_rate=float(fps),
+    )
     raw_output_path = output_path.with_name(f"{output_path.stem}.opencv{output_path.suffix}")
     writer = open_writer(raw_output_path, fps, width, height)
 
@@ -975,6 +999,15 @@ def analyze(args):
     goalkeepers_with_team_id = 0
     goalkeeper_assignment_frame_examples = []
     player_team_mutation_violations = 0
+    human_track_last_seen_frame = {}
+    recovered_track_gap_events = 0
+    recovered_track_ids = set()
+    recovered_track_examples = []
+    player_referee_class_history = {}
+    last_raw_player_referee_class = {}
+    last_stabilized_player_referee_class = {}
+    player_referee_raw_swap_events = 0
+    player_referee_stabilized_swap_events = 0
     team_classification_frame_examples = []
     last_emitted_progress = -1
 
@@ -1016,12 +1049,57 @@ def analyze(args):
         tracker_ids = tracked_human_detections.tracker_id
         if tracker_ids is None:
             tracker_ids = np.full(len(tracked_human_detections), -1, dtype=np.int32)
+        current_frame_number = frames_processed + 1
+        current_frame_track_ids = set()
+        for tracker_id_value in tracker_ids:
+            tracker_id_int = int(tracker_id_value)
+            if tracker_id_int >= 0:
+                current_frame_track_ids.add(tracker_id_int)
+        for track_id in current_frame_track_ids:
+            last_seen_frame = human_track_last_seen_frame.get(track_id)
+            if last_seen_frame is not None and current_frame_number - last_seen_frame > 1:
+                missing_frames = current_frame_number - last_seen_frame - 1
+                recovered_track_gap_events += 1
+                recovered_track_ids.add(track_id)
+                if len(recovered_track_examples) < 5:
+                    recovered_track_examples.append(
+                        {
+                            "track_id": track_id,
+                            "missing_frames": missing_frames,
+                            "recovered_frame": current_frame_number,
+                        }
+                    )
+            human_track_last_seen_frame[track_id] = current_frame_number
 
         for detection_index in range(len(tracked_human_detections)):
-            class_id = int(tracked_human_detections.class_id[detection_index])
+            raw_class_id = int(tracked_human_detections.class_id[detection_index])
             confidence = float(tracked_human_detections.confidence[detection_index])
             box = tracked_human_detections.xyxy[detection_index].tolist()
             track_id = int(tracker_ids[detection_index])
+            class_id = raw_class_id
+            if track_id >= 0 and raw_class_id in {PLAYER_CLASS_ID, REFEREE_CLASS_ID}:
+                previous_raw_class = last_raw_player_referee_class.get(track_id)
+                if (
+                    previous_raw_class is not None
+                    and previous_raw_class != raw_class_id
+                ):
+                    player_referee_raw_swap_events += 1
+                last_raw_player_referee_class[track_id] = raw_class_id
+
+                class_history = player_referee_class_history.setdefault(
+                    track_id, deque(maxlen=PLAYER_REFEREE_HISTORY_WINDOW)
+                )
+                class_history.append(raw_class_id)
+                class_id = stabilize_player_referee_class(class_history, raw_class_id)
+
+                previous_stabilized_class = last_stabilized_player_referee_class.get(track_id)
+                if (
+                    previous_stabilized_class is not None
+                    and previous_stabilized_class != class_id
+                ):
+                    player_referee_stabilized_swap_events += 1
+                last_stabilized_player_referee_class[track_id] = class_id
+
             detection_payload = {
                 "box": box,
                 "bounding_box": box,
@@ -1312,9 +1390,23 @@ def analyze(args):
         },
         "tracking": {
             "status": "implemented",
-            "method": "sv.ByteTrack(minimum_consecutive_frames=3)",
+            "method": "sv.ByteTrack",
+            "bytetrack_parameters": {
+                "minimum_consecutive_frames": BYTE_TRACK_MIN_CONSECUTIVE_FRAMES,
+                "lost_track_buffer": BYTE_TRACK_LOST_TRACK_BUFFER,
+                "minimum_matching_threshold": BYTE_TRACK_MINIMUM_MATCHING_THRESHOLD,
+                "frame_rate": float(fps),
+            },
             "id_storage": "track_id is stored per detection dict for player/goalkeeper/referee and rendered in labels",
             "team_classifier": "TeamClassifier predicts team_id (0/1) for players based on crops",
+            "stability": {
+                "recovered_track_gap_events": recovered_track_gap_events,
+                "recovered_track_ids_count": len(recovered_track_ids),
+                "recovered_track_examples": recovered_track_examples,
+                "player_referee_class_swaps_before_history": player_referee_raw_swap_events,
+                "player_referee_class_swaps_after_history": player_referee_stabilized_swap_events,
+                "player_referee_history_window": PLAYER_REFEREE_HISTORY_WINDOW,
+            },
         },
         "team_classifier": {
             "training": {
