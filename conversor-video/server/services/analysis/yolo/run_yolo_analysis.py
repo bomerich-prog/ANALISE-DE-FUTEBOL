@@ -20,7 +20,9 @@ import supervision as sv
 from ultralytics import YOLO
 
 from roboflow_ball import BallTracker
+from roboflow_soccer_config import SoccerPitchConfiguration
 from roboflow_team import TeamClassifier
+from roboflow_view import ViewTransformer
 
 
 BALL_CLASS_ID = 0
@@ -54,6 +56,7 @@ BYTE_TRACK_MIN_CONSECUTIVE_FRAMES = 3
 BYTE_TRACK_LOST_TRACK_BUFFER = 60
 BYTE_TRACK_MINIMUM_MATCHING_THRESHOLD = 0.72
 PLAYER_REFEREE_HISTORY_WINDOW = 9
+HOMOGRAPHY_MIN_KEYPOINTS = 4
 PITCH_KEYPOINT_COLOR = (255, 0, 255)
 PITCH_KEYPOINT_OUTLINE_COLOR = (255, 255, 255)
 PITCH_KEYPOINT_RADIUS = 4
@@ -69,6 +72,7 @@ CLASS_COLOR_OVERRIDES = {
     "Referee": (138, 43, 226),
     "Ball": (0, 179, 255),
 }
+SOCCER_PITCH_CONFIGURATION = SoccerPitchConfiguration()
 
 
 def emit(payload):
@@ -455,6 +459,53 @@ def detection_foot_point(box):
     return int((x1 + x2) / 2), int(y2)
 
 
+def build_view_transformer_from_pitch_keypoints(keypoints):
+    keypoints_by_index = {}
+    for keypoint in keypoints:
+        keypoint_index = int(keypoint["index"])
+        if keypoint_index < 0 or keypoint_index >= len(SOCCER_PITCH_CONFIGURATION.vertices):
+            continue
+
+        score = float(keypoint["confidence"]) if keypoint.get("confidence") is not None else -1.0
+        previous = keypoints_by_index.get(keypoint_index)
+        if previous is None or score > previous["score"]:
+            keypoints_by_index[keypoint_index] = {"keypoint": keypoint, "score": score}
+
+    if len(keypoints_by_index) < HOMOGRAPHY_MIN_KEYPOINTS:
+        return None
+
+    source_points = []
+    target_points = []
+    for keypoint_index in sorted(keypoints_by_index.keys()):
+        keypoint = keypoints_by_index[keypoint_index]["keypoint"]
+        source_points.append([keypoint["x"], keypoint["y"]])
+        target_points.append(SOCCER_PITCH_CONFIGURATION.vertices[keypoint_index])
+
+    try:
+        return ViewTransformer(
+            source=np.array(source_points, dtype=np.float32),
+            target=np.array(target_points, dtype=np.float32),
+        )
+    except ValueError:
+        return None
+
+
+def assign_field_coordinates_to_detections(detections, view_transformer, anchor_getter):
+    if not detections:
+        return
+    if view_transformer is None:
+        for detection in detections:
+            detection["field_x"] = None
+            detection["field_y"] = None
+        return
+
+    anchor_points = np.array([anchor_getter(detection["box"]) for detection in detections], dtype=np.float32)
+    transformed_points = view_transformer.transform_points(anchor_points)
+    for index, detection in enumerate(detections):
+        detection["field_x"] = float(transformed_points[index][0])
+        detection["field_y"] = float(transformed_points[index][1])
+
+
 def is_detection_inside_field(detection, field_mask):
     foot_x, foot_y = detection_foot_point(detection["box"])
     foot_x = clamp(foot_x, 0, field_mask.shape[1] - 1)
@@ -651,8 +702,11 @@ def ball_detections_to_dicts(detections):
     return [
         {
             "box": detections.xyxy[index].tolist(),
+            "bounding_box": detections.xyxy[index].tolist(),
             "confidence": float(confidence_values[index]),
             "source": "ball_model",
+            "field_x": None,
+            "field_y": None,
         }
         for index in range(len(detections))
     ]
@@ -994,6 +1048,9 @@ def analyze(args):
     ball_detected = False
     confidence_sum = {"Player": 0.0, "Ball": 0.0}
     confidence_count = {"Player": 0, "Ball": 0}
+    homography_valid_frames = 0
+    total_pitch_keypoints_detected = 0
+    homography_examples = []
     team_prediction_counts = {0: 0, 1: 0}
     goalkeeper_team_prediction_counts = {0: 0, 1: 0}
     goalkeepers_with_team_id = 0
@@ -1037,6 +1094,10 @@ def analyze(args):
             verbose=False,
         )[0]
         pitch_keypoints = extract_pitch_keypoints(pitch_result, args.pitch_keypoint_conf)
+        total_pitch_keypoints_detected += len(pitch_keypoints)
+        view_transformer = build_view_transformer_from_pitch_keypoints(pitch_keypoints)
+        if view_transformer is not None:
+            homography_valid_frames += 1
         ball_result = ball_model(frame, imgsz=640, verbose=False)[0]
         dedicated_ball_detections = extract_ball_detections(ball_result).with_nms(threshold=0.1)
         dedicated_ball_detections = ball_tracker.update(dedicated_ball_detections)
@@ -1105,6 +1166,8 @@ def analyze(args):
                 "bounding_box": box,
                 "confidence": confidence,
                 "track_id": track_id,
+                "field_x": None,
+                "field_y": None,
             }
 
             if class_id == PLAYER_CLASS_ID:
@@ -1200,6 +1263,51 @@ def analyze(args):
         ]
         if player_team_ids_before_goalkeeper_assignment != player_team_ids_after_goalkeeper_assignment:
             player_team_mutation_violations += 1
+
+        assign_field_coordinates_to_detections(
+            accepted_player_detections,
+            view_transformer,
+            detection_foot_point,
+        )
+        assign_field_coordinates_to_detections(
+            accepted_goalkeeper_detections,
+            view_transformer,
+            detection_foot_point,
+        )
+        assign_field_coordinates_to_detections(
+            accepted_referee_detections,
+            view_transformer,
+            detection_foot_point,
+        )
+        assign_field_coordinates_to_detections(
+            ball_detections,
+            view_transformer,
+            detection_center,
+        )
+
+        if len(homography_examples) < 8:
+            for class_name, detections in (
+                ("Player", accepted_player_detections),
+                ("Goalkeeper", accepted_goalkeeper_detections),
+                ("Referee", accepted_referee_detections),
+                ("Ball", ball_detections),
+            ):
+                for detection in detections:
+                    if detection.get("field_x") is None or detection.get("field_y") is None:
+                        continue
+                    homography_examples.append(
+                        {
+                            "frame": frames_processed + 1,
+                            "class": class_name,
+                            "track_id": detection.get("track_id"),
+                            "field_x": float(detection["field_x"]),
+                            "field_y": float(detection["field_y"]),
+                        }
+                    )
+                    if len(homography_examples) >= 8:
+                        break
+                if len(homography_examples) >= 8:
+                    break
 
         discarded_outside_field += len(rejected_player_detections)
         filtered_player_detections += len(accepted_player_detections)
@@ -1313,6 +1421,8 @@ def analyze(args):
                         "team_id": int(detection.get("team_id", 0)),
                         "confidence": float(detection["confidence"]),
                         "bounding_box": detection["bounding_box"],
+                        "field_x": detection.get("field_x"),
+                        "field_y": detection.get("field_y"),
                     }
                     for detection in accepted_player_detections
                 ],
@@ -1326,8 +1436,29 @@ def analyze(args):
                         ),
                         "confidence": float(detection["confidence"]),
                         "bounding_box": detection["bounding_box"],
+                        "field_x": detection.get("field_x"),
+                        "field_y": detection.get("field_y"),
                     }
                     for detection in accepted_goalkeeper_detections
+                ],
+                "refereeDetections": [
+                    {
+                        "track_id": int(detection.get("track_id", -1)),
+                        "confidence": float(detection["confidence"]),
+                        "bounding_box": detection["bounding_box"],
+                        "field_x": detection.get("field_x"),
+                        "field_y": detection.get("field_y"),
+                    }
+                    for detection in accepted_referee_detections
+                ],
+                "ballDetections": [
+                    {
+                        "confidence": float(detection["confidence"]),
+                        "bounding_box": detection["bounding_box"],
+                        "field_x": detection.get("field_x"),
+                        "field_y": detection.get("field_y"),
+                    }
+                    for detection in ball_detections
                 ],
             }
             if should_emit_debug_frame:
@@ -1352,6 +1483,9 @@ def analyze(args):
     )
     avg_ball_confidence = (
         confidence_sum["Ball"] / confidence_count["Ball"] if confidence_count["Ball"] else 0
+    )
+    avg_pitch_keypoints_detected = (
+        total_pitch_keypoints_detected / frames_processed if frames_processed else 0
     )
 
     result = {
@@ -1387,6 +1521,7 @@ def analyze(args):
             "player_duplicate_iou_threshold": PERSON_DUPLICATE_IOU_THRESHOLD,
             "field_filter": "player/goalkeeper/referee bbox bottom-center foot point must be inside white-line-guided playable-field polygon",
             "labels": "class name and confidence are burned into the annotated video",
+            "field_coordinates": "field_x and field_y are homography-transformed pitch coordinates for player/goalkeeper/referee/ball",
         },
         "tracking": {
             "status": "implemented",
@@ -1443,6 +1578,13 @@ def analyze(args):
             "team_1": goalkeeper_team_prediction_counts[1],
             "player_team_mutation_violations": player_team_mutation_violations,
             "frame_examples": goalkeeper_assignment_frame_examples,
+        },
+        "homography": {
+            "status": "implemented (official ViewTransformer)",
+            "valid_frames": homography_valid_frames,
+            "total_frames": frames_processed,
+            "avg_keypoints_detected": avg_pitch_keypoints_detected,
+            "examples": homography_examples,
         },
         "features": {"status": "pending"},
         "machine_learning": {"status": "pending"},
