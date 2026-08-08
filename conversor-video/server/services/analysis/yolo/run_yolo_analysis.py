@@ -1488,25 +1488,10 @@ def analyze(args):
         goalkeeper_detections, _ = suppress_duplicate_person_detections(goalkeeper_detections)
         referee_detections, _ = suppress_duplicate_person_detections(referee_detections)
 
-        accepted_player_detections = []
-        accepted_goalkeeper_detections = []
-        accepted_referee_detections = []
+        accepted_player_detections = list(player_detections)
+        accepted_goalkeeper_detections = list(goalkeeper_detections)
+        accepted_referee_detections = list(referee_detections)
         rejected_player_detections = []
-        for detection in player_detections:
-            if is_detection_inside_field(detection, field_mask):
-                accepted_player_detections.append(detection)
-            else:
-                rejected_player_detections.append(detection)
-        for detection in goalkeeper_detections:
-            if is_detection_inside_field(detection, field_mask):
-                accepted_goalkeeper_detections.append(detection)
-            else:
-                rejected_player_detections.append(detection)
-        for detection in referee_detections:
-            if is_detection_inside_field(detection, field_mask):
-                accepted_referee_detections.append(detection)
-            else:
-                rejected_player_detections.append(detection)
 
         team_classifier_predict_stage_start = time.perf_counter()
         if accepted_player_detections:
