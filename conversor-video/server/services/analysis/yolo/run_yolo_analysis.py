@@ -53,6 +53,7 @@ TEAM_CLASSIFIER_MIN_CROP_HEIGHT = 50
 TEAM_CLASSIFIER_MIN_CROP_WIDTH = 30
 TEAM_CLASSIFIER_BORDER_MARGIN = 2
 TEAM_CLASSIFIER_MIN_LAPLACIAN_VARIANCE = 45.0
+TEAM_CLASSIFIER_REFRESH_INTERVAL = 30
 BYTE_TRACK_MIN_CONSECUTIVE_FRAMES = 3
 BYTE_TRACK_LOST_TRACK_BUFFER = 60
 BYTE_TRACK_MINIMUM_MATCHING_THRESHOLD = 0.72
@@ -988,6 +989,7 @@ def build_performance_profile_report(
     input_path,
     output_path,
     hardware_info,
+    team_classifier_cache_metrics,
 ):
     frame_total_seconds = profile_state["frame_total_seconds"]
     avg_frame_seconds = (
@@ -1037,6 +1039,32 @@ def build_performance_profile_report(
         reverse=True,
     )[:5]
 
+    predict_calls_before_cache = int(team_classifier_cache_metrics["predict_calls_before_cache"])
+    predict_calls_after_cache = int(team_classifier_cache_metrics["predict_calls_after_cache"])
+    cache_hits = int(team_classifier_cache_metrics["cache_hits"])
+    cache_misses = int(team_classifier_cache_metrics["cache_misses"])
+    total_cache_decisions = cache_hits + cache_misses
+    hit_rate_percent = (
+        (cache_hits / total_cache_decisions) * 100.0
+        if total_cache_decisions > 0
+        else 0.0
+    )
+    reduction_calls = max(0, predict_calls_before_cache - predict_calls_after_cache)
+    reduction_percent = (
+        (reduction_calls / predict_calls_before_cache) * 100.0
+        if predict_calls_before_cache > 0
+        else 0.0
+    )
+    team_classifier_predict_total_seconds = float(
+        profile_state["stages"]["team_classifier_predict"]["total_seconds"]
+    )
+    avg_predict_call_seconds_after = (
+        team_classifier_predict_total_seconds / predict_calls_after_cache
+        if predict_calls_after_cache > 0
+        else 0.0
+    )
+    estimated_time_saved_seconds = reduction_calls * avg_predict_call_seconds_after
+
     return {
         "analysis": {
             "input_video_path": str(input_path),
@@ -1054,6 +1082,17 @@ def build_performance_profile_report(
             "min_frame_ms": float(min_frame_seconds * 1000.0),
         },
         "hardware": hardware_info,
+        "team_classifier_cache": {
+            "refresh_interval_frames": TEAM_CLASSIFIER_REFRESH_INTERVAL,
+            "predict_calls_before_cache": predict_calls_before_cache,
+            "predict_calls_after_cache": predict_calls_after_cache,
+            "cache_hits": cache_hits,
+            "cache_misses": cache_misses,
+            "hit_rate_percent": hit_rate_percent,
+            "reduction_calls": reduction_calls,
+            "reduction_percent": reduction_percent,
+            "estimated_time_saved_seconds": estimated_time_saved_seconds,
+        },
         "stages": stages,
         "top_5_slowest_stages": top_5_slowest_stages,
         "frame_total_seconds": frame_total_seconds,
@@ -1267,6 +1306,13 @@ def analyze(args):
     total_pitch_keypoints_detected = 0
     homography_examples = []
     team_prediction_counts = {0: 0, 1: 0}
+    player_team_cache_by_track_id = {}
+    team_classifier_cache_metrics = {
+        "predict_calls_before_cache": 0,
+        "predict_calls_after_cache": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+    }
     goalkeeper_team_prediction_counts = {0: 0, 1: 0}
     goalkeepers_with_team_id = 0
     goalkeeper_assignment_frame_examples = []
@@ -1463,21 +1509,58 @@ def analyze(args):
                 rejected_player_detections.append(detection)
 
         team_classifier_predict_stage_start = time.perf_counter()
-        player_crops = get_player_crops_from_payload(frame, accepted_player_detections)
-        players_team_id = np.array([])
-        if player_crops:
+        if accepted_player_detections:
+            team_classifier_cache_metrics["predict_calls_before_cache"] += 1
+
+        detections_needing_prediction = []
+        cached_team_ids_for_players = [None] * len(accepted_player_detections)
+        for idx, detection in enumerate(accepted_player_detections):
+            track_id = int(detection.get("track_id", -1))
+            cache_entry = player_team_cache_by_track_id.get(track_id) if track_id >= 0 else None
+            if cache_entry is not None:
+                last_classified_frame = int(cache_entry["last_classified_frame"])
+                if current_frame_number - last_classified_frame <= TEAM_CLASSIFIER_REFRESH_INTERVAL:
+                    cached_team_ids_for_players[idx] = int(cache_entry["team_id"])
+                    team_classifier_cache_metrics["cache_hits"] += 1
+                    continue
+            detections_needing_prediction.append(idx)
+            team_classifier_cache_metrics["cache_misses"] += 1
+
+        if detections_needing_prediction:
             team_training_stats["predict_called_count"] += 1
-            players_team_id = team_classifier.predict(player_crops)
+            team_classifier_cache_metrics["predict_calls_after_cache"] += 1
+            detections_to_predict = [accepted_player_detections[idx] for idx in detections_needing_prediction]
+            prediction_crops = get_player_crops_from_payload(frame, detections_to_predict)
+            predicted_team_ids = team_classifier.predict(prediction_crops) if prediction_crops else np.array([])
+            for prediction_idx, detection_idx in enumerate(detections_needing_prediction):
+                predicted_team_id = (
+                    int(predicted_team_ids[prediction_idx])
+                    if prediction_idx < len(predicted_team_ids)
+                    else 0
+                )
+                cached_team_ids_for_players[detection_idx] = predicted_team_id
+                detection = accepted_player_detections[detection_idx]
+                track_id = int(detection.get("track_id", -1))
+                if track_id >= 0:
+                    player_team_cache_by_track_id[track_id] = {
+                        "team_id": predicted_team_id,
+                        "last_classified_frame": current_frame_number,
+                    }
+
+        players_team_id_list = []
+        for idx, detection in enumerate(accepted_player_detections):
+            team_id_value = cached_team_ids_for_players[idx]
+            team_id = int(team_id_value) if team_id_value is not None else 0
+            detection["team_id"] = team_id
+            players_team_id_list.append(team_id)
+            if team_id in team_prediction_counts:
+                team_prediction_counts[team_id] += 1
+        players_team_id = np.array(players_team_id_list, dtype=np.int32)
         record_profile_stage(
             profile_state,
             "team_classifier_predict",
             time.perf_counter() - team_classifier_predict_stage_start,
         )
-        for idx, detection in enumerate(accepted_player_detections):
-            team_id = int(players_team_id[idx]) if idx < len(players_team_id) else 0
-            detection["team_id"] = team_id
-            if team_id in team_prediction_counts:
-                team_prediction_counts[team_id] += 1
         if accepted_player_detections and len(team_classification_frame_examples) < 3:
             team_classification_frame_examples.append(
                 {
@@ -1784,6 +1867,7 @@ def analyze(args):
         input_path=input_path,
         output_path=output_path,
         hardware_info=hardware_info,
+        team_classifier_cache_metrics=team_classifier_cache_metrics,
     )
     write_performance_profile_report(profile_report_path, profile_report)
 
