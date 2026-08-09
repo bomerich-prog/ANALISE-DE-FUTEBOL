@@ -1662,10 +1662,6 @@ def analyze(args):
         if debug_frame is not None:
             draw_pitch_keypoints(debug_frame, pitch_keypoints)
 
-        draw_field_debug_overlay(output_frame, field_contours)
-        if debug_frame is not None:
-            draw_field_debug_overlay(debug_frame, field_contours)
-
         render_bounding_boxes_stage_start = time.perf_counter()
         for detection in accepted_player_detections:
             confidence = detection["confidence"]
