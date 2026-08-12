@@ -53,6 +53,15 @@ BALL_ROI_SCALE_FROM_BOX = 2.25
 BALL_PREDICTION_NEAR_DISTANCE_PX = 80.0
 BALL_CONFIDENCE_NEAR_MIN = 0.12
 BALL_CONFIDENCE_FAR_MIN = 0.35
+BALL_DETECTOR_DEFAULT_CONFIDENCE = 0.25
+BALL_DIAGNOSTIC_MIN_CONFIDENCE = 0.05
+BALL_DIAGNOSTIC_FRAME_CONFIDENCE_BINS = [
+    {"label": "0.05-0.10", "lower": 0.05, "upper": 0.10},
+    {"label": "0.10-0.20", "lower": 0.10, "upper": 0.20},
+    {"label": "0.20-0.30", "lower": 0.20, "upper": 0.30},
+    {"label": "0.30-0.40", "lower": 0.30, "upper": 0.40},
+    {"label": ">0.40", "lower": 0.40, "upper": None},
+]
 TEAM_CLASSIFIER_STRIDE = 10
 TEAM_CLASSIFIER_MAX_TRAINING_FRAMES = 400
 TEAM_CLASSIFIER_TARGET_SAMPLES = 60
@@ -821,6 +830,95 @@ def select_ball_detection_with_roi(detections, predicted_center, roi_radius_pixe
     return selected_global, True, False
 
 
+def ball_confidence_threshold_for_distance(distance_to_prediction):
+    if distance_to_prediction is None:
+        return None
+    return (
+        BALL_CONFIDENCE_NEAR_MIN
+        if distance_to_prediction <= BALL_PREDICTION_NEAR_DISTANCE_PX
+        else BALL_CONFIDENCE_FAR_MIN
+    )
+
+
+def detection_box_to_xywh(box):
+    x1, y1, x2, y2 = [float(value) for value in box]
+    width = max(0.0, x2 - x1)
+    height = max(0.0, y2 - y1)
+    return [x1, y1, width, height]
+
+
+def detection_box_area(box):
+    _, _, width, height = detection_box_to_xywh(box)
+    return width * height
+
+
+def compute_nms_keep_mask(detections, iou_threshold):
+    if not detections:
+        return []
+
+    sorted_indexes = sorted(
+        range(len(detections)),
+        key=lambda index: detections[index]["confidence"],
+        reverse=True,
+    )
+    keep_mask = [False] * len(detections)
+    kept_indexes = []
+    for index in sorted_indexes:
+        candidate_box = detections[index]["box"]
+        if any(box_iou(candidate_box, detections[kept_index]["box"]) > iou_threshold for kept_index in kept_indexes):
+            continue
+        keep_mask[index] = True
+        kept_indexes.append(index)
+    return keep_mask
+
+
+def pick_best_ball_diagnostic_candidate(detections, predicted_center):
+    if not detections:
+        return None
+
+    if predicted_center is None:
+        return max(range(len(detections)), key=lambda index: detections[index]["confidence"])
+
+    return min(
+        range(len(detections)),
+        key=lambda index: (
+            np.linalg.norm(detection_center_np(detections[index]["box"]) - predicted_center),
+            -detections[index]["confidence"],
+        ),
+    )
+
+
+def frame_has_candidate_in_confidence_range(detections, lower, upper):
+    if upper is None:
+        return any(detection["confidence"] > lower for detection in detections)
+    return any(lower <= detection["confidence"] < upper for detection in detections)
+
+
+def histogram_of_confidences(confidence_values):
+    histogram_bins = {
+        "<0.05": 0,
+        "0.05-0.10": 0,
+        "0.10-0.20": 0,
+        "0.20-0.30": 0,
+        "0.30-0.40": 0,
+        ">0.40": 0,
+    }
+    for confidence in confidence_values:
+        if confidence < 0.05:
+            histogram_bins["<0.05"] += 1
+        elif confidence < 0.10:
+            histogram_bins["0.05-0.10"] += 1
+        elif confidence < 0.20:
+            histogram_bins["0.10-0.20"] += 1
+        elif confidence < 0.30:
+            histogram_bins["0.20-0.30"] += 1
+        elif confidence < 0.40:
+            histogram_bins["0.30-0.40"] += 1
+        else:
+            histogram_bins[">0.40"] += 1
+    return histogram_bins
+
+
 def clamp(value, lower, upper):
     return max(lower, min(upper, value))
 
@@ -1226,6 +1324,79 @@ def write_performance_profile_report(report_path, report):
     os.replace(temp_path, report_path)
 
 
+def write_ball_diagnostics_report(report_path, report):
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = report_path.with_suffix(f"{report_path.suffix}.tmp")
+    with temp_path.open("w", encoding="utf-8") as file_pointer:
+        json.dump(report, file_pointer, ensure_ascii=False, indent=2)
+        file_pointer.write("\n")
+    os.replace(temp_path, report_path)
+
+
+def build_ball_diagnostics_summary(ball_diagnostics_state):
+    consecutive_missing_sequences = list(ball_diagnostics_state["consecutive_missing_sequences"])
+    current_missing_streak = int(ball_diagnostics_state["current_missing_streak"])
+    if current_missing_streak > 0:
+        consecutive_missing_sequences.append(current_missing_streak)
+
+    max_missing_streak = max(consecutive_missing_sequences) if consecutive_missing_sequences else 0
+    average_missing_streak = (
+        float(sum(consecutive_missing_sequences) / len(consecutive_missing_sequences))
+        if consecutive_missing_sequences
+        else 0.0
+    )
+    missing_frames_count = int(len(ball_diagnostics_state["frames_without_ball"]))
+
+    reason_counts = {
+        "no_candidate": int(ball_diagnostics_state["frames_without_any_candidate"]),
+        "confidence": int(ball_diagnostics_state["frames_discarded_by_confidence"]),
+        "roi": int(ball_diagnostics_state["frames_discarded_by_roi"]),
+        "nms": int(ball_diagnostics_state["frames_discarded_by_nms"]),
+    }
+    for other_filter_name, count in ball_diagnostics_state["other_filter_frame_counts"].items():
+        reason_counts[f"other:{other_filter_name}"] = int(count)
+
+    sorted_reasons = sorted(reason_counts.items(), key=lambda item: item[1], reverse=True)
+    top_reasons = [item for item in sorted_reasons if item[1] > 0][:3]
+    top_reason_key = top_reasons[0][0] if top_reasons else None
+
+    recommended_adjustment = "no_change_recommended"
+    if top_reason_key == "confidence":
+        recommended_adjustment = "evaluate lowering confidence gate for predicted-near candidates"
+    elif top_reason_key == "roi":
+        recommended_adjustment = "evaluate widening ROI radius around predicted position"
+    elif top_reason_key == "nms":
+        recommended_adjustment = "evaluate relaxing NMS IoU threshold for dense candidate clusters"
+    elif top_reason_key == "no_candidate":
+        recommended_adjustment = "evaluate improving detector sensitivity for small/blurred ball appearances"
+    elif top_reason_key and top_reason_key.startswith("other:"):
+        recommended_adjustment = "evaluate downstream ball candidate gating after detector output"
+
+    top_reason_count = top_reasons[0][1] if top_reasons else 0
+    estimated_gain_percent = (
+        (float(top_reason_count) / float(missing_frames_count)) * 100.0
+        if missing_frames_count > 0
+        else 0.0
+    )
+
+    return {
+        "max_consecutive_frames_without_ball": max_missing_streak,
+        "avg_consecutive_frames_without_ball": average_missing_streak,
+        "consecutive_missing_sequences": consecutive_missing_sequences,
+        "missing_frames_count": missing_frames_count,
+        "discarded_candidate_confidence_distribution": histogram_of_confidences(
+            ball_diagnostics_state["discarded_candidate_confidences"]
+        ),
+        "frames_with_candidate_confidence_range": dict(
+            ball_diagnostics_state["frames_with_candidate_confidence_range"]
+        ),
+        "frame_counts_by_reason": reason_counts,
+        "top_reasons": top_reasons,
+        "recommended_adjustment": recommended_adjustment,
+        "estimated_gain_percent_if_applied": estimated_gain_percent,
+    }
+
+
 def analyze(args):
     input_path = Path(args.input)
     output_path = Path(args.output)
@@ -1235,6 +1406,17 @@ def analyze(args):
     profile_state = create_profile_state()
     hardware_info = collect_hardware_info()
     profile_report_path = output_path.with_suffix(f"{output_path.suffix}.profile.json")
+    ball_diagnostics_output_path = (
+        Path(args.ball_diagnostics_output).resolve()
+        if args.ball_diagnostics_output
+        else None
+    )
+    ball_diagnostics_enabled = ball_diagnostics_output_path is not None
+    ball_detector_confidence_for_run = (
+        max(0.0, float(args.ball_diagnostics_min_confidence))
+        if ball_diagnostics_enabled
+        else BALL_DETECTOR_DEFAULT_CONFIDENCE
+    )
 
     player_model_path = resolve_player_model_path(args.model)
     if not player_model_path.exists():
@@ -1437,6 +1619,23 @@ def analyze(args):
         "ball_track_interruptions_before": 0,
         "ball_track_interruptions_after": 0,
     }
+    ball_diagnostics_state = {
+        "enabled": ball_diagnostics_enabled,
+        "inference_confidence": ball_detector_confidence_for_run,
+        "frames_without_ball": [],
+        "consecutive_missing_sequences": [],
+        "current_missing_streak": 0,
+        "discarded_candidate_confidences": [],
+        "frames_with_candidate_confidence_range": {
+            confidence_range["label"]: 0
+            for confidence_range in BALL_DIAGNOSTIC_FRAME_CONFIDENCE_BINS
+        },
+        "frames_discarded_by_confidence": 0,
+        "frames_discarded_by_roi": 0,
+        "frames_discarded_by_nms": 0,
+        "frames_without_any_candidate": 0,
+        "other_filter_frame_counts": {},
+    }
     team_prediction_counts = {0: 0, 1: 0}
     player_team_cache_by_track_id = {}
     team_classifier_cache_metrics = {
@@ -1521,8 +1720,17 @@ def analyze(args):
         )
 
         ball_detection_stage_start = time.perf_counter()
-        ball_result = ball_model(frame, imgsz=640, verbose=False)[0]
-        dedicated_ball_detections = extract_ball_detections(ball_result).with_nms(threshold=0.1)
+        ball_result = ball_model(
+            frame,
+            imgsz=640,
+            conf=ball_detector_confidence_for_run,
+            verbose=False,
+        )[0]
+        ball_detector_raw_detections = extract_ball_detections(ball_result)
+        ball_detector_raw_dicts = ball_detections_to_dicts(ball_detector_raw_detections)
+        ball_detector_nms_keep_mask = compute_nms_keep_mask(ball_detector_raw_dicts, 0.1)
+        ball_detections_after_nms = ball_detector_raw_detections.with_nms(threshold=0.1)
+        dedicated_ball_detections = ball_detections_after_nms
         record_profile_stage(
             profile_state,
             "ball_detection",
@@ -1613,8 +1821,8 @@ def analyze(args):
             elif class_id == REFEREE_CLASS_ID:
                 referee_detections.append(detection_payload)
 
-        raw_ball_detections = ball_detections_to_dicts(dedicated_ball_detections)
-        raw_ball_present = bool(raw_ball_detections)
+        tracker_ball_detections = ball_detections_to_dicts(dedicated_ball_detections)
+        raw_ball_present = bool(tracker_ball_detections)
         if ball_previous_raw_present and not raw_ball_present:
             ball_tracking_metrics["ball_track_interruptions_before"] += 1
 
@@ -1625,7 +1833,7 @@ def analyze(args):
 
         roi_radius_pixels = ball_roi_radius(ball_last_valid_detection)
         selected_ball_detection, roi_attempted, roi_success = select_ball_detection_with_roi(
-            raw_ball_detections,
+            tracker_ball_detections,
             predicted_ball_center,
             roi_radius_pixels,
         )
@@ -1667,6 +1875,112 @@ def analyze(args):
             ball_tracking_metrics["ball_track_interruptions_after"] += 1
         ball_previous_raw_present = raw_ball_present
         ball_previous_final_present = internal_ball_track_alive
+        if ball_diagnostics_state["enabled"]:
+            if visual_ball_present:
+                if ball_diagnostics_state["current_missing_streak"] > 0:
+                    ball_diagnostics_state["consecutive_missing_sequences"].append(
+                        ball_diagnostics_state["current_missing_streak"]
+                    )
+                    ball_diagnostics_state["current_missing_streak"] = 0
+            else:
+                ball_diagnostics_state["current_missing_streak"] += 1
+                for confidence_range in BALL_DIAGNOSTIC_FRAME_CONFIDENCE_BINS:
+                    if frame_has_candidate_in_confidence_range(
+                        ball_detector_raw_dicts,
+                        confidence_range["lower"],
+                        confidence_range["upper"],
+                    ):
+                        label = confidence_range["label"]
+                        ball_diagnostics_state["frames_with_candidate_confidence_range"][label] += 1
+
+                best_candidate_index = pick_best_ball_diagnostic_candidate(
+                    ball_detector_raw_dicts,
+                    predicted_ball_center,
+                )
+                had_prediction = predicted_ball_center is not None
+                frame_diagnostic_entry = {
+                    "frame_id": int(current_frame_number),
+                    "had_predicted_position": bool(had_prediction),
+                    "distance_prediction_to_best_candidate": None,
+                    "best_candidate_confidence": None,
+                    "detector_candidates_count": int(len(ball_detector_raw_dicts)),
+                    "best_candidate_bbox_xywh": None,
+                    "best_candidate_bbox_area": None,
+                    "discarded_by_confidence": False,
+                    "discarded_by_nms": False,
+                    "discarded_by_roi": False,
+                    "discarded_by_other_filter": None,
+                }
+                if best_candidate_index is None:
+                    ball_diagnostics_state["frames_without_any_candidate"] += 1
+                    frame_diagnostic_entry["discarded_by_other_filter"] = "no_detector_candidates"
+                else:
+                    best_candidate = ball_detector_raw_dicts[best_candidate_index]
+                    best_candidate_center = detection_center_np(best_candidate["box"])
+                    prediction_distance = (
+                        float(np.linalg.norm(best_candidate_center - predicted_ball_center))
+                        if had_prediction
+                        else None
+                    )
+                    confidence_threshold = ball_confidence_threshold_for_distance(prediction_distance)
+                    discarded_by_confidence = (
+                        confidence_threshold is not None
+                        and best_candidate["confidence"] < confidence_threshold
+                    )
+                    discarded_by_nms = (
+                        best_candidate_index < len(ball_detector_nms_keep_mask)
+                        and not ball_detector_nms_keep_mask[best_candidate_index]
+                    )
+                    discarded_by_roi = (
+                        had_prediction
+                        and prediction_distance is not None
+                        and prediction_distance > roi_radius_pixels
+                    )
+
+                    other_filter_name = None
+                    if not discarded_by_confidence and not discarded_by_nms and not discarded_by_roi:
+                        candidate_present_after_ball_tracker = any(
+                            box_iou(best_candidate["box"], tracker_candidate["box"]) >= 0.99
+                            for tracker_candidate in tracker_ball_detections
+                        )
+                        if not candidate_present_after_ball_tracker:
+                            other_filter_name = "ball_tracker_selection"
+                        elif selected_ball_detection is None:
+                            other_filter_name = "selection_rule"
+
+                    if discarded_by_confidence:
+                        ball_diagnostics_state["frames_discarded_by_confidence"] += 1
+                    if discarded_by_nms:
+                        ball_diagnostics_state["frames_discarded_by_nms"] += 1
+                    if discarded_by_roi:
+                        ball_diagnostics_state["frames_discarded_by_roi"] += 1
+                    if other_filter_name is not None:
+                        ball_diagnostics_state["other_filter_frame_counts"][other_filter_name] = (
+                            int(ball_diagnostics_state["other_filter_frame_counts"].get(other_filter_name, 0)) + 1
+                        )
+                    if (
+                        discarded_by_confidence
+                        or discarded_by_nms
+                        or discarded_by_roi
+                        or other_filter_name is not None
+                    ):
+                        ball_diagnostics_state["discarded_candidate_confidences"].append(
+                            float(best_candidate["confidence"])
+                        )
+
+                    frame_diagnostic_entry["distance_prediction_to_best_candidate"] = prediction_distance
+                    frame_diagnostic_entry["best_candidate_confidence"] = float(best_candidate["confidence"])
+                    frame_diagnostic_entry["best_candidate_bbox_xywh"] = detection_box_to_xywh(
+                        best_candidate["box"]
+                    )
+                    frame_diagnostic_entry["best_candidate_bbox_area"] = float(
+                        detection_box_area(best_candidate["box"])
+                    )
+                    frame_diagnostic_entry["discarded_by_confidence"] = bool(discarded_by_confidence)
+                    frame_diagnostic_entry["discarded_by_nms"] = bool(discarded_by_nms)
+                    frame_diagnostic_entry["discarded_by_roi"] = bool(discarded_by_roi)
+                    frame_diagnostic_entry["discarded_by_other_filter"] = other_filter_name
+                ball_diagnostics_state["frames_without_ball"].append(frame_diagnostic_entry)
 
         player_detections, suppressed = suppress_duplicate_person_detections(player_detections)
         duplicate_player_detections_suppressed += suppressed
@@ -2037,6 +2351,28 @@ def analyze(args):
         ball_tracking_metrics=ball_tracking_metrics,
     )
     write_performance_profile_report(profile_report_path, profile_report)
+    ball_diagnostics_report = None
+    if ball_diagnostics_state["enabled"]:
+        ball_diagnostics_summary = build_ball_diagnostics_summary(ball_diagnostics_state)
+        ball_diagnostics_report = {
+            "input_video_path": str(input_path),
+            "output_video_path": str(output_path),
+            "frames_processed": int(frames_processed),
+            "detector_inference_confidence": float(ball_diagnostics_state["inference_confidence"]),
+            "nms_iou_threshold": 0.1,
+            "roi_radius": {
+                "min_px": BALL_ROI_MIN_RADIUS_PX,
+                "scale_from_box": BALL_ROI_SCALE_FROM_BOX,
+            },
+            "confidence_gate": {
+                "near_distance_px": BALL_PREDICTION_NEAR_DISTANCE_PX,
+                "near_min_confidence": BALL_CONFIDENCE_NEAR_MIN,
+                "far_min_confidence": BALL_CONFIDENCE_FAR_MIN,
+            },
+            "summary": ball_diagnostics_summary,
+            "frames_without_ball": ball_diagnostics_state["frames_without_ball"],
+        }
+        write_ball_diagnostics_report(ball_diagnostics_output_path, ball_diagnostics_report)
 
     avg_player_confidence = (
         confidence_sum["Player"] / confidence_count["Player"] if confidence_count["Player"] else 0
@@ -2150,6 +2486,11 @@ def analyze(args):
         "machine_learning": {"status": "pending"},
         "artifacts": {
             "processed_video_path": str(output_path),
+            "ball_diagnostics_path": (
+                str(ball_diagnostics_output_path)
+                if ball_diagnostics_output_path is not None
+                else None
+            ),
         },
     }
     emit(
@@ -2201,6 +2542,17 @@ def parse_args():
         type=int,
         default=1,
         help="Write one live debug frame every N processed frames when debug mode is enabled",
+    )
+    parser.add_argument(
+        "--ball-diagnostics-output",
+        default=None,
+        help="Optional JSON path to write frame-level ball detector diagnostics",
+    )
+    parser.add_argument(
+        "--ball-diagnostics-min-confidence",
+        type=float,
+        default=BALL_DIAGNOSTIC_MIN_CONFIDENCE,
+        help="Detector confidence used during diagnostic runs (single inference, no extra model)",
     )
     return parser.parse_args()
 
