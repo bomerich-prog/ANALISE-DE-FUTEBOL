@@ -46,6 +46,13 @@ PITCH_MODEL_RELATIVE_PATH = Path("models/football-pitch-detection.pt")
 BALL_MODEL_RELATIVE_PATH = Path("models/football-ball-detection.pt")
 PITCH_KEYPOINT_MIN_CONFIDENCE = 0.25
 BALL_TRACKER_BUFFER_SIZE = 20
+BALL_MEMORY_MAX_MISSING_FRAMES = 5
+BALL_TRAJECTORY_HISTORY_SIZE = 6
+BALL_ROI_MIN_RADIUS_PX = 45.0
+BALL_ROI_SCALE_FROM_BOX = 2.25
+BALL_PREDICTION_NEAR_DISTANCE_PX = 80.0
+BALL_CONFIDENCE_NEAR_MIN = 0.12
+BALL_CONFIDENCE_FAR_MIN = 0.35
 TEAM_CLASSIFIER_STRIDE = 10
 TEAM_CLASSIFIER_MAX_TRAINING_FRAMES = 400
 TEAM_CLASSIFIER_TARGET_SAMPLES = 60
@@ -729,6 +736,91 @@ def ball_detections_to_dicts(detections):
     ]
 
 
+def detection_center_np(box):
+    x1, y1, x2, y2 = [float(value) for value in box]
+    return np.array([(x1 + x2) * 0.5, (y1 + y2) * 0.5], dtype=np.float32)
+
+
+def predict_ball_center(position_history, current_frame_number):
+    if not position_history:
+        return None
+
+    latest_frame, latest_center = position_history[-1]
+    if len(position_history) < 2:
+        return latest_center.copy()
+
+    velocity_samples = []
+    sampled_positions = list(position_history)[-4:]
+    for index in range(1, len(sampled_positions)):
+        previous_frame, previous_center = sampled_positions[index - 1]
+        next_frame, next_center = sampled_positions[index]
+        frame_delta = max(1, int(next_frame - previous_frame))
+        velocity_samples.append((next_center - previous_center) / float(frame_delta))
+
+    if not velocity_samples:
+        return latest_center.copy()
+
+    average_velocity = np.mean(np.stack(velocity_samples), axis=0)
+    prediction_frame_delta = max(1, int(current_frame_number - latest_frame))
+    return latest_center + average_velocity * float(prediction_frame_delta)
+
+
+def ball_roi_radius(last_detection):
+    if not last_detection:
+        return BALL_ROI_MIN_RADIUS_PX
+    x1, y1, x2, y2 = [float(value) for value in last_detection["box"]]
+    width = max(1.0, x2 - x1)
+    height = max(1.0, y2 - y1)
+    return max(BALL_ROI_MIN_RADIUS_PX, max(width, height) * BALL_ROI_SCALE_FROM_BOX)
+
+
+def pick_detection_with_confidence_fusion(detections, predicted_center):
+    if not detections:
+        return None
+    if predicted_center is None:
+        return max(detections, key=lambda detection: detection["confidence"])
+
+    accepted = []
+    for detection in detections:
+        center = detection_center_np(detection["box"])
+        distance = float(np.linalg.norm(center - predicted_center))
+        confidence_threshold = (
+            BALL_CONFIDENCE_NEAR_MIN
+            if distance <= BALL_PREDICTION_NEAR_DISTANCE_PX
+            else BALL_CONFIDENCE_FAR_MIN
+        )
+        if detection["confidence"] < confidence_threshold:
+            continue
+        accepted.append((distance, detection))
+
+    if not accepted:
+        return None
+
+    accepted.sort(key=lambda item: (item[0], -item[1]["confidence"]))
+    return accepted[0][1]
+
+
+def select_ball_detection_with_roi(detections, predicted_center, roi_radius_pixels):
+    if not detections:
+        return None, False, False
+    if predicted_center is None:
+        return pick_detection_with_confidence_fusion(detections, None), False, False
+
+    roi_candidates = []
+    for detection in detections:
+        center = detection_center_np(detection["box"])
+        distance = float(np.linalg.norm(center - predicted_center))
+        if distance <= roi_radius_pixels:
+            roi_candidates.append(detection)
+
+    selected_from_roi = pick_detection_with_confidence_fusion(roi_candidates, predicted_center)
+    if selected_from_roi is not None:
+        return selected_from_roi, True, True
+
+    selected_global = pick_detection_with_confidence_fusion(detections, predicted_center)
+    return selected_global, True, False
+
+
 def clamp(value, lower, upper):
     return max(lower, min(upper, value))
 
@@ -990,6 +1082,7 @@ def build_performance_profile_report(
     output_path,
     hardware_info,
     team_classifier_cache_metrics,
+    ball_tracking_metrics,
 ):
     frame_total_seconds = profile_state["frame_total_seconds"]
     avg_frame_seconds = (
@@ -1064,6 +1157,18 @@ def build_performance_profile_report(
         else 0.0
     )
     estimated_time_saved_seconds = reduction_calls * avg_predict_call_seconds_after
+    prediction_error_sum = float(ball_tracking_metrics["ball_prediction_error_sum"])
+    prediction_error_count = int(ball_tracking_metrics["ball_prediction_error_count"])
+    average_prediction_error = (
+        prediction_error_sum / prediction_error_count if prediction_error_count > 0 else 0.0
+    )
+    interruptions_before = int(ball_tracking_metrics["ball_track_interruptions_before"])
+    interruptions_after = int(ball_tracking_metrics["ball_track_interruptions_after"])
+    continuity_gain_percent = (
+        ((interruptions_before - interruptions_after) / interruptions_before) * 100.0
+        if interruptions_before > 0
+        else 0.0
+    )
 
     return {
         "analysis": {
@@ -1092,6 +1197,18 @@ def build_performance_profile_report(
             "reduction_calls": reduction_calls,
             "reduction_percent": reduction_percent,
             "estimated_time_saved_seconds": estimated_time_saved_seconds,
+        },
+        "ball_tracking_enhancements": {
+            "memory_max_missing_frames": BALL_MEMORY_MAX_MISSING_FRAMES,
+            "ball_memory_hits": int(ball_tracking_metrics["ball_memory_hits"]),
+            "ball_memory_misses": int(ball_tracking_metrics["ball_memory_misses"]),
+            "ball_roi_searches": int(ball_tracking_metrics["ball_roi_searches"]),
+            "ball_roi_success": int(ball_tracking_metrics["ball_roi_success"]),
+            "ball_prediction_error": average_prediction_error,
+            "ball_prediction_error_samples": prediction_error_count,
+            "ball_track_interruptions_before": interruptions_before,
+            "ball_track_interruptions_after": interruptions_after,
+            "ball_track_continuity_gain_percent": continuity_gain_percent,
         },
         "stages": stages,
         "top_5_slowest_stages": top_5_slowest_stages,
@@ -1305,6 +1422,21 @@ def analyze(args):
     homography_valid_frames = 0
     total_pitch_keypoints_detected = 0
     homography_examples = []
+    ball_position_history = deque(maxlen=BALL_TRAJECTORY_HISTORY_SIZE)
+    ball_last_valid_detection = None
+    ball_frames_without_detection = 0
+    ball_previous_raw_present = False
+    ball_previous_final_present = False
+    ball_tracking_metrics = {
+        "ball_memory_hits": 0,
+        "ball_memory_misses": 0,
+        "ball_roi_searches": 0,
+        "ball_roi_success": 0,
+        "ball_prediction_error_sum": 0.0,
+        "ball_prediction_error_count": 0,
+        "ball_track_interruptions_before": 0,
+        "ball_track_interruptions_after": 0,
+    }
     team_prediction_counts = {0: 0, 1: 0}
     player_team_cache_by_track_id = {}
     team_classifier_cache_metrics = {
@@ -1481,7 +1613,56 @@ def analyze(args):
             elif class_id == REFEREE_CLASS_ID:
                 referee_detections.append(detection_payload)
 
-        ball_detections = ball_detections_to_dicts(dedicated_ball_detections)
+        raw_ball_detections = ball_detections_to_dicts(dedicated_ball_detections)
+        raw_ball_present = bool(raw_ball_detections)
+        if ball_previous_raw_present and not raw_ball_present:
+            ball_tracking_metrics["ball_track_interruptions_before"] += 1
+
+        predicted_ball_center = predict_ball_center(ball_position_history, current_frame_number)
+        if predicted_ball_center is not None:
+            predicted_ball_center[0] = float(clamp(predicted_ball_center[0], 0.0, width - 1.0))
+            predicted_ball_center[1] = float(clamp(predicted_ball_center[1], 0.0, height - 1.0))
+
+        roi_radius_pixels = ball_roi_radius(ball_last_valid_detection)
+        selected_ball_detection, roi_attempted, roi_success = select_ball_detection_with_roi(
+            raw_ball_detections,
+            predicted_ball_center,
+            roi_radius_pixels,
+        )
+        if roi_attempted:
+            ball_tracking_metrics["ball_roi_searches"] += 1
+            if roi_success:
+                ball_tracking_metrics["ball_roi_success"] += 1
+
+        if selected_ball_detection is not None:
+            ball_detections = [selected_ball_detection]
+            ball_frames_without_detection = 0
+            ball_last_valid_detection = selected_ball_detection
+            selected_center = detection_center_np(selected_ball_detection["box"])
+            ball_position_history.append((current_frame_number, selected_center))
+            if predicted_ball_center is not None:
+                prediction_error = float(np.linalg.norm(selected_center - predicted_ball_center))
+                ball_tracking_metrics["ball_prediction_error_sum"] += prediction_error
+                ball_tracking_metrics["ball_prediction_error_count"] += 1
+        else:
+            ball_detections = []
+            ball_frames_without_detection += 1
+            if (
+                ball_last_valid_detection is not None
+                and ball_frames_without_detection <= BALL_MEMORY_MAX_MISSING_FRAMES
+            ):
+                ball_tracking_metrics["ball_memory_hits"] += 1
+            else:
+                ball_tracking_metrics["ball_memory_misses"] += 1
+
+            if ball_frames_without_detection > BALL_MEMORY_MAX_MISSING_FRAMES:
+                ball_last_valid_detection = None
+                ball_position_history.clear()
+        final_ball_present = bool(ball_detections)
+        if ball_previous_final_present and not final_ball_present:
+            ball_tracking_metrics["ball_track_interruptions_after"] += 1
+        ball_previous_raw_present = raw_ball_present
+        ball_previous_final_present = final_ball_present
 
         player_detections, suppressed = suppress_duplicate_person_detections(player_detections)
         duplicate_player_detections_suppressed += suppressed
@@ -1849,6 +2030,7 @@ def analyze(args):
         output_path=output_path,
         hardware_info=hardware_info,
         team_classifier_cache_metrics=team_classifier_cache_metrics,
+        ball_tracking_metrics=ball_tracking_metrics,
     )
     write_performance_profile_report(profile_report_path, profile_report)
 
