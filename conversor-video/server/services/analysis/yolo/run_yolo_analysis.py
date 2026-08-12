@@ -55,6 +55,14 @@ BALL_CONFIDENCE_NEAR_MIN = 0.12
 BALL_CONFIDENCE_FAR_MIN = 0.35
 BALL_DETECTOR_DEFAULT_CONFIDENCE = 0.25
 BALL_DIAGNOSTIC_MIN_CONFIDENCE = 0.05
+BALL_DETECTOR_BACKEND_DEFAULT = os.getenv("BALL_DETECTOR_BACKEND", "yolo").strip().lower()
+BALL_DETECTOR_BACKENDS = {"yolo", "rfdetr"}
+if BALL_DETECTOR_BACKEND_DEFAULT not in BALL_DETECTOR_BACKENDS:
+    BALL_DETECTOR_BACKEND_DEFAULT = "yolo"
+RFDETR_SOCCERNET_REPO_ID_DEFAULT = "julianzu9612/RFDETR-Soccernet"
+RFDETR_SOCCERNET_CHECKPOINT_FILENAME = "weights/checkpoint_best_regular.pth"
+RFDETR_SOCCERNET_CONFIG_FILENAME = "config.json"
+RFDETR_SOCCERNET_MODEL_DIR = Path("models/rfdetr-soccernet")
 BALL_DIAGNOSTIC_FRAME_CONFIDENCE_BINS = [
     {"label": "0.05-0.10", "lower": 0.05, "upper": 0.10},
     {"label": "0.10-0.20", "lower": 0.10, "upper": 0.20},
@@ -654,6 +662,172 @@ def resolve_player_model_path(player_model_arg):
     return resolve_model_path(player_model_arg)
 
 
+def empty_detections():
+    return sv.Detections(
+        xyxy=np.empty((0, 4), dtype=np.float32),
+        confidence=np.empty((0,), dtype=np.float32),
+        class_id=np.empty((0,), dtype=np.int32),
+    )
+
+
+def load_rfdetr_ball_class_id(config_path):
+    try:
+        config_data = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return BALL_CLASS_ID
+
+    class_mapping = (
+        config_data.get("classes", {}).get("class_mapping", {})
+        if isinstance(config_data, dict)
+        else {}
+    )
+    for class_id, class_name in class_mapping.items():
+        if str(class_name).strip().lower() == "ball":
+            try:
+                return int(class_id)
+            except (TypeError, ValueError):
+                continue
+    return BALL_CLASS_ID
+
+
+def download_huggingface_model_file(repo_id, filename, target_directory):
+    target_directory.mkdir(parents=True, exist_ok=True)
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as exc:
+        raise RuntimeError(
+            "huggingface_hub não está disponível para baixar o checkpoint RF-DETR."
+        ) from exc
+
+    try:
+        downloaded_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            local_dir=str(target_directory),
+            local_dir_use_symlinks=False,
+        )
+    except TypeError:
+        downloaded_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            local_dir=str(target_directory),
+        )
+    return Path(downloaded_path).resolve()
+
+
+def ensure_rfdetr_soccernet_files(repo_id, model_directory):
+    checkpoint_path = model_directory / RFDETR_SOCCERNET_CHECKPOINT_FILENAME
+    config_path = model_directory / RFDETR_SOCCERNET_CONFIG_FILENAME
+    if not checkpoint_path.exists():
+        checkpoint_path = download_huggingface_model_file(
+            repo_id=repo_id,
+            filename=RFDETR_SOCCERNET_CHECKPOINT_FILENAME,
+            target_directory=model_directory,
+        )
+    if not config_path.exists():
+        config_path = download_huggingface_model_file(
+            repo_id=repo_id,
+            filename=RFDETR_SOCCERNET_CONFIG_FILENAME,
+            target_directory=model_directory,
+        )
+    return checkpoint_path.resolve(), config_path.resolve()
+
+
+class BallDetectorYOLO:
+    def __init__(self, model, confidence_threshold):
+        self.model = model
+        self.confidence_threshold = float(confidence_threshold)
+        self.source_name = "yolo-football-ball-detection"
+
+    def detect(self, frame):
+        result = self.model(
+            frame,
+            imgsz=640,
+            conf=self.confidence_threshold,
+            verbose=False,
+        )[0]
+        return extract_ball_detections(result)
+
+
+class BallDetectorRFDETR:
+    def __init__(self, checkpoint_path, confidence_threshold, ball_class_id):
+        self.checkpoint_path = Path(checkpoint_path).resolve()
+        self.confidence_threshold = float(confidence_threshold)
+        self.ball_class_id = int(ball_class_id)
+        self.source_name = "rfdetr-soccernet"
+        self.model = None
+
+    def _ensure_model(self):
+        if self.model is not None:
+            return
+        try:
+            from rfdetr import RFDETR
+        except ImportError as exc:
+            raise RuntimeError("Pacote oficial rfdetr não está instalado.") from exc
+        self.model = RFDETR.from_checkpoint(
+            str(self.checkpoint_path),
+            trust_checkpoint=True,
+        )
+
+    def detect(self, frame):
+        self._ensure_model()
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        detections = self.model.predict(
+            frame_rgb,
+            threshold=self.confidence_threshold,
+            include_source_image=False,
+        )
+        if isinstance(detections, list):
+            detections = detections[0] if detections else empty_detections()
+        if detections is None or len(detections) == 0:
+            return empty_detections()
+
+        class_ids = detections.class_id
+        if class_ids is None:
+            return detections
+        class_ids_array = np.asarray(class_ids, dtype=np.int32)
+        if class_ids_array.size != len(detections):
+            return detections
+        ball_mask = class_ids_array == self.ball_class_id
+        if not np.any(ball_mask):
+            return empty_detections()
+        return detections[ball_mask]
+
+
+def build_ball_detector(args, confidence_threshold):
+    backend = str(args.ball_detector).strip().lower()
+    if backend not in BALL_DETECTOR_BACKENDS:
+        raise ValueError(
+            f"Detector de bola inválido '{backend}'. Opções: {sorted(BALL_DETECTOR_BACKENDS)}"
+        )
+
+    if backend == "yolo":
+        ball_model_path = resolve_ball_model_path(args.ball_model)
+        if not ball_model_path.exists():
+            raise FileNotFoundError(f"Modelo de detecção da bola não encontrado: {ball_model_path}")
+        return (
+            BallDetectorYOLO(YOLO(str(ball_model_path)), confidence_threshold),
+            backend,
+            str(ball_model_path),
+        )
+
+    rfdetr_model_directory = resolve_model_path(args.rfdetr_model_dir)
+    checkpoint_path, config_path = ensure_rfdetr_soccernet_files(
+        repo_id=args.rfdetr_repo_id,
+        model_directory=rfdetr_model_directory,
+    )
+    ball_class_id = load_rfdetr_ball_class_id(config_path)
+    return (
+        BallDetectorRFDETR(
+            checkpoint_path=checkpoint_path,
+            confidence_threshold=confidence_threshold,
+            ball_class_id=ball_class_id,
+        ),
+        backend,
+        str(checkpoint_path),
+    )
+
+
 def extract_pitch_keypoints(pitch_result, confidence_threshold):
     keypoints = getattr(pitch_result, "keypoints", None)
     if keypoints is None:
@@ -724,25 +898,37 @@ def extract_ball_detections(ball_result):
     return sv.Detections.from_ultralytics(ball_result)
 
 
-def ball_detections_to_dicts(detections):
+def ball_detections_to_dicts(detections, source_name):
     if len(detections) == 0:
         return []
 
     confidence_values = detections.confidence
     if confidence_values is None:
         confidence_values = np.zeros(len(detections), dtype=np.float32)
+    class_ids = detections.class_id
+    if class_ids is None:
+        class_ids = np.full(len(detections), BALL_CLASS_ID, dtype=np.int32)
+    else:
+        class_ids = np.asarray(class_ids, dtype=np.int32)
 
-    return [
-        {
-            "box": detections.xyxy[index].tolist(),
-            "bounding_box": detections.xyxy[index].tolist(),
-            "confidence": float(confidence_values[index]),
-            "source": "ball_model",
-            "field_x": None,
-            "field_y": None,
-        }
-        for index in range(len(detections))
-    ]
+    detection_dicts = []
+    for index in range(len(detections)):
+        box = detections.xyxy[index].tolist()
+        center = detection_center_np(box)
+        detection_dicts.append(
+            {
+                "box": box,
+                "bounding_box": box,
+                "confidence": float(confidence_values[index]),
+                "source": source_name,
+                "class_id": int(class_ids[index]) if index < len(class_ids) else BALL_CLASS_ID,
+                "class": "Ball",
+                "center": [float(center[0]), float(center[1])],
+                "field_x": None,
+                "field_y": None,
+            }
+        )
+    return detection_dicts
 
 
 def detection_center_np(box):
@@ -1428,16 +1614,15 @@ def analyze(args):
     if not pitch_model_path.exists():
         raise FileNotFoundError(f"Modelo de detecção de campo não encontrado: {pitch_model_path}")
     pitch_model = YOLO(str(pitch_model_path))
-    ball_model_path = resolve_ball_model_path(args.ball_model)
-    if not ball_model_path.exists():
-        raise FileNotFoundError(f"Modelo de detecção da bola não encontrado: {ball_model_path}")
-    ball_model = YOLO(str(ball_model_path))
+    ball_detector, ball_detector_backend, ball_detector_model_path = build_ball_detector(
+        args=args,
+        confidence_threshold=ball_detector_confidence_for_run,
+    )
     ball_tracker = BallTracker(buffer_size=BALL_TRACKER_BUFFER_SIZE)
     team_classifier = TeamClassifier(device="cpu")
 
     def ball_slicer_callback(image_slice):
-        ball_slice_result = ball_model(image_slice, imgsz=640, verbose=False)[0]
-        return extract_ball_detections(ball_slice_result)
+        return ball_detector.detect(image_slice)
 
     # NOTE: InferenceSlicer wiring is intentionally kept in place (callback preserved)
     # for easy reactivation, but temporarily disabled from the runtime flow.
@@ -1622,7 +1807,10 @@ def analyze(args):
     ball_diagnostics_state = {
         "enabled": ball_diagnostics_enabled,
         "inference_confidence": ball_detector_confidence_for_run,
+        "detector_backend": ball_detector_backend,
+        "detector_model_path": ball_detector_model_path,
         "frames_without_ball": [],
+        "final_ball_timeline": [],
         "consecutive_missing_sequences": [],
         "current_missing_streak": 0,
         "discarded_candidate_confidences": [],
@@ -1720,14 +1908,11 @@ def analyze(args):
         )
 
         ball_detection_stage_start = time.perf_counter()
-        ball_result = ball_model(
-            frame,
-            imgsz=640,
-            conf=ball_detector_confidence_for_run,
-            verbose=False,
-        )[0]
-        ball_detector_raw_detections = extract_ball_detections(ball_result)
-        ball_detector_raw_dicts = ball_detections_to_dicts(ball_detector_raw_detections)
+        ball_detector_raw_detections = ball_detector.detect(frame)
+        ball_detector_raw_dicts = ball_detections_to_dicts(
+            ball_detector_raw_detections,
+            source_name=ball_detector.source_name,
+        )
         ball_detector_nms_keep_mask = compute_nms_keep_mask(ball_detector_raw_dicts, 0.1)
         ball_detections_after_nms = ball_detector_raw_detections.with_nms(threshold=0.1)
         dedicated_ball_detections = ball_detections_after_nms
@@ -1821,7 +2006,10 @@ def analyze(args):
             elif class_id == REFEREE_CLASS_ID:
                 referee_detections.append(detection_payload)
 
-        tracker_ball_detections = ball_detections_to_dicts(dedicated_ball_detections)
+        tracker_ball_detections = ball_detections_to_dicts(
+            dedicated_ball_detections,
+            source_name=ball_detector.source_name,
+        )
         raw_ball_present = bool(tracker_ball_detections)
         if ball_previous_raw_present and not raw_ball_present:
             ball_tracking_metrics["ball_track_interruptions_before"] += 1
@@ -1876,6 +2064,25 @@ def analyze(args):
         ball_previous_raw_present = raw_ball_present
         ball_previous_final_present = internal_ball_track_alive
         if ball_diagnostics_state["enabled"]:
+            timeline_entry = {
+                "frame_id": int(current_frame_number),
+                "detected": bool(visual_ball_present),
+                "bbox_xyxy": None,
+                "bbox_xywh": None,
+                "confidence": None,
+                "center": None,
+                "class": "Ball",
+                "class_id": BALL_CLASS_ID,
+            }
+            if visual_ball_present and ball_detections:
+                chosen_detection = ball_detections[0]
+                timeline_entry["bbox_xyxy"] = chosen_detection["box"]
+                timeline_entry["bbox_xywh"] = detection_box_to_xywh(chosen_detection["box"])
+                timeline_entry["confidence"] = float(chosen_detection["confidence"])
+                timeline_entry["center"] = chosen_detection.get("center")
+                timeline_entry["class_id"] = int(chosen_detection.get("class_id", BALL_CLASS_ID))
+            ball_diagnostics_state["final_ball_timeline"].append(timeline_entry)
+
             if visual_ball_present:
                 if ball_diagnostics_state["current_missing_streak"] > 0:
                     ball_diagnostics_state["consecutive_missing_sequences"].append(
@@ -2358,6 +2565,8 @@ def analyze(args):
             "input_video_path": str(input_path),
             "output_video_path": str(output_path),
             "frames_processed": int(frames_processed),
+            "detector_used": ball_diagnostics_state["detector_backend"],
+            "detector_model_path": ball_diagnostics_state["detector_model_path"],
             "detector_inference_confidence": float(ball_diagnostics_state["inference_confidence"]),
             "nms_iou_threshold": 0.1,
             "roi_radius": {
@@ -2371,6 +2580,7 @@ def analyze(args):
             },
             "summary": ball_diagnostics_summary,
             "frames_without_ball": ball_diagnostics_state["frames_without_ball"],
+            "final_ball_timeline": ball_diagnostics_state["final_ball_timeline"],
         }
         write_ball_diagnostics_report(ball_diagnostics_output_path, ball_diagnostics_report)
 
@@ -2413,6 +2623,8 @@ def analyze(args):
             "classes": ["Player", "Goalkeeper", "Referee", "Ball"],
             "class_id_map": DETECTION_LABEL_BY_CLASS_ID,
             "player_detection_model": str(player_model_path),
+            "ball_detector_backend": ball_detector_backend,
+            "ball_detector_model": ball_detector_model_path,
             "confidence_threshold": args.conf,
             "player_duplicate_iou_threshold": PERSON_DUPLICATE_IOU_THRESHOLD,
             "field_filter": "player/goalkeeper/referee bbox bottom-center foot point must be inside white-line-guided playable-field polygon",
@@ -2527,6 +2739,22 @@ def parse_args():
         "--ball-model",
         default=str(ball_model_default),
         help="Path to the football ball detection model (.pt)",
+    )
+    parser.add_argument(
+        "--ball-detector",
+        choices=sorted(BALL_DETECTOR_BACKENDS),
+        default=BALL_DETECTOR_BACKEND_DEFAULT,
+        help="Ball detector backend: yolo (football-ball-detection.pt) or rfdetr (SoccerNet checkpoint)",
+    )
+    parser.add_argument(
+        "--rfdetr-repo-id",
+        default=RFDETR_SOCCERNET_REPO_ID_DEFAULT,
+        help="Hugging Face repository id for RF-DETR SoccerNet checkpoint",
+    )
+    parser.add_argument(
+        "--rfdetr-model-dir",
+        default=str(RFDETR_SOCCERNET_MODEL_DIR),
+        help="Local directory to store RF-DETR SoccerNet model files",
     )
     parser.add_argument("--imgsz", type=int, default=1280, help="YOLO inference image size")
     parser.add_argument("--conf", type=float, default=0.25, help="YOLO confidence threshold")
