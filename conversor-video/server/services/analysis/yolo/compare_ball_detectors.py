@@ -53,6 +53,11 @@ def parse_args():
         help="Local directory for RF-DETR model files",
     )
     parser.add_argument(
+        "--rfdetr-device",
+        default="auto",
+        help='RF-DETR runtime device: "auto", "cpu" or "cuda"',
+    )
+    parser.add_argument(
         "--match-iou-threshold",
         type=float,
         default=0.1,
@@ -90,6 +95,8 @@ def run_detector_analysis(args, detector_backend, output_dir):
         str(args.rfdetr_repo_id),
         "--rfdetr-model-dir",
         str(args.rfdetr_model_dir),
+        "--rfdetr-device",
+        str(args.rfdetr_device),
     ]
     if args.model:
         command.extend(["--model", str(args.model)])

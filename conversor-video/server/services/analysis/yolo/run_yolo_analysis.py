@@ -750,24 +750,66 @@ class BallDetectorYOLO:
 
 
 class BallDetectorRFDETR:
-    def __init__(self, checkpoint_path, confidence_threshold, ball_class_id):
+    def __init__(self, checkpoint_path, confidence_threshold, ball_class_id, device="auto"):
         self.checkpoint_path = Path(checkpoint_path).resolve()
         self.confidence_threshold = float(confidence_threshold)
         self.ball_class_id = int(ball_class_id)
         self.source_name = "rfdetr-soccernet"
+        self.device = device
         self.model = None
 
     def _ensure_model(self):
         if self.model is not None:
             return
         try:
+            import torch
+        except ImportError as exc:
+            raise RuntimeError("PyTorch não está disponível para carregar o RF-DETR.") from exc
+        try:
             from rfdetr import RFDETR
         except ImportError as exc:
             raise RuntimeError("Pacote oficial rfdetr não está instalado.") from exc
-        self.model = RFDETR.from_checkpoint(
+
+        runtime_device = self.device
+        if runtime_device == "auto":
+            runtime_device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        checkpoint = torch.load(
             str(self.checkpoint_path),
-            trust_checkpoint=True,
+            map_location=runtime_device,
+            weights_only=False,
         )
+        checkpoint_args = checkpoint.get("args")
+        args_dict = {}
+        if isinstance(checkpoint_args, dict):
+            args_dict = checkpoint_args
+        elif checkpoint_args is not None and hasattr(checkpoint_args, "__dict__"):
+            args_dict = vars(checkpoint_args)
+
+        checkpoint_num_classes = int(args_dict.get("num_classes", 4))
+        model_kwargs = {
+            "encoder": args_dict.get("encoder", "dinov2_windowed_base"),
+            "out_feature_indexes": args_dict.get("out_feature_indexes", [2, 5, 8, 11]),
+            "dec_layers": args_dict.get("dec_layers", 3),
+            "projector_scale": args_dict.get("projector_scale", ["P3", "P5"]),
+            "hidden_dim": args_dict.get("hidden_dim", 384),
+            "patch_size": args_dict.get("patch_size", 14),
+            "num_windows": args_dict.get("num_windows", 4),
+            "sa_nheads": args_dict.get("sa_nheads", 12),
+            "ca_nheads": args_dict.get("ca_nheads", 24),
+            "dec_n_points": args_dict.get("dec_n_points", 4),
+            "resolution": args_dict.get("resolution", 560),
+            "positional_encoding_size": args_dict.get("positional_encoding_size", 37),
+            "num_classes": max(1, checkpoint_num_classes - 1),
+            "pretrain_weights": args_dict.get("pretrain_weights", "rf-detr-large.pth"),
+        }
+
+        self.model = RFDETR(**model_kwargs)
+        model_state = checkpoint.get("model") or checkpoint.get("model_state_dict") or checkpoint
+        self.model.model.model.load_state_dict(model_state, strict=False)
+        self.model.model.model.to(runtime_device)
+        self.model.model.model.eval()
+        self.device = runtime_device
 
     def detect(self, frame):
         self._ensure_model()
@@ -822,6 +864,7 @@ def build_ball_detector(args, confidence_threshold):
             checkpoint_path=checkpoint_path,
             confidence_threshold=confidence_threshold,
             ball_class_id=ball_class_id,
+            device=args.rfdetr_device,
         ),
         backend,
         str(checkpoint_path),
@@ -2755,6 +2798,11 @@ def parse_args():
         "--rfdetr-model-dir",
         default=str(RFDETR_SOCCERNET_MODEL_DIR),
         help="Local directory to store RF-DETR SoccerNet model files",
+    )
+    parser.add_argument(
+        "--rfdetr-device",
+        default="auto",
+        help='RF-DETR runtime device: "auto", "cpu" or "cuda"',
     )
     parser.add_argument("--imgsz", type=int, default=1280, help="YOLO inference image size")
     parser.add_argument("--conf", type=float, default=0.25, help="YOLO confidence threshold")
