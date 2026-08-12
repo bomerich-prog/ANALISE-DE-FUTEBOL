@@ -1658,11 +1658,15 @@ def analyze(args):
             if ball_frames_without_detection > BALL_MEMORY_MAX_MISSING_FRAMES:
                 ball_last_valid_detection = None
                 ball_position_history.clear()
-        final_ball_present = bool(ball_detections)
-        if ball_previous_final_present and not final_ball_present:
+        visual_ball_present = bool(ball_detections)
+        internal_ball_track_alive = visual_ball_present or (
+            ball_last_valid_detection is not None
+            and ball_frames_without_detection <= BALL_MEMORY_MAX_MISSING_FRAMES
+        )
+        if ball_previous_final_present and not internal_ball_track_alive:
             ball_tracking_metrics["ball_track_interruptions_after"] += 1
         ball_previous_raw_present = raw_ball_present
-        ball_previous_final_present = final_ball_present
+        ball_previous_final_present = internal_ball_track_alive
 
         player_detections, suppressed = suppress_duplicate_person_detections(player_detections)
         duplicate_player_detections_suppressed += suppressed
