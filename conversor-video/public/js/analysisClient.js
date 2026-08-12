@@ -1,7 +1,7 @@
 import { api } from './api.js';
 import { ANALYSIS_STATUS } from './pipelineStatus.js';
 
-const POLL_INTERVAL_MS = 400;
+const POLL_INTERVAL_MS = 200;
 
 /**
  * Cliente de análise — comunica com a API e faz polling de progresso.
