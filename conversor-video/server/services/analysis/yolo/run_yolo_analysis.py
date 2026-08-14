@@ -53,8 +53,15 @@ BALL_ROI_SCALE_FROM_BOX = 2.25
 BALL_PREDICTION_NEAR_DISTANCE_PX = 80.0
 BALL_CONFIDENCE_NEAR_MIN = 0.12
 BALL_CONFIDENCE_FAR_MIN = 0.35
+PREDICTIVE_BALL_CONFIDENCE_NEAR_MIN = 0.08
 BALL_DETECTOR_DEFAULT_CONFIDENCE = 0.25
 BALL_DIAGNOSTIC_MIN_CONFIDENCE = 0.05
+PREDICTIVE_BALL_TRACKING_DEFAULT = os.getenv("PREDICTIVE_BALL_TRACKING", "on").strip().lower()
+if PREDICTIVE_BALL_TRACKING_DEFAULT not in {"on", "off"}:
+    PREDICTIVE_BALL_TRACKING_DEFAULT = "on"
+PREDICTIVE_ROI_SIZE_SEQUENCE = [200.0, 300.0, 450.0, 650.0]
+PREDICTIVE_GLOBAL_FALLBACK_AFTER_MISSES = 4
+PREDICTIVE_HISTORY_SIZE = 10
 BALL_DETECTOR_BACKEND_DEFAULT = os.getenv("BALL_DETECTOR_BACKEND", "yolo").strip().lower()
 BALL_DETECTOR_BACKENDS = {"yolo", "rfdetr"}
 if BALL_DETECTOR_BACKEND_DEFAULT not in BALL_DETECTOR_BACKENDS:
@@ -739,14 +746,26 @@ class BallDetectorYOLO:
         self.confidence_threshold = float(confidence_threshold)
         self.source_name = "yolo-football-ball-detection"
 
-    def detect(self, frame):
+    def detect(self, frame, roi_xyxy=None):
+        roi_frame = frame
+        offset_x = 0
+        offset_y = 0
+        if roi_xyxy is not None:
+            x1, y1, x2, y2 = [int(value) for value in roi_xyxy]
+            roi_frame = frame[y1:y2, x1:x2]
+            offset_x = x1
+            offset_y = y1
+
         result = self.model(
-            frame,
+            roi_frame,
             imgsz=640,
             conf=self.confidence_threshold,
             verbose=False,
         )[0]
-        return extract_ball_detections(result)
+        detections = extract_ball_detections(result)
+        if roi_xyxy is None or len(detections) == 0:
+            return detections
+        return translate_detections_to_full_frame(detections, offset_x, offset_y)
 
 
 class BallDetectorRFDETR:
@@ -811,9 +830,18 @@ class BallDetectorRFDETR:
         self.model.model.model.eval()
         self.device = runtime_device
 
-    def detect(self, frame):
+    def detect(self, frame, roi_xyxy=None):
         self._ensure_model()
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        roi_frame = frame
+        offset_x = 0
+        offset_y = 0
+        if roi_xyxy is not None:
+            x1, y1, x2, y2 = [int(value) for value in roi_xyxy]
+            roi_frame = frame[y1:y2, x1:x2]
+            offset_x = x1
+            offset_y = y1
+
+        frame_rgb = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2RGB)
         detections = self.model.predict(
             frame_rgb,
             threshold=self.confidence_threshold,
@@ -833,7 +861,10 @@ class BallDetectorRFDETR:
         ball_mask = class_ids_array == self.ball_class_id
         if not np.any(ball_mask):
             return empty_detections()
-        return detections[ball_mask]
+        filtered = detections[ball_mask]
+        if roi_xyxy is None or len(filtered) == 0:
+            return filtered
+        return translate_detections_to_full_frame(filtered, offset_x, offset_y)
 
 
 def build_ball_detector(args, confidence_threshold):
@@ -1003,6 +1034,133 @@ def predict_ball_center(position_history, current_frame_number):
     return latest_center + average_velocity * float(prediction_frame_delta)
 
 
+def predict_motion_state_from_history(position_history, current_frame_number):
+    if not position_history:
+        return None
+
+    sampled_positions = list(position_history)[-3:]
+    latest_frame, latest_position = sampled_positions[-1]
+    frame_delta_to_target = max(1, int(current_frame_number - latest_frame))
+
+    if len(sampled_positions) == 1:
+        velocity = np.zeros(2, dtype=np.float32)
+        acceleration = np.zeros(2, dtype=np.float32)
+        predicted = latest_position.copy()
+    elif len(sampled_positions) == 2:
+        previous_frame, previous_position = sampled_positions[0]
+        dt = max(1, int(latest_frame - previous_frame))
+        velocity = (latest_position - previous_position) / float(dt)
+        acceleration = np.zeros(2, dtype=np.float32)
+        predicted = latest_position + velocity * float(frame_delta_to_target)
+    else:
+        first_frame, first_position = sampled_positions[0]
+        middle_frame, middle_position = sampled_positions[1]
+        dt1 = max(1, int(middle_frame - first_frame))
+        dt2 = max(1, int(latest_frame - middle_frame))
+        velocity_previous = (middle_position - first_position) / float(dt1)
+        velocity_latest = (latest_position - middle_position) / float(dt2)
+        average_dt = max(1.0, (float(dt1) + float(dt2)) * 0.5)
+        acceleration = (velocity_latest - velocity_previous) / average_dt
+        velocity = velocity_latest
+        dt_to_target = float(frame_delta_to_target)
+        predicted = latest_position + velocity * dt_to_target + 0.5 * acceleration * (dt_to_target**2)
+
+    direction_norm = float(np.linalg.norm(velocity))
+    if direction_norm > 0:
+        direction = (velocity / direction_norm).astype(np.float32)
+    else:
+        direction = np.zeros(2, dtype=np.float32)
+
+    return {
+        "predicted": predicted.astype(np.float32),
+        "velocity": velocity.astype(np.float32),
+        "acceleration": acceleration.astype(np.float32),
+        "direction": direction.astype(np.float32),
+        "latest_frame": int(latest_frame),
+    }
+
+
+def transform_field_point_to_image(view_transformer, field_point):
+    if view_transformer is None or field_point is None:
+        return None
+    try:
+        inverse_matrix = np.linalg.inv(view_transformer.m)
+    except np.linalg.LinAlgError:
+        return None
+    reshaped_point = np.asarray(field_point, dtype=np.float32).reshape(1, 1, 2)
+    transformed = cv2.perspectiveTransform(reshaped_point, inverse_matrix).reshape(-1, 2)
+    if transformed.size == 0:
+        return None
+    image_point = transformed[0]
+    if not np.all(np.isfinite(image_point)):
+        return None
+    return image_point.astype(np.float32)
+
+
+def transform_image_point_to_field(view_transformer, image_point):
+    if view_transformer is None or image_point is None:
+        return None
+    transformed = view_transformer.transform_points(
+        np.asarray(image_point, dtype=np.float32).reshape(1, 2)
+    )
+    if transformed.size == 0:
+        return None
+    field_point = transformed[0]
+    if not np.all(np.isfinite(field_point)):
+        return None
+    return field_point.astype(np.float32)
+
+
+def clamp_center_to_frame(center, width, height):
+    if center is None:
+        return None
+    return np.array(
+        [
+            float(clamp(center[0], 0.0, max(0.0, float(width) - 1.0))),
+            float(clamp(center[1], 0.0, max(0.0, float(height) - 1.0))),
+        ],
+        dtype=np.float32,
+    )
+
+
+def build_square_roi_from_center(center, roi_size_px, width, height):
+    if center is None:
+        return None
+    if roi_size_px <= 1:
+        return None
+
+    half = float(roi_size_px) * 0.5
+    x1 = int(math.floor(center[0] - half))
+    y1 = int(math.floor(center[1] - half))
+    x2 = int(math.ceil(center[0] + half))
+    y2 = int(math.ceil(center[1] + half))
+
+    x1 = max(0, min(x1, max(0, width - 1)))
+    y1 = max(0, min(y1, max(0, height - 1)))
+    x2 = max(x1 + 1, min(x2, width))
+    y2 = max(y1 + 1, min(y2, height))
+
+    if x2 - x1 <= 1 or y2 - y1 <= 1:
+        return None
+    return (x1, y1, x2, y2)
+
+
+def translate_detections_to_full_frame(detections, offset_x, offset_y):
+    if detections is None or len(detections) == 0:
+        return detections if detections is not None else empty_detections()
+    shifted = detections.xyxy.copy()
+    shifted[:, [0, 2]] += float(offset_x)
+    shifted[:, [1, 3]] += float(offset_y)
+    return sv.Detections(
+        xyxy=shifted,
+        mask=detections.mask,
+        confidence=detections.confidence,
+        class_id=detections.class_id,
+        tracker_id=detections.tracker_id,
+        data=detections.data,
+    )
+
+
 def ball_roi_radius(last_detection):
     if not last_detection:
         return BALL_ROI_MIN_RADIUS_PX
@@ -1012,7 +1170,12 @@ def ball_roi_radius(last_detection):
     return max(BALL_ROI_MIN_RADIUS_PX, max(width, height) * BALL_ROI_SCALE_FROM_BOX)
 
 
-def pick_detection_with_confidence_fusion(detections, predicted_center):
+def pick_detection_with_confidence_fusion(
+    detections,
+    predicted_center,
+    near_min_confidence=BALL_CONFIDENCE_NEAR_MIN,
+    far_min_confidence=BALL_CONFIDENCE_FAR_MIN,
+):
     if not detections:
         return None
     if predicted_center is None:
@@ -1023,9 +1186,9 @@ def pick_detection_with_confidence_fusion(detections, predicted_center):
         center = detection_center_np(detection["box"])
         distance = float(np.linalg.norm(center - predicted_center))
         confidence_threshold = (
-            BALL_CONFIDENCE_NEAR_MIN
+            near_min_confidence
             if distance <= BALL_PREDICTION_NEAR_DISTANCE_PX
-            else BALL_CONFIDENCE_FAR_MIN
+            else far_min_confidence
         )
         if detection["confidence"] < confidence_threshold:
             continue
@@ -1489,6 +1652,23 @@ def build_performance_profile_report(
     average_prediction_error = (
         prediction_error_sum / prediction_error_count if prediction_error_count > 0 else 0.0
     )
+    prediction_error_pixels_sum = float(ball_tracking_metrics["prediction_error_pixels_sum"])
+    prediction_error_pixels_count = int(ball_tracking_metrics["prediction_error_pixels_count"])
+    average_prediction_error_pixels = (
+        prediction_error_pixels_sum / prediction_error_pixels_count
+        if prediction_error_pixels_count > 0
+        else 0.0
+    )
+    prediction_error_field_sum = float(ball_tracking_metrics["prediction_error_field_sum"])
+    prediction_error_field_count = int(ball_tracking_metrics["prediction_error_field_count"])
+    average_prediction_error_field = (
+        prediction_error_field_sum / prediction_error_field_count
+        if prediction_error_field_count > 0
+        else 0.0
+    )
+    roi_size_sum = float(ball_tracking_metrics["roi_size_sum"])
+    roi_size_count = int(ball_tracking_metrics["roi_size_count"])
+    roi_average_size = roi_size_sum / roi_size_count if roi_size_count > 0 else 0.0
     interruptions_before = int(ball_tracking_metrics["ball_track_interruptions_before"])
     interruptions_after = int(ball_tracking_metrics["ball_track_interruptions_after"])
     continuity_gain_percent = (
@@ -1533,6 +1713,20 @@ def build_performance_profile_report(
             "ball_roi_success": int(ball_tracking_metrics["ball_roi_success"]),
             "ball_prediction_error": average_prediction_error,
             "ball_prediction_error_samples": prediction_error_count,
+            "ball_prediction_hits": int(ball_tracking_metrics["ball_prediction_hits"]),
+            "ball_prediction_misses": int(ball_tracking_metrics["ball_prediction_misses"]),
+            "roi_search_success": int(ball_tracking_metrics["roi_search_success"]),
+            "roi_search_fail": int(ball_tracking_metrics["roi_search_fail"]),
+            "average_prediction_error_pixels": average_prediction_error_pixels,
+            "average_prediction_error_field": average_prediction_error_field,
+            "roi_average_size": roi_average_size,
+            "roi_expansions": int(ball_tracking_metrics["roi_expansions"]),
+            "global_fallbacks": int(ball_tracking_metrics["global_fallbacks"]),
+            "largest_gap_before_prediction": int(
+                ball_tracking_metrics["largest_gap_before_prediction"]
+            ),
+            "largest_gap_after_prediction": int(ball_tracking_metrics["largest_gap_after_prediction"]),
+            "prediction_mode_selected": str(ball_tracking_metrics["prediction_mode_selected"]),
             "ball_track_interruptions_before": interruptions_before,
             "ball_track_interruptions_after": interruptions_after,
             "ball_track_continuity_gain_percent": continuity_gain_percent,
@@ -1660,6 +1854,10 @@ def analyze(args):
     ball_detector, ball_detector_backend, ball_detector_model_path = build_ball_detector(
         args=args,
         confidence_threshold=ball_detector_confidence_for_run,
+    )
+    predictive_ball_tracking_enabled = (
+        str(args.predictive_ball_tracking).strip().lower() == "on"
+        and ball_detector_backend == "rfdetr"
     )
     ball_tracker = BallTracker(buffer_size=BALL_TRACKER_BUFFER_SIZE)
     team_classifier = TeamClassifier(device="cpu")
@@ -1833,10 +2031,15 @@ def analyze(args):
     total_pitch_keypoints_detected = 0
     homography_examples = []
     ball_position_history = deque(maxlen=BALL_TRAJECTORY_HISTORY_SIZE)
+    ball_field_position_history = deque(maxlen=BALL_TRAJECTORY_HISTORY_SIZE)
+    ball_motion_history = deque(maxlen=PREDICTIVE_HISTORY_SIZE)
     ball_last_valid_detection = None
     ball_frames_without_detection = 0
+    ball_prediction_mode_selected = "pixel"
     ball_previous_raw_present = False
     ball_previous_final_present = False
+    ball_current_raw_gap = 0
+    ball_current_final_gap = 0
     ball_tracking_metrics = {
         "ball_memory_hits": 0,
         "ball_memory_misses": 0,
@@ -1844,6 +2047,23 @@ def analyze(args):
         "ball_roi_success": 0,
         "ball_prediction_error_sum": 0.0,
         "ball_prediction_error_count": 0,
+        "prediction_error_pixels_sum": 0.0,
+        "prediction_error_pixels_count": 0,
+        "prediction_error_field_sum": 0.0,
+        "prediction_error_field_count": 0,
+        "prediction_error_field_to_pixel_sum": 0.0,
+        "prediction_error_field_to_pixel_count": 0,
+        "ball_prediction_hits": 0,
+        "ball_prediction_misses": 0,
+        "roi_search_success": 0,
+        "roi_search_fail": 0,
+        "roi_size_sum": 0.0,
+        "roi_size_count": 0,
+        "roi_expansions": 0,
+        "global_fallbacks": 0,
+        "largest_gap_before_prediction": 0,
+        "largest_gap_after_prediction": 0,
+        "prediction_mode_selected": ball_prediction_mode_selected,
         "ball_track_interruptions_before": 0,
         "ball_track_interruptions_after": 0,
     }
@@ -1896,6 +2116,7 @@ def analyze(args):
         if not ok:
             break
         frame_start_time = time.perf_counter()
+        current_frame_number = frames_processed + 1
 
         field_mask, field_contours, field_detected = detect_field_region(frame, previous_field_mask)
         previous_field_mask = field_mask
@@ -1950,8 +2171,91 @@ def analyze(args):
             time.perf_counter() - homography_stage_start,
         )
 
+        pixel_motion_state = predict_motion_state_from_history(ball_position_history, current_frame_number)
+        predicted_pixel_center = (
+            clamp_center_to_frame(pixel_motion_state["predicted"], width, height)
+            if pixel_motion_state is not None
+            else None
+        )
+        field_motion_state = predict_motion_state_from_history(
+            ball_field_position_history,
+            current_frame_number,
+        )
+        predicted_field_center = (
+            field_motion_state["predicted"] if field_motion_state is not None else None
+        )
+        predicted_field_center_in_pixels = clamp_center_to_frame(
+            transform_field_point_to_image(view_transformer, predicted_field_center),
+            width,
+            height,
+        )
+
+        pixel_error_average = (
+            float(ball_tracking_metrics["prediction_error_pixels_sum"])
+            / float(ball_tracking_metrics["prediction_error_pixels_count"])
+            if int(ball_tracking_metrics["prediction_error_pixels_count"]) > 0
+            else float("inf")
+        )
+        pixel_error_count = int(ball_tracking_metrics["prediction_error_pixels_count"])
+        field_to_pixel_error_average = (
+            float(ball_tracking_metrics["prediction_error_field_to_pixel_sum"])
+            / float(ball_tracking_metrics["prediction_error_field_to_pixel_count"])
+            if int(ball_tracking_metrics["prediction_error_field_to_pixel_count"]) > 0
+            else float("inf")
+        )
+        field_to_pixel_error_count = int(ball_tracking_metrics["prediction_error_field_to_pixel_count"])
+        use_field_prediction = (
+            predicted_field_center_in_pixels is not None
+            and (
+                (
+                    field_to_pixel_error_count >= 12
+                    and pixel_error_count >= 12
+                    and field_to_pixel_error_average < pixel_error_average
+                )
+                or (
+                    predicted_pixel_center is None
+                    and field_to_pixel_error_count >= 3
+                )
+            )
+        )
+        if use_field_prediction:
+            predicted_ball_center = predicted_field_center_in_pixels
+            ball_prediction_mode_selected = "field"
+        else:
+            predicted_ball_center = predicted_pixel_center
+            ball_prediction_mode_selected = "pixel"
+        ball_tracking_metrics["prediction_mode_selected"] = ball_prediction_mode_selected
+
+        ball_detector_roi_xyxy = None
+        predictive_roi_size_used = None
+        predictive_roi_stage = min(
+            max(0, int(ball_frames_without_detection)),
+            PREDICTIVE_GLOBAL_FALLBACK_AFTER_MISSES,
+        )
+        if predictive_ball_tracking_enabled and predicted_ball_center is not None:
+            if predictive_roi_stage >= PREDICTIVE_GLOBAL_FALLBACK_AFTER_MISSES:
+                ball_tracking_metrics["global_fallbacks"] += 1
+            else:
+                predictive_roi_size_used = float(
+                    PREDICTIVE_ROI_SIZE_SEQUENCE[
+                        min(predictive_roi_stage, len(PREDICTIVE_ROI_SIZE_SEQUENCE) - 1)
+                    ]
+                )
+                ball_detector_roi_xyxy = build_square_roi_from_center(
+                    predicted_ball_center,
+                    predictive_roi_size_used,
+                    width,
+                    height,
+                )
+                if ball_detector_roi_xyxy is not None:
+                    ball_tracking_metrics["ball_roi_searches"] += 1
+                    ball_tracking_metrics["roi_size_sum"] += predictive_roi_size_used
+                    ball_tracking_metrics["roi_size_count"] += 1
+                    if predictive_roi_stage > 0:
+                        ball_tracking_metrics["roi_expansions"] += 1
+
         ball_detection_stage_start = time.perf_counter()
-        ball_detector_raw_detections = ball_detector.detect(frame)
+        ball_detector_raw_detections = ball_detector.detect(frame, roi_xyxy=ball_detector_roi_xyxy)
         ball_detector_raw_dicts = ball_detections_to_dicts(
             ball_detector_raw_detections,
             source_name=ball_detector.source_name,
@@ -1981,7 +2285,6 @@ def analyze(args):
         tracker_ids = tracked_human_detections.tracker_id
         if tracker_ids is None:
             tracker_ids = np.full(len(tracked_human_detections), -1, dtype=np.int32)
-        current_frame_number = frames_processed + 1
         current_frame_track_ids = set()
         for tracker_id_value in tracker_ids:
             tracker_id_int = int(tracker_id_value)
@@ -2054,24 +2357,51 @@ def analyze(args):
             source_name=ball_detector.source_name,
         )
         raw_ball_present = bool(tracker_ball_detections)
+        if raw_ball_present:
+            ball_current_raw_gap = 0
+        else:
+            ball_current_raw_gap += 1
+            ball_tracking_metrics["largest_gap_before_prediction"] = max(
+                int(ball_tracking_metrics["largest_gap_before_prediction"]),
+                ball_current_raw_gap,
+            )
         if ball_previous_raw_present and not raw_ball_present:
             ball_tracking_metrics["ball_track_interruptions_before"] += 1
 
-        predicted_ball_center = predict_ball_center(ball_position_history, current_frame_number)
-        if predicted_ball_center is not None:
-            predicted_ball_center[0] = float(clamp(predicted_ball_center[0], 0.0, width - 1.0))
-            predicted_ball_center[1] = float(clamp(predicted_ball_center[1], 0.0, height - 1.0))
-
-        roi_radius_pixels = ball_roi_radius(ball_last_valid_detection)
-        selected_ball_detection, roi_attempted, roi_success = select_ball_detection_with_roi(
-            tracker_ball_detections,
-            predicted_ball_center,
-            roi_radius_pixels,
+        roi_radius_pixels = (
+            max(BALL_ROI_MIN_RADIUS_PX, predictive_roi_size_used * 0.5)
+            if predictive_roi_size_used is not None
+            else ball_roi_radius(ball_last_valid_detection)
         )
+        if predictive_ball_tracking_enabled:
+            selected_ball_detection = pick_detection_with_confidence_fusion(
+                tracker_ball_detections,
+                predicted_ball_center,
+                near_min_confidence=PREDICTIVE_BALL_CONFIDENCE_NEAR_MIN,
+            )
+            roi_attempted = ball_detector_roi_xyxy is not None
+            roi_success = roi_attempted and selected_ball_detection is not None
+        else:
+            selected_ball_detection, roi_attempted, roi_success = select_ball_detection_with_roi(
+                tracker_ball_detections,
+                predicted_ball_center,
+                roi_radius_pixels,
+            )
+
         if roi_attempted:
-            ball_tracking_metrics["ball_roi_searches"] += 1
+            if not predictive_ball_tracking_enabled:
+                ball_tracking_metrics["ball_roi_searches"] += 1
             if roi_success:
                 ball_tracking_metrics["ball_roi_success"] += 1
+                ball_tracking_metrics["roi_search_success"] += 1
+            else:
+                ball_tracking_metrics["roi_search_fail"] += 1
+
+        if predicted_ball_center is not None:
+            if selected_ball_detection is not None:
+                ball_tracking_metrics["ball_prediction_hits"] += 1
+            else:
+                ball_tracking_metrics["ball_prediction_misses"] += 1
 
         if selected_ball_detection is not None:
             ball_detections = [selected_ball_detection]
@@ -2079,10 +2409,57 @@ def analyze(args):
             ball_last_valid_detection = selected_ball_detection
             selected_center = detection_center_np(selected_ball_detection["box"])
             ball_position_history.append((current_frame_number, selected_center))
+            selected_field_center = transform_image_point_to_field(view_transformer, selected_center)
+            if selected_field_center is not None:
+                ball_field_position_history.append((current_frame_number, selected_field_center))
+
+            chosen_motion_state = (
+                field_motion_state
+                if ball_prediction_mode_selected == "field" and field_motion_state is not None
+                else pixel_motion_state
+            )
+            velocity = (
+                chosen_motion_state["velocity"]
+                if chosen_motion_state is not None
+                else np.zeros(2, dtype=np.float32)
+            )
+            direction = (
+                chosen_motion_state["direction"]
+                if chosen_motion_state is not None
+                else np.zeros(2, dtype=np.float32)
+            )
+            ball_motion_history.append(
+                {
+                    "frame": int(current_frame_number),
+                    "position_x": float(selected_center[0]),
+                    "position_y": float(selected_center[1]),
+                    "vx": float(velocity[0]),
+                    "vy": float(velocity[1]),
+                    "direction_x": float(direction[0]),
+                    "direction_y": float(direction[1]),
+                    "mode": ball_prediction_mode_selected,
+                }
+            )
+
             if predicted_ball_center is not None:
                 prediction_error = float(np.linalg.norm(selected_center - predicted_ball_center))
                 ball_tracking_metrics["ball_prediction_error_sum"] += prediction_error
                 ball_tracking_metrics["ball_prediction_error_count"] += 1
+                ball_tracking_metrics["prediction_error_pixels_sum"] += prediction_error
+                ball_tracking_metrics["prediction_error_pixels_count"] += 1
+            if (
+                predicted_field_center is not None
+                and selected_field_center is not None
+            ):
+                field_error = float(np.linalg.norm(selected_field_center - predicted_field_center))
+                ball_tracking_metrics["prediction_error_field_sum"] += field_error
+                ball_tracking_metrics["prediction_error_field_count"] += 1
+            if predicted_field_center_in_pixels is not None:
+                field_to_pixel_error = float(
+                    np.linalg.norm(selected_center - predicted_field_center_in_pixels)
+                )
+                ball_tracking_metrics["prediction_error_field_to_pixel_sum"] += field_to_pixel_error
+                ball_tracking_metrics["prediction_error_field_to_pixel_count"] += 1
         else:
             ball_detections = []
             ball_frames_without_detection += 1
@@ -2097,7 +2474,17 @@ def analyze(args):
             if ball_frames_without_detection > BALL_MEMORY_MAX_MISSING_FRAMES:
                 ball_last_valid_detection = None
                 ball_position_history.clear()
+                ball_field_position_history.clear()
+                ball_motion_history.clear()
         visual_ball_present = bool(ball_detections)
+        if visual_ball_present:
+            ball_current_final_gap = 0
+        else:
+            ball_current_final_gap += 1
+            ball_tracking_metrics["largest_gap_after_prediction"] = max(
+                int(ball_tracking_metrics["largest_gap_after_prediction"]),
+                ball_current_final_gap,
+            )
         internal_ball_track_alive = visual_ball_present or (
             ball_last_valid_detection is not None
             and ball_frames_without_detection <= BALL_MEMORY_MAX_MISSING_FRAMES
@@ -2803,6 +3190,12 @@ def parse_args():
         "--rfdetr-device",
         default="auto",
         help='RF-DETR runtime device: "auto", "cpu" or "cuda"',
+    )
+    parser.add_argument(
+        "--predictive-ball-tracking",
+        choices=["on", "off"],
+        default=PREDICTIVE_BALL_TRACKING_DEFAULT,
+        help="Enable predictive ball tracking with adaptive ROI search for RF-DETR",
     )
     parser.add_argument("--imgsz", type=int, default=1280, help="YOLO inference image size")
     parser.add_argument("--conf", type=float, default=0.25, help="YOLO confidence threshold")
