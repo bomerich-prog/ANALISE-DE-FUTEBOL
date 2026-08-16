@@ -58,6 +58,8 @@ PREDICTIVE_BALL_CONFIDENCE_FAR_MIN = 0.20
 HYBRID_BALL_CONFIDENCE_NEAR_MIN = 0.05
 HYBRID_BALL_CONFIDENCE_FAR_MIN = 0.1
 FIELD_PREDICTION_MAX_DELTA_PX = 180.0
+HYBRID_CONFIDENCE_BONUS_DISTANCE_PX = 40.0
+HYBRID_CONFIDENCE_BONUS_DELTA = 0.03
 BALL_DETECTOR_DEFAULT_CONFIDENCE = 0.25
 BALL_DIAGNOSTIC_MIN_CONFIDENCE = 0.05
 PREDICTIVE_BALL_TRACKING_DEFAULT = os.getenv("PREDICTIVE_BALL_TRACKING", "on").strip().lower()
@@ -74,9 +76,10 @@ TILE_OVERLAP = 0.25
 INITIAL_DETECTIONS_REQUIRED = 3
 CROP_INITIAL_SIZE = 250
 CROP_MAX_SIZE = 1400
-MAX_FRAMES_BEFORE_GLOBAL_SEARCH = 7
+MAX_FRAMES_BEFORE_GLOBAL_SEARCH = 3
 SEMI_GLOBAL_WINDOW_SIZE = 1200
-CROP_EXPANSION_LEVELS_DEFAULT = [250, 350, 500, 700, 900, 1100, 1400]
+CROP_EXPANSION_LEVELS_DEFAULT = [250, 500, 900, 1400]
+SEMI_GLOBAL_RECOVERY_COOLDOWN_FRAMES = 10
 BALL_DETECTOR_BACKEND_DEFAULT = os.getenv("BALL_DETECTOR_BACKEND", "yolo").strip().lower()
 BALL_DETECTOR_BACKENDS = {"yolo", "rfdetr"}
 if BALL_DETECTOR_BACKEND_DEFAULT not in BALL_DETECTOR_BACKENDS:
@@ -1301,6 +1304,8 @@ def pick_detection_with_confidence_fusion(
     predicted_center,
     near_min_confidence=BALL_CONFIDENCE_NEAR_MIN,
     far_min_confidence=BALL_CONFIDENCE_FAR_MIN,
+    proximity_bonus_distance_px=None,
+    proximity_bonus_delta=0.0,
 ):
     if not detections:
         return None
@@ -1311,8 +1316,15 @@ def pick_detection_with_confidence_fusion(
     for detection in detections:
         center = detection_center_np(detection["box"])
         distance = float(np.linalg.norm(center - predicted_center))
+        near_threshold = float(near_min_confidence)
+        if (
+            proximity_bonus_distance_px is not None
+            and distance <= float(proximity_bonus_distance_px)
+            and proximity_bonus_delta > 0.0
+        ):
+            near_threshold = max(0.0, near_threshold - float(proximity_bonus_delta))
         confidence_threshold = (
-            near_min_confidence
+            near_threshold
             if distance <= BALL_PREDICTION_NEAR_DISTANCE_PX
             else far_min_confidence
         )
@@ -2245,6 +2257,7 @@ def analyze(args):
     ball_motion_history = deque(maxlen=PREDICTIVE_HISTORY_SIZE)
     ball_search_mode = "global_search" if hybrid_ball_search_enabled else "standard"
     ball_consecutive_detections_for_crop = 0
+    semi_global_recovery_cooldown_remaining = 0
     ball_last_valid_detection = None
     ball_frames_without_detection = 0
     ball_prediction_mode_selected = "pixel"
@@ -2459,10 +2472,7 @@ def analyze(args):
         search_mode_for_frame = "standard"
         detection_source_mode = "standard"
         semi_global_window_xyxy = None
-        crop_expansion_threshold = max(
-            int(configured_max_frames_before_global_search),
-            len(adaptive_crop_schedule),
-        )
+        crop_expansion_threshold = int(configured_max_frames_before_global_search)
         if hybrid_ball_search_enabled:
             if (
                 ball_search_mode == "smart_crop"
@@ -2478,6 +2488,21 @@ def analyze(args):
                     adaptive_crop_schedule,
                     ball_frames_without_detection,
                 )
+                if semi_global_recovery_cooldown_remaining > 0:
+                    cooldown_progress = (
+                        float(SEMI_GLOBAL_RECOVERY_COOLDOWN_FRAMES - semi_global_recovery_cooldown_remaining)
+                        / float(max(1, SEMI_GLOBAL_RECOVERY_COOLDOWN_FRAMES - 1))
+                    )
+                    cooldown_start = float(max(adaptive_crop_schedule))
+                    cooldown_end = float(min(adaptive_crop_schedule))
+                    cooldown_size = cooldown_start + (
+                        (cooldown_end - cooldown_start) * cooldown_progress
+                    )
+                    predictive_roi_size_used = max(
+                        float(predictive_roi_size_used),
+                        float(max(cooldown_end, cooldown_size)),
+                    )
+                    semi_global_recovery_cooldown_remaining -= 1
                 crop_center = predicted_center_for_search
                 if crop_center is None and ball_last_valid_detection is not None:
                     crop_center = detection_center_np(ball_last_valid_detection["box"])
@@ -2732,6 +2757,8 @@ def analyze(args):
                     predicted_center_for_search,
                     near_min_confidence=HYBRID_BALL_CONFIDENCE_NEAR_MIN,
                     far_min_confidence=HYBRID_BALL_CONFIDENCE_FAR_MIN,
+                    proximity_bonus_distance_px=HYBRID_CONFIDENCE_BONUS_DISTANCE_PX,
+                    proximity_bonus_delta=HYBRID_CONFIDENCE_BONUS_DELTA,
                 )
                 roi_attempted = search_mode_for_frame == "crop"
                 roi_success = roi_attempted and selected_ball_detection is not None
@@ -2776,6 +2803,9 @@ def analyze(args):
                     ball_consecutive_detections_for_crop += 1
                     if detection_source_mode == "semi_global":
                         ball_tracking_metrics["semi_global_success"] += 1
+                        semi_global_recovery_cooldown_remaining = (
+                            SEMI_GLOBAL_RECOVERY_COOLDOWN_FRAMES
+                        )
                     if detection_source_mode == "full_global":
                         ball_tracking_metrics["global_search_success"] += 1
                     if previous_missing_frames > 0:
