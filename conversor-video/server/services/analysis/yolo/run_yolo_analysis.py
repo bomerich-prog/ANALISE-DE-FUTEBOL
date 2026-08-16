@@ -56,7 +56,8 @@ BALL_CONFIDENCE_FAR_MIN = 0.35
 PREDICTIVE_BALL_CONFIDENCE_NEAR_MIN = 0.08
 PREDICTIVE_BALL_CONFIDENCE_FAR_MIN = 0.20
 HYBRID_BALL_CONFIDENCE_NEAR_MIN = 0.05
-HYBRID_BALL_CONFIDENCE_FAR_MIN = 0.12
+HYBRID_BALL_CONFIDENCE_FAR_MIN = 0.1
+FIELD_PREDICTION_MAX_DELTA_PX = 180.0
 BALL_DETECTOR_DEFAULT_CONFIDENCE = 0.25
 BALL_DIAGNOSTIC_MIN_CONFIDENCE = 0.05
 PREDICTIVE_BALL_TRACKING_DEFAULT = os.getenv("PREDICTIVE_BALL_TRACKING", "on").strip().lower()
@@ -71,9 +72,11 @@ PREDICTIVE_HISTORY_SIZE = 10
 TILE_SIZE = 640
 TILE_OVERLAP = 0.25
 INITIAL_DETECTIONS_REQUIRED = 3
-CROP_INITIAL_SIZE = 256
-CROP_MAX_SIZE = 800
-MAX_FRAMES_BEFORE_GLOBAL_SEARCH = 5
+CROP_INITIAL_SIZE = 250
+CROP_MAX_SIZE = 1400
+MAX_FRAMES_BEFORE_GLOBAL_SEARCH = 7
+SEMI_GLOBAL_WINDOW_SIZE = 1200
+CROP_EXPANSION_LEVELS_DEFAULT = [250, 350, 500, 700, 900, 1100, 1400]
 BALL_DETECTOR_BACKEND_DEFAULT = os.getenv("BALL_DETECTOR_BACKEND", "yolo").strip().lower()
 BALL_DETECTOR_BACKENDS = {"yolo", "rfdetr"}
 if BALL_DETECTOR_BACKEND_DEFAULT not in BALL_DETECTOR_BACKENDS:
@@ -1229,22 +1232,51 @@ def build_tile_ranges(frame_width, frame_height, tile_size, tile_overlap):
     return tiles
 
 
-def detect_ball_with_global_tiling(frame, ball_detector, tile_size, tile_overlap):
+def detect_ball_with_global_tiling(frame, ball_detector, tile_size, tile_overlap, region_xyxy=None):
     height, width = frame.shape[:2]
-    tiles = build_tile_ranges(width, height, tile_size, tile_overlap)
+    if region_xyxy is None:
+        region_x1, region_y1, region_x2, region_y2 = 0, 0, width, height
+    else:
+        region_x1, region_y1, region_x2, region_y2 = [int(value) for value in region_xyxy]
+        region_x1 = max(0, min(region_x1, max(0, width - 1)))
+        region_y1 = max(0, min(region_y1, max(0, height - 1)))
+        region_x2 = max(region_x1 + 1, min(region_x2, width))
+        region_y2 = max(region_y1 + 1, min(region_y2, height))
+
+    region_width = region_x2 - region_x1
+    region_height = region_y2 - region_y1
+    tiles = build_tile_ranges(region_width, region_height, tile_size, tile_overlap)
     tile_detections = []
-    for tile_xyxy in tiles:
-        tile_detections.append(ball_detector.detect(frame, roi_xyxy=tile_xyxy))
+    for local_tile_xyxy in tiles:
+        tile_x1, tile_y1, tile_x2, tile_y2 = local_tile_xyxy
+        global_tile_xyxy = (
+            int(region_x1 + tile_x1),
+            int(region_y1 + tile_y1),
+            int(region_x1 + tile_x2),
+            int(region_y1 + tile_y2),
+        )
+        tile_detections.append(ball_detector.detect(frame, roi_xyxy=global_tile_xyxy))
     return merge_detection_batches(tile_detections)
 
 
 def build_adaptive_crop_schedule(initial_size, max_size):
-    base = float(max(64, initial_size))
-    cap = float(max(base, max_size))
-    growth_factors = [1.0, 1.25, 1.5625, 2.0, 2.5, 3.125]
-    schedule = [min(cap, base * factor) for factor in growth_factors]
-    if schedule[-1] < cap:
-        schedule.append(cap)
+    normalized_initial = float(max(64, int(initial_size)))
+    normalized_max = float(max(normalized_initial, int(max_size)))
+    schedule = []
+    for level in CROP_EXPANSION_LEVELS_DEFAULT:
+        level_size = float(level)
+        if level_size < normalized_initial:
+            continue
+        bounded_size = min(normalized_max, level_size)
+        if not schedule or bounded_size > schedule[-1]:
+            schedule.append(bounded_size)
+
+    if not schedule:
+        schedule = [normalized_initial]
+    if schedule[0] > normalized_initial:
+        schedule.insert(0, normalized_initial)
+    if schedule[-1] < normalized_max:
+        schedule.append(normalized_max)
     return schedule
 
 
@@ -1771,9 +1803,15 @@ def build_performance_profile_report(
         else 0.0
     )
     frames_using_global_tiling = int(ball_tracking_metrics["frames_using_global_tiling"])
+    frames_using_full_global_search = int(ball_tracking_metrics["frames_using_full_global_search"])
+    semi_global_searches = int(ball_tracking_metrics["semi_global_searches"])
+    semi_global_success = int(ball_tracking_metrics["semi_global_success"])
+    global_searches = int(ball_tracking_metrics["global_searches"])
+    global_search_success = int(ball_tracking_metrics["global_search_success"])
     frames_using_crop = int(ball_tracking_metrics["frames_using_crop"])
     number_of_global_searches = int(ball_tracking_metrics["number_of_global_searches"])
     number_of_crop_searches = int(ball_tracking_metrics["number_of_crop_searches"])
+    crop_expansion_levels_used = dict(ball_tracking_metrics["crop_expansion_levels_used"])
     average_crop_size = (
         float(ball_tracking_metrics["average_crop_size_sum"])
         / float(ball_tracking_metrics["average_crop_size_count"])
@@ -1785,7 +1823,17 @@ def build_performance_profile_report(
     time_spent_crop_search = float(ball_tracking_metrics["time_spent_crop_search"])
     recoveries_after_global_search = int(ball_tracking_metrics["recoveries_after_global_search"])
     recoveries_after_crop = int(ball_tracking_metrics["recoveries_after_crop"])
+    semi_global_success_rate = (
+        (semi_global_success / semi_global_searches) * 100.0
+        if semi_global_searches > 0
+        else 0.0
+    )
     global_search_success_rate = (
+        (global_search_success / global_searches) * 100.0
+        if global_searches > 0
+        else 0.0
+    )
+    global_recovery_success_rate = (
         (recoveries_after_global_search / number_of_global_searches) * 100.0
         if number_of_global_searches > 0
         else 0.0
@@ -1793,6 +1841,11 @@ def build_performance_profile_report(
     crop_search_success_rate = (
         (recoveries_after_crop / number_of_crop_searches) * 100.0
         if number_of_crop_searches > 0
+        else 0.0
+    )
+    percentage_of_frames_using_full_global_search = (
+        (frames_using_full_global_search / frames_processed) * 100.0
+        if frames_processed > 0
         else 0.0
     )
 
@@ -1847,8 +1900,18 @@ def build_performance_profile_report(
             "largest_gap_after_prediction": int(ball_tracking_metrics["largest_gap_after_prediction"]),
             "prediction_mode_selected": str(ball_tracking_metrics["prediction_mode_selected"]),
             "frames_using_global_tiling": frames_using_global_tiling,
+            "frames_using_full_global_search": frames_using_full_global_search,
+            "semi_global_searches": semi_global_searches,
+            "semi_global_success": semi_global_success,
+            "semi_global_success_rate": semi_global_success_rate,
+            "crop_expansion_levels_used": crop_expansion_levels_used,
             "frames_using_crop": frames_using_crop,
             "number_of_global_searches": number_of_global_searches,
+            "global_searches": global_searches,
+            "global_search_success": global_search_success,
+            "percentage_of_frames_using_full_global_search": (
+                percentage_of_frames_using_full_global_search
+            ),
             "number_of_crop_searches": number_of_crop_searches,
             "average_crop_size": average_crop_size,
             "largest_crop_size": largest_crop_size,
@@ -1857,6 +1920,7 @@ def build_performance_profile_report(
             "recoveries_after_global_search": recoveries_after_global_search,
             "recoveries_after_crop": recoveries_after_crop,
             "global_search_success_rate": global_search_success_rate,
+            "global_recovery_success_rate": global_recovery_success_rate,
             "crop_success_rate": crop_search_success_rate,
             "ball_track_interruptions_before": interruptions_before,
             "ball_track_interruptions_after": interruptions_after,
@@ -2179,7 +2243,7 @@ def analyze(args):
     ball_position_history = deque(maxlen=BALL_TRAJECTORY_HISTORY_SIZE)
     ball_field_position_history = deque(maxlen=BALL_TRAJECTORY_HISTORY_SIZE)
     ball_motion_history = deque(maxlen=PREDICTIVE_HISTORY_SIZE)
-    ball_search_mode = "global_tiling" if hybrid_ball_search_enabled else "standard"
+    ball_search_mode = "global_search" if hybrid_ball_search_enabled else "standard"
     ball_consecutive_detections_for_crop = 0
     ball_last_valid_detection = None
     ball_frames_without_detection = 0
@@ -2213,9 +2277,15 @@ def analyze(args):
         "largest_gap_after_prediction": 0,
         "prediction_mode_selected": ball_prediction_mode_selected,
         "frames_using_global_tiling": 0,
+        "frames_using_full_global_search": 0,
+        "semi_global_searches": 0,
+        "semi_global_success": 0,
         "frames_using_crop": 0,
         "number_of_global_searches": 0,
+        "global_searches": 0,
+        "global_search_success": 0,
         "number_of_crop_searches": 0,
+        "crop_expansion_levels_used": {},
         "average_crop_size_sum": 0.0,
         "average_crop_size_count": 0,
         "largest_crop_size": 0.0,
@@ -2363,37 +2433,42 @@ def analyze(args):
             else float("inf")
         )
         field_to_pixel_error_count = int(ball_tracking_metrics["prediction_error_field_to_pixel_count"])
-        use_field_prediction = (
-            predicted_field_center_in_pixels is not None
-            and (
-                (
-                    field_to_pixel_error_count >= 40
-                    and pixel_error_count >= 40
-                    and field_to_pixel_error_average < (pixel_error_average * 0.9)
-                )
-                or (
-                    predicted_pixel_center is None
-                    and field_to_pixel_error_count >= 3
-                )
-            )
-        )
-        if use_field_prediction:
-            predicted_ball_center = predicted_field_center_in_pixels
-            ball_prediction_mode_selected = "field"
-        else:
-            predicted_ball_center = predicted_pixel_center
-            ball_prediction_mode_selected = "pixel"
+        # Keep motion prediction stability in pixel space for tracker decisions.
+        # Field-space velocity is still leveraged to place the search crop when available.
+        use_field_prediction = False
+        predicted_ball_center = predicted_pixel_center
+        ball_prediction_mode_selected = "pixel"
         ball_tracking_metrics["prediction_mode_selected"] = ball_prediction_mode_selected
+        predicted_center_for_search = predicted_ball_center
+        if (
+            view_transformer is not None
+            and predicted_field_center_in_pixels is not None
+            and len(ball_field_position_history) >= 2
+        ):
+            if predicted_pixel_center is None:
+                predicted_center_for_search = predicted_field_center_in_pixels
+            else:
+                prediction_delta = float(
+                    np.linalg.norm(predicted_field_center_in_pixels - predicted_pixel_center)
+                )
+                if prediction_delta <= FIELD_PREDICTION_MAX_DELTA_PX:
+                    predicted_center_for_search = predicted_field_center_in_pixels
 
         ball_detector_roi_xyxy = None
         predictive_roi_size_used = None
         search_mode_for_frame = "standard"
+        detection_source_mode = "standard"
+        semi_global_window_xyxy = None
+        crop_expansion_threshold = max(
+            int(configured_max_frames_before_global_search),
+            len(adaptive_crop_schedule),
+        )
         if hybrid_ball_search_enabled:
             if (
                 ball_search_mode == "smart_crop"
-                and ball_frames_without_detection >= configured_max_frames_before_global_search
+                and ball_frames_without_detection >= crop_expansion_threshold
             ):
-                ball_search_mode = "global_tiling"
+                ball_search_mode = "global_search"
                 ball_consecutive_detections_for_crop = 0
                 ball_tracking_metrics["global_fallbacks"] += 1
 
@@ -2403,7 +2478,7 @@ def analyze(args):
                     adaptive_crop_schedule,
                     ball_frames_without_detection,
                 )
-                crop_center = predicted_ball_center
+                crop_center = predicted_center_for_search
                 if crop_center is None and ball_last_valid_detection is not None:
                     crop_center = detection_center_np(ball_last_valid_detection["box"])
                 ball_detector_roi_xyxy = (
@@ -2412,11 +2487,38 @@ def analyze(args):
                     else None
                 )
                 if ball_detector_roi_xyxy is None:
-                    search_mode_for_frame = "global_tiling"
-                    ball_search_mode = "global_tiling"
+                    search_mode_for_frame = "semi_global"
+                    ball_search_mode = "global_search"
                     ball_consecutive_detections_for_crop = 0
-            else:
-                search_mode_for_frame = "global_tiling"
+                elif predictive_roi_size_used is not None:
+                    crop_level_label = str(int(round(float(predictive_roi_size_used))))
+                    crop_levels = ball_tracking_metrics["crop_expansion_levels_used"]
+                    crop_levels[crop_level_label] = int(crop_levels.get(crop_level_label, 0)) + 1
+                    if ball_frames_without_detection > 0:
+                        ball_tracking_metrics["roi_expansions"] += 1
+                    ball_tracking_metrics["roi_size_sum"] += float(predictive_roi_size_used)
+                    ball_tracking_metrics["roi_size_count"] += 1
+                    ball_tracking_metrics["average_crop_size_sum"] += float(predictive_roi_size_used)
+                    ball_tracking_metrics["average_crop_size_count"] += 1
+                    ball_tracking_metrics["largest_crop_size"] = max(
+                        float(ball_tracking_metrics["largest_crop_size"]),
+                        float(predictive_roi_size_used),
+                    )
+                    ball_tracking_metrics["ball_roi_searches"] += 1
+
+            if ball_search_mode == "global_search":
+                search_mode_for_frame = "semi_global"
+                semi_global_center = predicted_center_for_search
+                if semi_global_center is None and ball_last_valid_detection is not None:
+                    semi_global_center = detection_center_np(ball_last_valid_detection["box"])
+                if semi_global_center is None:
+                    semi_global_center = np.array([width * 0.5, height * 0.5], dtype=np.float32)
+                semi_global_window_xyxy = build_square_roi_from_center(
+                    semi_global_center,
+                    SEMI_GLOBAL_WINDOW_SIZE,
+                    width,
+                    height,
+                )
         elif predictive_ball_tracking_enabled and predicted_ball_center is not None:
             predictive_roi_stage = min(
                 max(0, int(ball_frames_without_detection)),
@@ -2444,13 +2546,46 @@ def analyze(args):
                         ball_tracking_metrics["roi_expansions"] += 1
 
         ball_detection_stage_start = time.perf_counter()
-        if hybrid_ball_search_enabled and search_mode_for_frame == "global_tiling":
-            ball_detector_raw_detections = detect_ball_with_global_tiling(
+        if hybrid_ball_search_enabled and search_mode_for_frame == "semi_global":
+            ball_tracking_metrics["semi_global_searches"] += 1
+            semi_global_detections = detect_ball_with_global_tiling(
                 frame=frame,
                 ball_detector=ball_detector,
                 tile_size=configured_tile_size,
                 tile_overlap=configured_tile_overlap,
+                region_xyxy=semi_global_window_xyxy,
             )
+            semi_global_detections_nms = (
+                semi_global_detections.with_nms(threshold=0.1)
+                if len(semi_global_detections) > 0
+                else semi_global_detections
+            )
+            if len(semi_global_detections_nms) > 0:
+                ball_detector_raw_detections = semi_global_detections
+                detection_source_mode = "semi_global"
+            else:
+                ball_tracking_metrics["global_searches"] += 1
+                ball_tracking_metrics["number_of_global_searches"] += 1
+                ball_tracking_metrics["frames_using_global_tiling"] += 1
+                ball_tracking_metrics["frames_using_full_global_search"] += 1
+                full_global_start_time = time.perf_counter()
+                ball_detector_raw_detections = detect_ball_with_global_tiling(
+                    frame=frame,
+                    ball_detector=ball_detector,
+                    tile_size=configured_tile_size,
+                    tile_overlap=configured_tile_overlap,
+                )
+                ball_tracking_metrics["time_spent_global_search"] += (
+                    time.perf_counter() - full_global_start_time
+                )
+                detection_source_mode = "full_global"
+        elif hybrid_ball_search_enabled and search_mode_for_frame == "crop":
+            ball_tracking_metrics["frames_using_crop"] += 1
+            ball_tracking_metrics["number_of_crop_searches"] += 1
+            crop_start_time = time.perf_counter()
+            ball_detector_raw_detections = ball_detector.detect(frame, roi_xyxy=ball_detector_roi_xyxy)
+            ball_tracking_metrics["time_spent_crop_search"] += time.perf_counter() - crop_start_time
+            detection_source_mode = "crop"
         else:
             ball_detector_raw_detections = ball_detector.detect(frame, roi_xyxy=ball_detector_roi_xyxy)
         ball_detector_raw_dicts = ball_detections_to_dicts(
@@ -2465,22 +2600,6 @@ def analyze(args):
         )
         dedicated_ball_detections = ball_detections_after_nms
         ball_detection_elapsed = time.perf_counter() - ball_detection_stage_start
-        if hybrid_ball_search_enabled:
-            if search_mode_for_frame == "global_tiling":
-                ball_tracking_metrics["frames_using_global_tiling"] += 1
-                ball_tracking_metrics["number_of_global_searches"] += 1
-                ball_tracking_metrics["time_spent_global_search"] += ball_detection_elapsed
-            elif search_mode_for_frame == "crop":
-                ball_tracking_metrics["frames_using_crop"] += 1
-                ball_tracking_metrics["number_of_crop_searches"] += 1
-                ball_tracking_metrics["time_spent_crop_search"] += ball_detection_elapsed
-                if predictive_roi_size_used is not None:
-                    ball_tracking_metrics["average_crop_size_sum"] += float(predictive_roi_size_used)
-                    ball_tracking_metrics["average_crop_size_count"] += 1
-                    ball_tracking_metrics["largest_crop_size"] = max(
-                        float(ball_tracking_metrics["largest_crop_size"]),
-                        float(predictive_roi_size_used),
-                    )
         record_profile_stage(
             profile_state,
             "ball_detection",
@@ -2577,7 +2696,7 @@ def analyze(args):
         selection_ball_candidates = tracker_ball_detections
         if (
             hybrid_ball_search_enabled
-            and search_mode_for_frame == "global_tiling"
+            and detection_source_mode in {"semi_global", "full_global"}
             and not selection_ball_candidates
             and ball_detections_after_nms_dicts
         ):
@@ -2600,7 +2719,7 @@ def analyze(args):
             else ball_roi_radius(ball_last_valid_detection)
         )
         if hybrid_ball_search_enabled:
-            if search_mode_for_frame == "global_tiling":
+            if detection_source_mode in {"semi_global", "full_global"}:
                 selected_ball_detection = pick_detection_with_confidence_fusion(
                     selection_ball_candidates,
                     None,
@@ -2610,7 +2729,7 @@ def analyze(args):
             else:
                 selected_ball_detection = pick_detection_with_confidence_fusion(
                     selection_ball_candidates,
-                    predicted_ball_center,
+                    predicted_center_for_search,
                     near_min_confidence=HYBRID_BALL_CONFIDENCE_NEAR_MIN,
                     far_min_confidence=HYBRID_BALL_CONFIDENCE_FAR_MIN,
                 )
@@ -2641,7 +2760,7 @@ def analyze(args):
             else:
                 ball_tracking_metrics["roi_search_fail"] += 1
 
-        if predicted_ball_center is not None:
+        if predicted_center_for_search is not None:
             if selected_ball_detection is not None:
                 ball_tracking_metrics["ball_prediction_hits"] += 1
             else:
@@ -2653,8 +2772,12 @@ def analyze(args):
             ball_frames_without_detection = 0
             ball_last_valid_detection = selected_ball_detection
             if hybrid_ball_search_enabled:
-                if search_mode_for_frame == "global_tiling":
+                if detection_source_mode in {"semi_global", "full_global"}:
                     ball_consecutive_detections_for_crop += 1
+                    if detection_source_mode == "semi_global":
+                        ball_tracking_metrics["semi_global_success"] += 1
+                    if detection_source_mode == "full_global":
+                        ball_tracking_metrics["global_search_success"] += 1
                     if previous_missing_frames > 0:
                         ball_tracking_metrics["recoveries_after_global_search"] += 1
                 elif search_mode_for_frame == "crop":
@@ -2662,7 +2785,7 @@ def analyze(args):
                     if previous_missing_frames > 0:
                         ball_tracking_metrics["recoveries_after_crop"] += 1
                 if (
-                    ball_search_mode == "global_tiling"
+                    ball_search_mode == "global_search"
                     and ball_consecutive_detections_for_crop >= configured_initial_detections_required
                 ):
                     ball_search_mode = "smart_crop"
@@ -2722,7 +2845,7 @@ def analyze(args):
         else:
             ball_detections = []
             ball_frames_without_detection += 1
-            if hybrid_ball_search_enabled and ball_search_mode == "global_tiling":
+            if hybrid_ball_search_enabled and ball_search_mode == "global_search":
                 ball_consecutive_detections_for_crop = 0
             if (
                 ball_last_valid_detection is not None
@@ -2740,9 +2863,9 @@ def analyze(args):
             if (
                 hybrid_ball_search_enabled
                 and ball_search_mode == "smart_crop"
-                and ball_frames_without_detection >= configured_max_frames_before_global_search
+                and ball_frames_without_detection >= crop_expansion_threshold
             ):
-                ball_search_mode = "global_tiling"
+                ball_search_mode = "global_search"
                 ball_consecutive_detections_for_crop = 0
         visual_ball_present = bool(ball_detections)
         if visual_ball_present:
