@@ -60,6 +60,15 @@ HYBRID_BALL_CONFIDENCE_FAR_MIN = 0.1
 FIELD_PREDICTION_MAX_DELTA_PX = 180.0
 HYBRID_CONFIDENCE_BONUS_DISTANCE_PX = 40.0
 HYBRID_CONFIDENCE_BONUS_DELTA = 0.03
+PHYSICAL_BALL_VALIDATION_DEFAULT = os.getenv("PHYSICAL_BALL_VALIDATION", "on").strip().lower()
+if PHYSICAL_BALL_VALIDATION_DEFAULT not in {"on", "off"}:
+    PHYSICAL_BALL_VALIDATION_DEFAULT = "on"
+PHYSICAL_ACCEPT_DISTANCE = 120.0
+PHYSICAL_VERIFY_DISTANCE = 300.0
+PHYSICAL_MAX_DISTANCE = 300.0
+PHYSICAL_CONSECUTIVE_CONFIRMATIONS = 2
+PHYSICAL_RESET_AFTER_MISSING = 10
+PHYSICAL_HIGH_SPEED_THRESHOLD = 120.0
 BALL_DETECTOR_DEFAULT_CONFIDENCE = 0.25
 BALL_DIAGNOSTIC_MIN_CONFIDENCE = 0.05
 PREDICTIVE_BALL_TRACKING_DEFAULT = os.getenv("PREDICTIVE_BALL_TRACKING", "on").strip().lower()
@@ -1370,6 +1379,129 @@ def ball_confidence_threshold_for_distance(distance_to_prediction):
     )
 
 
+def ball_dicts_to_detections(detections):
+    if not detections:
+        return empty_detections()
+
+    xyxy = np.asarray([detection["box"] for detection in detections], dtype=np.float32)
+    confidence = np.asarray(
+        [float(detection.get("confidence", 0.0)) for detection in detections],
+        dtype=np.float32,
+    )
+    class_id = np.asarray(
+        [int(detection.get("class_id", BALL_CLASS_ID)) for detection in detections],
+        dtype=np.int32,
+    )
+    return sv.Detections(
+        xyxy=xyxy,
+        confidence=confidence,
+        class_id=class_id,
+    )
+
+
+def apply_physical_ball_validation(
+    selected_detection,
+    predicted_center,
+    pending_candidate_state,
+    current_frame_number,
+    missing_frames,
+    last_valid_detection,
+    predicted_speed,
+    accept_distance,
+    verify_distance,
+    max_distance,
+    consecutive_confirmations,
+    reset_after_missing,
+    high_speed_threshold,
+):
+    stats = {
+        "accepts": 0,
+        "rejects": 0,
+        "pending": 0,
+        "confirmed": 0,
+        "false_candidates": 0,
+        "teleports_avoided": 0,
+        "distance": None,
+    }
+
+    pending_state = pending_candidate_state
+    if pending_state is not None:
+        frames_since_last_pending = int(current_frame_number - int(pending_state["last_frame"]))
+        if frames_since_last_pending > 1 or int(missing_frames) > int(reset_after_missing):
+            stats["false_candidates"] += 1
+            pending_state = None
+
+    if selected_detection is None:
+        return None, pending_state, stats
+
+    candidate_center = detection_center_np(selected_detection["box"])
+    distance_to_prediction = None
+    if predicted_center is not None:
+        distance_to_prediction = float(np.linalg.norm(candidate_center - predicted_center))
+        stats["distance"] = distance_to_prediction
+
+    has_reset_condition = (
+        predicted_center is None
+        or last_valid_detection is None
+        or int(missing_frames) > int(reset_after_missing)
+        or float(predicted_speed) >= float(high_speed_threshold)
+    )
+    if distance_to_prediction is None or has_reset_condition:
+        if pending_state is not None:
+            stats["false_candidates"] += 1
+            pending_state = None
+        stats["accepts"] += 1
+        return selected_detection, pending_state, stats
+
+    if distance_to_prediction <= float(accept_distance):
+        if pending_state is not None:
+            stats["false_candidates"] += 1
+            pending_state = None
+        stats["accepts"] += 1
+        return selected_detection, pending_state, stats
+
+    if distance_to_prediction <= float(verify_distance):
+        if (
+            pending_state is not None
+            and np.linalg.norm(candidate_center - pending_state["center"]) <= float(accept_distance)
+        ):
+            pending_state["consecutive"] = int(pending_state["consecutive"]) + 1
+            pending_state["center"] = candidate_center.astype(np.float32)
+            pending_state["detection"] = selected_detection
+            pending_state["last_frame"] = int(current_frame_number)
+        else:
+            if pending_state is not None:
+                stats["false_candidates"] += 1
+            pending_state = {
+                "center": candidate_center.astype(np.float32),
+                "detection": selected_detection,
+                "consecutive": 1,
+                "first_frame": int(current_frame_number),
+                "last_frame": int(current_frame_number),
+            }
+
+        stats["pending"] += 1
+        if int(pending_state["consecutive"]) >= int(consecutive_confirmations):
+            confirmed_detection = pending_state["detection"]
+            pending_state = None
+            stats["accepts"] += 1
+            stats["confirmed"] += 1
+            return confirmed_detection, pending_state, stats
+
+        stats["rejects"] += 1
+        return None, pending_state, stats
+
+    if pending_state is not None:
+        stats["false_candidates"] += 1
+        pending_state = None
+    stats["rejects"] += 1
+    if distance_to_prediction > float(max_distance):
+        stats["teleports_avoided"] += 1
+    else:
+        stats["teleports_avoided"] += 1
+    return None, pending_state, stats
+
+
 def detection_box_to_xywh(box):
     x1, y1, x2, y2 = [float(value) for value in box]
     width = max(0.0, x2 - x1)
@@ -1711,6 +1843,13 @@ def build_performance_profile_report(
     hardware_info,
     team_classifier_cache_metrics,
     ball_tracking_metrics,
+    physical_validation_enabled,
+    physical_accept_distance,
+    physical_verify_distance,
+    physical_max_distance,
+    physical_consecutive_confirmations,
+    physical_reset_after_missing,
+    physical_high_speed_threshold,
 ):
     frame_total_seconds = profile_state["frame_total_seconds"]
     avg_frame_seconds = (
@@ -1860,6 +1999,13 @@ def build_performance_profile_report(
         if frames_processed > 0
         else 0.0
     )
+    physical_detection_distance_count = int(ball_tracking_metrics["physical_detection_distance_count"])
+    average_detection_distance = (
+        float(ball_tracking_metrics["physical_detection_distance_sum"]) / physical_detection_distance_count
+        if physical_detection_distance_count > 0
+        else 0.0
+    )
+    max_detection_distance = float(ball_tracking_metrics["physical_detection_distance_max"])
 
     return {
         "analysis": {
@@ -1937,6 +2083,27 @@ def build_performance_profile_report(
             "ball_track_interruptions_before": interruptions_before,
             "ball_track_interruptions_after": interruptions_after,
             "ball_track_continuity_gain_percent": continuity_gain_percent,
+            "physical_validation_accepts": int(ball_tracking_metrics["physical_validation_accepts"]),
+            "physical_validation_rejects": int(ball_tracking_metrics["physical_validation_rejects"]),
+            "physical_validation_pending": int(ball_tracking_metrics["physical_validation_pending"]),
+            "physical_validation_confirmed": int(ball_tracking_metrics["physical_validation_confirmed"]),
+            "physical_validation_false_candidates": int(
+                ball_tracking_metrics["physical_validation_false_candidates"]
+            ),
+            "physical_validation_teleports_avoided": int(
+                ball_tracking_metrics["physical_validation_teleports_avoided"]
+            ),
+            "average_detection_distance": average_detection_distance,
+            "max_detection_distance": max_detection_distance,
+            "physical_validation_enabled": bool(physical_validation_enabled),
+            "physical_validation_config": {
+                "accept_distance": float(physical_accept_distance),
+                "verify_distance": float(physical_verify_distance),
+                "max_distance": float(physical_max_distance),
+                "consecutive_confirmations": int(physical_consecutive_confirmations),
+                "reset_after_missing": int(physical_reset_after_missing),
+                "high_speed_threshold": float(physical_high_speed_threshold),
+            },
         },
         "stages": stages,
         "top_5_slowest_stages": top_5_slowest_stages,
@@ -2077,6 +2244,25 @@ def analyze(args):
     configured_crop_initial_size = max(64, int(args.crop_initial_size))
     configured_crop_max_size = max(configured_crop_initial_size, int(args.crop_max_size))
     configured_max_frames_before_global_search = max(1, int(args.max_frames_before_global_search))
+    physical_ball_validation_enabled = str(args.physical_ball_validation).strip().lower() == "on"
+    configured_physical_accept_distance = max(1.0, float(args.physical_accept_distance))
+    configured_physical_verify_distance = max(
+        configured_physical_accept_distance,
+        float(args.physical_verify_distance),
+    )
+    configured_physical_max_distance = max(
+        configured_physical_verify_distance,
+        float(args.physical_max_distance),
+    )
+    configured_physical_consecutive_confirmations = max(
+        1,
+        int(args.physical_consecutive_confirmations),
+    )
+    configured_physical_reset_after_missing = max(1, int(args.physical_reset_after_missing))
+    configured_physical_high_speed_threshold = max(
+        0.0,
+        float(args.physical_high_speed_threshold),
+    )
     adaptive_crop_schedule = build_adaptive_crop_schedule(
         configured_crop_initial_size,
         configured_crop_max_size,
@@ -2258,6 +2444,7 @@ def analyze(args):
     ball_search_mode = "global_search" if hybrid_ball_search_enabled else "standard"
     ball_consecutive_detections_for_crop = 0
     semi_global_recovery_cooldown_remaining = 0
+    physical_pending_candidate_state = None
     ball_last_valid_detection = None
     ball_frames_without_detection = 0
     ball_prediction_mode_selected = "pixel"
@@ -2308,6 +2495,15 @@ def analyze(args):
         "recoveries_after_crop": 0,
         "ball_track_interruptions_before": 0,
         "ball_track_interruptions_after": 0,
+        "physical_validation_accepts": 0,
+        "physical_validation_rejects": 0,
+        "physical_validation_pending": 0,
+        "physical_validation_confirmed": 0,
+        "physical_validation_false_candidates": 0,
+        "physical_validation_teleports_avoided": 0,
+        "physical_detection_distance_sum": 0.0,
+        "physical_detection_distance_count": 0,
+        "physical_detection_distance_max": 0.0,
     }
     ball_diagnostics_state = {
         "enabled": ball_diagnostics_enabled,
@@ -2631,14 +2827,6 @@ def analyze(args):
             ball_detection_elapsed,
         )
 
-        ball_tracker_stage_start = time.perf_counter()
-        dedicated_ball_detections = ball_tracker.update(dedicated_ball_detections)
-        record_profile_stage(
-            profile_state,
-            "ball_tracker",
-            time.perf_counter() - ball_tracker_stage_start,
-        )
-
         player_detections = []
         goalkeeper_detections = []
         referee_detections = []
@@ -2714,29 +2902,14 @@ def analyze(args):
             elif class_id == REFEREE_CLASS_ID:
                 referee_detections.append(detection_payload)
 
-        tracker_ball_detections = ball_detections_to_dicts(
-            dedicated_ball_detections,
-            source_name=ball_detector.source_name,
-        )
-        selection_ball_candidates = tracker_ball_detections
+        selection_ball_candidates = list(ball_detections_after_nms_dicts)
         if (
             hybrid_ball_search_enabled
             and detection_source_mode in {"semi_global", "full_global"}
             and not selection_ball_candidates
-            and ball_detections_after_nms_dicts
+            and ball_detector_raw_dicts
         ):
-            selection_ball_candidates = ball_detections_after_nms_dicts
-        raw_ball_present = bool(tracker_ball_detections)
-        if raw_ball_present:
-            ball_current_raw_gap = 0
-        else:
-            ball_current_raw_gap += 1
-            ball_tracking_metrics["largest_gap_before_prediction"] = max(
-                int(ball_tracking_metrics["largest_gap_before_prediction"]),
-                ball_current_raw_gap,
-            )
-        if ball_previous_raw_present and not raw_ball_present:
-            ball_tracking_metrics["ball_track_interruptions_before"] += 1
+            selection_ball_candidates = list(ball_detector_raw_dicts)
 
         roi_radius_pixels = (
             max(BALL_ROI_MIN_RADIUS_PX, predictive_roi_size_used * 0.5)
@@ -2777,6 +2950,83 @@ def analyze(args):
                 predicted_ball_center,
                 roi_radius_pixels,
             )
+
+        predicted_speed_for_validation = (
+            float(np.linalg.norm(pixel_motion_state["velocity"]))
+            if pixel_motion_state is not None
+            else 0.0
+        )
+        if physical_ball_validation_enabled:
+            selected_ball_detection, physical_pending_candidate_state, physical_validation_stats = (
+                apply_physical_ball_validation(
+                    selected_detection=selected_ball_detection,
+                    predicted_center=predicted_center_for_search,
+                    pending_candidate_state=physical_pending_candidate_state,
+                    current_frame_number=current_frame_number,
+                    missing_frames=ball_frames_without_detection,
+                    last_valid_detection=ball_last_valid_detection,
+                    predicted_speed=predicted_speed_for_validation,
+                    accept_distance=configured_physical_accept_distance,
+                    verify_distance=configured_physical_verify_distance,
+                    max_distance=configured_physical_max_distance,
+                    consecutive_confirmations=configured_physical_consecutive_confirmations,
+                    reset_after_missing=configured_physical_reset_after_missing,
+                    high_speed_threshold=configured_physical_high_speed_threshold,
+                )
+            )
+            ball_tracking_metrics["physical_validation_accepts"] += int(physical_validation_stats["accepts"])
+            ball_tracking_metrics["physical_validation_rejects"] += int(physical_validation_stats["rejects"])
+            ball_tracking_metrics["physical_validation_pending"] += int(physical_validation_stats["pending"])
+            ball_tracking_metrics["physical_validation_confirmed"] += int(physical_validation_stats["confirmed"])
+            ball_tracking_metrics["physical_validation_false_candidates"] += int(
+                physical_validation_stats["false_candidates"]
+            )
+            ball_tracking_metrics["physical_validation_teleports_avoided"] += int(
+                physical_validation_stats["teleports_avoided"]
+            )
+            if physical_validation_stats["distance"] is not None:
+                physical_distance = float(physical_validation_stats["distance"])
+                ball_tracking_metrics["physical_detection_distance_sum"] += physical_distance
+                ball_tracking_metrics["physical_detection_distance_count"] += 1
+                ball_tracking_metrics["physical_detection_distance_max"] = max(
+                    float(ball_tracking_metrics["physical_detection_distance_max"]),
+                    physical_distance,
+                )
+        else:
+            physical_pending_candidate_state = None
+
+        dedicated_ball_detections = ball_dicts_to_detections(
+            [selected_ball_detection] if selected_ball_detection is not None else []
+        )
+        ball_tracker_stage_start = time.perf_counter()
+        dedicated_ball_detections = ball_tracker.update(dedicated_ball_detections)
+        record_profile_stage(
+            profile_state,
+            "ball_tracker",
+            time.perf_counter() - ball_tracker_stage_start,
+        )
+        tracker_ball_detections = ball_detections_to_dicts(
+            dedicated_ball_detections,
+            source_name=ball_detector.source_name,
+        )
+        if not tracker_ball_detections and selected_ball_detection is not None:
+            tracker_ball_detections = [selected_ball_detection]
+        if tracker_ball_detections:
+            selected_ball_detection = tracker_ball_detections[0]
+        else:
+            selected_ball_detection = None
+
+        raw_ball_present = bool(tracker_ball_detections)
+        if raw_ball_present:
+            ball_current_raw_gap = 0
+        else:
+            ball_current_raw_gap += 1
+            ball_tracking_metrics["largest_gap_before_prediction"] = max(
+                int(ball_tracking_metrics["largest_gap_before_prediction"]),
+                ball_current_raw_gap,
+            )
+        if ball_previous_raw_present and not raw_ball_present:
+            ball_tracking_metrics["ball_track_interruptions_before"] += 1
 
         if roi_attempted:
             if not predictive_ball_tracking_enabled:
@@ -3407,6 +3657,13 @@ def analyze(args):
         hardware_info=hardware_info,
         team_classifier_cache_metrics=team_classifier_cache_metrics,
         ball_tracking_metrics=ball_tracking_metrics,
+        physical_validation_enabled=physical_ball_validation_enabled,
+        physical_accept_distance=configured_physical_accept_distance,
+        physical_verify_distance=configured_physical_verify_distance,
+        physical_max_distance=configured_physical_max_distance,
+        physical_consecutive_confirmations=configured_physical_consecutive_confirmations,
+        physical_reset_after_missing=configured_physical_reset_after_missing,
+        physical_high_speed_threshold=configured_physical_high_speed_threshold,
     )
     write_performance_profile_report(profile_report_path, profile_report)
     ball_diagnostics_report = None
@@ -3659,6 +3916,48 @@ def parse_args():
         type=int,
         default=MAX_FRAMES_BEFORE_GLOBAL_SEARCH,
         help="Consecutive misses before abandoning crop and returning to global tiling",
+    )
+    parser.add_argument(
+        "--physical-ball-validation",
+        choices=["on", "off"],
+        default=PHYSICAL_BALL_VALIDATION_DEFAULT,
+        help="Enable physical consistency validation between detector output and BallTracker updates",
+    )
+    parser.add_argument(
+        "--physical-accept-distance",
+        type=float,
+        default=PHYSICAL_ACCEPT_DISTANCE,
+        help="Pixel distance threshold for immediate acceptance of a detected ball",
+    )
+    parser.add_argument(
+        "--physical-verify-distance",
+        type=float,
+        default=PHYSICAL_VERIFY_DISTANCE,
+        help="Pixel distance upper bound for pending confirmation candidates",
+    )
+    parser.add_argument(
+        "--physical-max-distance",
+        type=float,
+        default=PHYSICAL_MAX_DISTANCE,
+        help="Pixel distance beyond which detections are rejected as implausible teleports",
+    )
+    parser.add_argument(
+        "--physical-consecutive-confirmations",
+        type=int,
+        default=PHYSICAL_CONSECUTIVE_CONFIRMATIONS,
+        help="Consecutive frames required to confirm medium-distance pending candidates",
+    )
+    parser.add_argument(
+        "--physical-reset-after-missing",
+        type=int,
+        default=PHYSICAL_RESET_AFTER_MISSING,
+        help="Missing-frame threshold to reset physical validation and allow distant reacquisition",
+    )
+    parser.add_argument(
+        "--physical-high-speed-threshold",
+        type=float,
+        default=PHYSICAL_HIGH_SPEED_THRESHOLD,
+        help="Predicted speed threshold (px/frame) that allows distant detections to be accepted",
     )
     parser.add_argument("--imgsz", type=int, default=1280, help="YOLO inference image size")
     parser.add_argument("--conf", type=float, default=0.25, help="YOLO confidence threshold")
