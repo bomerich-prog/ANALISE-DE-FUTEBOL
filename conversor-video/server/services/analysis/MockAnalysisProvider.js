@@ -49,6 +49,13 @@ class MockAnalysisProvider extends AnalysisProvider {
       tracking: { status: 'pending' },
       features: { status: 'pending' },
       machine_learning: { status: 'pending' },
+      events: {
+        current_possession_team: null,
+        blue_passes: 0,
+        red_passes: 0,
+        turnovers: 0,
+        ball_detected: false,
+      },
     };
   }
 }

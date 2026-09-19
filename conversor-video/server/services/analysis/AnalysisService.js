@@ -8,6 +8,11 @@ const {
   PIPELINE_STATUS,
   ANALYSIS_STATUS,
 } = require('./AnalysisProvider');
+const {
+  createPlaceholderMatchEvents,
+  normalizeMatchEvents,
+  toUserFacingAnalysisMessage,
+} = require('./matchEvents');
 
 /**
  * Orquestrador de análises — ponto único de entrada para rotas e jobs.
@@ -38,6 +43,9 @@ class AnalysisService {
       frames_processed: metrics.frames_processed || 0,
       players_detected: metrics.players_detected || 0,
       ball_detected: Boolean(metrics.ball_detected),
+      events: normalizeMatchEvents(result?.events, {
+        ball_detected: Boolean(metrics.ball_detected),
+      }),
     };
     if (result?.artifacts?.debug_live_frame_url) {
       stats.debug_frame_url = result.artifacts.debug_live_frame_url;
@@ -56,6 +64,9 @@ class AnalysisService {
       delete result.artifacts.debug_live_frame_path;
       result.artifacts.debug_live_frame_url = `/api/analyses/${analysisId}/debug-frame`;
     }
+    result.events = normalizeMatchEvents(result.events, {
+      ball_detected: Boolean(result.metrics?.ball_detected),
+    });
     return result;
   }
 
@@ -133,15 +144,19 @@ class AnalysisService {
     const progress = progressStore.get(row.id);
     const resultJson = row.result_json ? JSON.parse(row.result_json) : {};
     const progressStats = progress.progress_stats || this.getProgressStatsFromResult(resultJson);
+    progressStats.events = normalizeMatchEvents(progressStats.events || resultJson.events, {
+      ball_detected: progressStats.ball_detected ?? resultJson.metrics?.ball_detected,
+    });
     const resolvedProgress =
       progress.message || progress.progress
         ? progress.progress
         : row.status === ANALYSIS_STATUS.COMPLETED
           ? 100
           : 0;
-    const resolvedMessage =
-      progress.message ||
-      (row.status === ANALYSIS_STATUS.COMPLETED ? 'Análise concluída com sucesso.' : '');
+    const resolvedMessage = toUserFacingAnalysisMessage(
+      row.status,
+      progress.message || resultJson.error
+    );
 
     return {
       id: row.id,
@@ -154,6 +169,7 @@ class AnalysisService {
       progress: resolvedProgress,
       message: resolvedMessage,
       progress_stats: progressStats,
+      events: progressStats.events,
     };
   }
 
@@ -194,7 +210,17 @@ class AnalysisService {
     const analysisId = insert.lastInsertRowid;
 
     setVideoPipelineStatus(videoId, userId, PIPELINE_STATUS.ANALYZING);
-    progressStore.set(analysisId, { progress: 0, message: 'Iniciando análise...' });
+    const initialEvents = createPlaceholderMatchEvents();
+    progressStore.set(analysisId, {
+      progress: 0,
+      message: 'Analisando a partida...',
+      progress_stats: {
+        frames_processed: 0,
+        players_detected: 0,
+        ball_detected: false,
+        events: initialEvents,
+      },
+    });
 
     this.runInBackground(analysisId, videoId, userId);
 
@@ -204,8 +230,14 @@ class AnalysisService {
       video_name: video.video_name,
       status: ANALYSIS_STATUS.ANALYZING,
       progress: 0,
-      message: 'Iniciando análise...',
-      progress_stats: { frames_processed: 0, players_detected: 0, ball_detected: false },
+      message: 'Analisando a partida...',
+      progress_stats: {
+        frames_processed: 0,
+        players_detected: 0,
+        ball_detected: false,
+        events: initialEvents,
+      },
+      events: initialEvents,
     };
   }
 
