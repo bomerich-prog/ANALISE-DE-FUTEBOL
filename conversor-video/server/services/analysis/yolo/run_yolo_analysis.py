@@ -20,6 +20,7 @@ import numpy as np
 import supervision as sv
 from ultralytics import YOLO
 
+from pass_detector import PassDetector
 from possession import PossessionEngine, build_ball_state, build_possession_players
 from roboflow_ball import BallTracker
 from roboflow_soccer_config import SoccerPitchConfiguration
@@ -144,6 +145,7 @@ PROFILE_STAGE_NAMES = [
     "team_classifier_predict",
     "goalkeeper_assignment",
     "homography",
+    "pass_detection",
     "render_bounding_boxes",
     "video_writer",
     "live_frame_update",
@@ -2551,6 +2553,7 @@ def analyze(args):
     last_emitted_progress = -1
     possession_engine = PossessionEngine()
     last_possession_events = possession_engine.snapshot().as_dict()
+    pass_detector = PassDetector()
 
     while True:
         ok, frame = capture.read()
@@ -3486,6 +3489,19 @@ def analyze(args):
         possession_events = possession_snapshot.as_dict()
         possession_changed = possession_events != last_possession_events
         last_possession_events = possession_events
+        pass_detection_stage_start = time.perf_counter()
+        pass_detector.update(
+            frame_number=current_frame_number,
+            fps=fps,
+            snapshot=possession_snapshot,
+            players=possession_players,
+            ball=possession_ball,
+        )
+        record_profile_stage(
+            profile_state,
+            "pass_detection",
+            time.perf_counter() - pass_detection_stage_start,
+        )
 
         discarded_outside_field += len(rejected_player_detections)
         filtered_player_detections += len(accepted_player_detections)
@@ -3673,6 +3689,7 @@ def analyze(args):
 
     capture.release()
     writer.release()
+    pass_metrics = pass_detector.finalize()
     finalize_browser_video(raw_output_path, output_path)
     analysis_total_seconds = time.perf_counter() - analysis_start_time
     profile_report = build_performance_profile_report(
@@ -3694,6 +3711,15 @@ def analyze(args):
         physical_reset_after_missing=configured_physical_reset_after_missing,
         physical_high_speed_threshold=configured_physical_high_speed_threshold,
     )
+    profile_report["pass_detection"] = {
+        "total_passes": int(pass_metrics["total_passes"]),
+        "raw_candidate_passes": int(pass_metrics["raw_candidate_passes"]),
+        "discarded_short_passes": int(pass_metrics["discarded_short_passes"]),
+        "discarded_long_passes": int(pass_metrics["discarded_long_passes"]),
+        "discarded_unstable_possession": int(pass_metrics["discarded_unstable_possession"]),
+        "discarded_timeout": int(pass_metrics["discarded_timeout"]),
+        "discarded_direction_check": int(pass_metrics["discarded_direction_check"]),
+    }
     write_performance_profile_report(profile_report_path, profile_report)
     ball_diagnostics_report = None
     if ball_diagnostics_state["enabled"]:
@@ -3831,10 +3857,11 @@ def analyze(args):
             "avg_keypoints_detected": avg_pitch_keypoints_detected,
             "examples": homography_examples,
         },
-        "features": {"status": "implemented (ball possession state machine)"},
+        "features": {"status": "implemented (ball possession state machine + pass detector refinements)"},
         "machine_learning": {"status": "pending"},
         "events": possession_engine.snapshot().as_dict(),
         "possession": possession_engine.metrics(),
+        "passes": pass_metrics,
         "artifacts": {
             "processed_video_path": str(output_path),
             "ball_diagnostics_path": (
