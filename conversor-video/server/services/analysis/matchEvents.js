@@ -1,20 +1,11 @@
 /**
  * Contrato de eventos da partida enviado ao frontend.
- * Os valores reais serão preenchidos quando a lógica de posse/passes existir.
- * Este módulo apenas normaliza o payload — não calcula eventos.
+ * Nesta etapa apenas a posse é preenchida pelo worker.
  *
  * @typedef {Object} MatchEvents
+ * @property {number|null} current_possessor_track_id
  * @property {string|null} current_possession_team  'blue' | 'red' | null
- * @property {number} blue_passes
- * @property {number} red_passes
- * @property {number} turnovers
- * @property {boolean} ball_detected
  */
-
-function toOptionalCount(value, fallback = 0) {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : fallback;
-}
 
 function normalizePossessionTeam(value) {
   if (value === 'blue' || value === 'red') return value;
@@ -25,24 +16,26 @@ function normalizePossessionTeam(value) {
   return null;
 }
 
+function normalizePossessorTrackId(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return parsed;
+}
+
 function createPlaceholderMatchEvents(overrides = {}) {
   return {
+    current_possessor_track_id: normalizePossessorTrackId(overrides.current_possessor_track_id),
     current_possession_team: normalizePossessionTeam(overrides.current_possession_team),
-    blue_passes: toOptionalCount(overrides.blue_passes, 0),
-    red_passes: toOptionalCount(overrides.red_passes, 0),
-    turnovers: toOptionalCount(overrides.turnovers, 0),
-    ball_detected: Boolean(overrides.ball_detected),
   };
 }
 
 function normalizeMatchEvents(raw, fallbacks = {}) {
   const source = raw && typeof raw === 'object' ? raw : {};
   return createPlaceholderMatchEvents({
+    current_possessor_track_id:
+      source.current_possessor_track_id ?? fallbacks.current_possessor_track_id,
     current_possession_team: source.current_possession_team ?? fallbacks.current_possession_team,
-    blue_passes: source.blue_passes ?? fallbacks.blue_passes,
-    red_passes: source.red_passes ?? fallbacks.red_passes,
-    turnovers: source.turnovers ?? fallbacks.turnovers,
-    ball_detected: source.ball_detected ?? fallbacks.ball_detected,
   });
 }
 

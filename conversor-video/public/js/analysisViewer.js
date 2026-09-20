@@ -73,11 +73,13 @@ function getEvents(analysis) {
   const progressStats = analysis?.progress_stats || {};
 
   return {
+    current_possessor_track_id:
+      progressEvents.current_possessor_track_id ?? resultEvents.current_possessor_track_id ?? null,
     current_possession_team:
       progressEvents.current_possession_team ?? resultEvents.current_possession_team ?? null,
-    blue_passes: progressEvents.blue_passes ?? resultEvents.blue_passes ?? 0,
-    red_passes: progressEvents.red_passes ?? resultEvents.red_passes ?? 0,
-    turnovers: progressEvents.turnovers ?? resultEvents.turnovers ?? 0,
+    blue_passes: 0,
+    red_passes: 0,
+    turnovers: 0,
     ball_detected: Boolean(
       progressEvents.ball_detected ??
         resultEvents.ball_detected ??
@@ -219,11 +221,8 @@ async function startAnalysisInVisualization(videoId) {
             players_detected: 0,
             ball_detected: false,
             events: analysis.events || {
+              current_possessor_track_id: null,
               current_possession_team: null,
-              blue_passes: 0,
-              red_passes: 0,
-              turnovers: 0,
-              ball_detected: false,
             },
           },
         });

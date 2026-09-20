@@ -43,9 +43,7 @@ class AnalysisService {
       frames_processed: metrics.frames_processed || 0,
       players_detected: metrics.players_detected || 0,
       ball_detected: Boolean(metrics.ball_detected),
-      events: normalizeMatchEvents(result?.events, {
-        ball_detected: Boolean(metrics.ball_detected),
-      }),
+      events: normalizeMatchEvents(result?.events),
     };
     if (result?.artifacts?.debug_live_frame_url) {
       stats.debug_frame_url = result.artifacts.debug_live_frame_url;
@@ -64,9 +62,7 @@ class AnalysisService {
       delete result.artifacts.debug_live_frame_path;
       result.artifacts.debug_live_frame_url = `/api/analyses/${analysisId}/debug-frame`;
     }
-    result.events = normalizeMatchEvents(result.events, {
-      ball_detected: Boolean(result.metrics?.ball_detected),
-    });
+    result.events = normalizeMatchEvents(result.events);
     return result;
   }
 
@@ -144,9 +140,7 @@ class AnalysisService {
     const progress = progressStore.get(row.id);
     const resultJson = row.result_json ? JSON.parse(row.result_json) : {};
     const progressStats = progress.progress_stats || this.getProgressStatsFromResult(resultJson);
-    progressStats.events = normalizeMatchEvents(progressStats.events || resultJson.events, {
-      ball_detected: progressStats.ball_detected ?? resultJson.metrics?.ball_detected,
-    });
+    progressStats.events = normalizeMatchEvents(progressStats.events || resultJson.events);
     const resolvedProgress =
       progress.message || progress.progress
         ? progress.progress

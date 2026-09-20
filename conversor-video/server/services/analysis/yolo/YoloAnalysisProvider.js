@@ -131,6 +131,10 @@ class YoloAnalysisProvider extends AnalysisProvider {
               frames_processed: payload.framesProcessed || 0,
               players_detected: payload.playersDetected || 0,
               ball_detected: Boolean(payload.ballDetected),
+              events: payload.events || {
+                current_possessor_track_id: null,
+                current_possession_team: null,
+              },
             },
           };
           if (payload.debugFrameUpdated) {

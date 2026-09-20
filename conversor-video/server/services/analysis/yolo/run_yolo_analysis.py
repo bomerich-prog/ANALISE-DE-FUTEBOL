@@ -20,6 +20,7 @@ import numpy as np
 import supervision as sv
 from ultralytics import YOLO
 
+from possession import PossessionEngine, build_ball_state, build_possession_players
 from roboflow_ball import BallTracker
 from roboflow_soccer_config import SoccerPitchConfiguration
 from roboflow_team import TeamClassifier
@@ -2548,6 +2549,8 @@ def analyze(args):
     player_referee_stabilized_swap_events = 0
     team_classification_frame_examples = []
     last_emitted_progress = -1
+    possession_engine = PossessionEngine()
+    last_possession_events = possession_engine.snapshot().as_dict()
 
     while True:
         ok, frame = capture.read()
@@ -3459,6 +3462,31 @@ def analyze(args):
             time.perf_counter() - homography_stage_start,
         )
 
+        remembered_ball = None
+        if ball_last_valid_detection is not None:
+            remembered_ball = dict(ball_last_valid_detection)
+            if remembered_ball.get("field_x") is None or remembered_ball.get("field_y") is None:
+                remembered_center = detection_center_np(remembered_ball["box"])
+                remembered_field = transform_image_point_to_field(view_transformer, remembered_center)
+                if remembered_field is not None:
+                    remembered_ball["field_x"] = float(remembered_field[0])
+                    remembered_ball["field_y"] = float(remembered_field[1])
+
+        possession_players = build_possession_players(
+            list(accepted_player_detections) + list(accepted_goalkeeper_detections)
+        )
+        possession_ball = build_ball_state(
+            observed_ball=ball_detections[0] if ball_detections else None,
+            remembered_ball=remembered_ball,
+            predicted_field=predicted_field_center,
+            predicted_pixel=predicted_center_for_search,
+            internal_alive=internal_ball_track_alive,
+        )
+        possession_snapshot = possession_engine.update(possession_players, possession_ball)
+        possession_events = possession_snapshot.as_dict()
+        possession_changed = possession_events != last_possession_events
+        last_possession_events = possession_events
+
         discarded_outside_field += len(rejected_player_detections)
         filtered_player_detections += len(accepted_player_detections)
 
@@ -3564,7 +3592,7 @@ def analyze(args):
         should_emit_debug_frame = should_write_live_debug_frame(
             args.debug_frame_dir, frames_processed, args.debug_frame_interval
         )
-        if should_emit or should_emit_debug_frame:
+        if should_emit or should_emit_debug_frame or possession_changed:
             last_emitted_progress = progress
             payload = {
                 "type": "progress",
@@ -3573,6 +3601,7 @@ def analyze(args):
                 "framesProcessed": frames_processed,
                 "playersDetected": max_players_detected,
                 "ballDetected": ball_detected or frame_ball,
+                "events": possession_events,
                 "playerDetections": [
                     {
                         "track_id": int(detection.get("track_id", -1)),
@@ -3802,8 +3831,10 @@ def analyze(args):
             "avg_keypoints_detected": avg_pitch_keypoints_detected,
             "examples": homography_examples,
         },
-        "features": {"status": "pending"},
+        "features": {"status": "implemented (ball possession state machine)"},
         "machine_learning": {"status": "pending"},
+        "events": possession_engine.snapshot().as_dict(),
+        "possession": possession_engine.metrics(),
         "artifacts": {
             "processed_video_path": str(output_path),
             "ball_diagnostics_path": (
@@ -3821,6 +3852,7 @@ def analyze(args):
             "framesProcessed": frames_processed,
             "playersDetected": max_players_detected,
             "ballDetected": ball_detected,
+            "events": possession_engine.snapshot().as_dict(),
         }
     )
     emit({"type": "result", "result": result})
