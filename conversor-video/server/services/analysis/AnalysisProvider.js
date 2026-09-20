@@ -12,6 +12,9 @@ const { PIPELINE_STATUS, ANALYSIS_STATUS } = require('../../constants/pipelineSt
  * @property {Object} [tracking]
  * @property {Object} [features]
  * @property {Object} [machine_learning]
+ * @property {Object} [events]
+ * @property {number|null} [events.current_possessor_track_id]
+ * @property {string|null} [events.current_possession_team]
  */
 
 class AnalysisProvider {

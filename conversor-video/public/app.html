@@ -373,7 +373,7 @@
     <section class="analysis-modal-panel">
       <header class="analysis-modal-header">
         <div>
-          <p class="analysis-kicker">YOLOv8 · Ultralytics</p>
+          <p class="analysis-kicker">Análise da partida</p>
           <h2 id="analysisVisualizationTitle">Visualização da Análise</h2>
           <p id="analysisVideoName">Aguardando vídeo...</p>
         </div>
@@ -384,7 +384,7 @@
         <div class="analysis-player-card">
           <div class="analysis-video-placeholder" id="analysisVideoPlaceholder">
             <div class="spinner"></div>
-            <span>O vídeo processado aparecerá quando a análise terminar.</span>
+            <span>A visualização da partida aparece durante a análise.</span>
           </div>
           <img class="analysis-video hidden" id="analysisLiveFrame" alt="Frame anotado em tempo real">
           <video class="analysis-video hidden" id="analysisProcessedVideo" controls playsinline></video>
@@ -392,39 +392,47 @@
 
         <aside class="analysis-sidebar">
           <div class="analysis-status-card">
-            <span class="analysis-status-label">Status da análise</span>
+            <span class="analysis-status-label">Status</span>
             <strong id="analysisStatusText">Aguardando</strong>
-            <p id="analysisStatusMessage">Pronto para iniciar YOLO.</p>
+            <p id="analysisStatusMessage">Aguardando análise.</p>
             <div class="progress-track progress-track--analysis">
               <div class="progress-bar-fill progress-bar-fill--analysis" id="analysisViewerProgress"></div>
             </div>
             <span class="analysis-progress-text" id="analysisViewerProgressText">0%</span>
           </div>
 
-          <div class="analysis-metrics-grid">
-            <article>
-              <span>Jogadores detectados</span>
-              <strong id="analysisPlayersCount">0</strong>
-            </article>
-            <article>
-              <span>Bola detectada</span>
-              <strong id="analysisBallFound">Não</strong>
-            </article>
-            <article>
-              <span>Frames processados</span>
-              <strong id="analysisFramesProcessed">0</strong>
-            </article>
-          </div>
+          <section class="analysis-match-card" aria-labelledby="analysisMatchTitle">
+            <h3 id="analysisMatchTitle">Análise da Partida</h3>
 
-          <div class="analysis-pipeline-card">
-            <h3>Arquitetura modular</h3>
-            <ol>
-              <li class="done">YOLO</li>
-              <li>Tracking</li>
-              <li>Extração de Features</li>
-              <li>Machine Learning</li>
-            </ol>
-          </div>
+            <article class="analysis-match-item">
+              <span>Posse atual</span>
+              <strong id="analysisPossessionTeam">Aguardando análise</strong>
+            </article>
+
+            <div class="analysis-match-passes">
+              <span class="analysis-match-label">Passes detectados</span>
+              <div class="analysis-match-split">
+                <article>
+                  <span>Time Azul</span>
+                  <strong id="analysisBluePasses">0</strong>
+                </article>
+                <article>
+                  <span>Time Vermelho</span>
+                  <strong id="analysisRedPasses">0</strong>
+                </article>
+              </div>
+            </div>
+
+            <article class="analysis-match-item">
+              <span>Trocas de posse</span>
+              <strong id="analysisTurnovers">0</strong>
+            </article>
+
+            <article class="analysis-match-item">
+              <span>Bola</span>
+              <strong id="analysisBallFound">Não detectada</strong>
+            </article>
+          </section>
         </aside>
       </div>
     </section>

@@ -1220,7 +1220,8 @@ body {
 
 .analysis-status-card,
 .analysis-metrics-grid article,
-.analysis-pipeline-card {
+.analysis-pipeline-card,
+.analysis-match-card {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -1228,7 +1229,9 @@ body {
 }
 
 .analysis-status-label,
-.analysis-metrics-grid span {
+.analysis-metrics-grid span,
+.analysis-match-card span,
+.analysis-match-label {
   display: block;
   color: var(--text-muted);
   font-size: 0.7rem;
@@ -1309,6 +1312,48 @@ body {
 
 .analysis-pipeline-card li.done::before {
   background: var(--green);
+}
+
+.analysis-match-card h3 {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 0.9rem;
+}
+
+.analysis-match-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+
+.analysis-match-item strong,
+.analysis-match-split strong {
+  display: block;
+  margin-top: 0.25rem;
+  color: var(--green-light);
+  font-size: 1.2rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.analysis-match-passes {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.analysis-match-split {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.6rem;
+}
+
+.analysis-match-split article {
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.7rem;
 }
 
 /* Settings */

@@ -13,9 +13,11 @@ const statusTextEl = document.getElementById('analysisStatusText');
 const statusMessageEl = document.getElementById('analysisStatusMessage');
 const progressEl = document.getElementById('analysisViewerProgress');
 const progressTextEl = document.getElementById('analysisViewerProgressText');
-const playersEl = document.getElementById('analysisPlayersCount');
+const possessionEl = document.getElementById('analysisPossessionTeam');
+const bluePassesEl = document.getElementById('analysisBluePasses');
+const redPassesEl = document.getElementById('analysisRedPasses');
+const turnoversEl = document.getElementById('analysisTurnovers');
 const ballEl = document.getElementById('analysisBallFound');
-const framesEl = document.getElementById('analysisFramesProcessed');
 const processedVideoEl = document.getElementById('analysisProcessedVideo');
 const liveFrameEl = document.getElementById('analysisLiveFrame');
 const placeholderEl = document.getElementById('analysisVideoPlaceholder');
@@ -47,16 +49,60 @@ function hideLiveFrame() {
   liveFrameEl.classList.add('hidden');
 }
 
+function userFacingMessage(status, rawMessage) {
+  if (status === ANALYSIS_STATUS.ERROR) {
+    return rawMessage || 'Não foi possível concluir a análise.';
+  }
+  if (status === ANALYSIS_STATUS.COMPLETED) return 'Análise concluída.';
+  if (status === ANALYSIS_STATUS.ANALYZING || status === ANALYSIS_STATUS.PENDING) {
+    return 'Analisando a partida...';
+  }
+  return 'Aguardando análise.';
+}
+
+function possessionLabel(team) {
+  if (team === 'blue' || team === 0 || team === '0' || team === 'Time Azul') return 'Time Azul';
+  if (team === 'red' || team === 1 || team === '1' || team === 'Time Vermelho') return 'Time Vermelho';
+  return 'Aguardando análise';
+}
+
+function getEvents(analysis) {
+  const progressEvents = analysis?.progress_stats?.events || analysis?.events || {};
+  const resultEvents = analysis?.result_json?.events || {};
+  const metrics = analysis?.result_json?.metrics || {};
+  const progressStats = analysis?.progress_stats || {};
+
+  return {
+    current_possessor_track_id:
+      progressEvents.current_possessor_track_id ?? resultEvents.current_possessor_track_id ?? null,
+    current_possession_team:
+      progressEvents.current_possession_team ?? resultEvents.current_possession_team ?? null,
+    blue_passes: 0,
+    red_passes: 0,
+    turnovers: 0,
+    ball_detected: Boolean(
+      progressEvents.ball_detected ??
+        resultEvents.ball_detected ??
+        progressStats.ball_detected ??
+        metrics.ball_detected
+    ),
+    debug_frame_url:
+      progressStats.debug_frame_url ?? analysis?.result_json?.artifacts?.debug_live_frame_url ?? null,
+  };
+}
+
 function resetViewer() {
   activeAnalysisId = null;
   stopPolling();
   setText(videoNameEl, 'Aguardando vídeo...');
   setText(statusTextEl, 'Aguardando');
-  setText(statusMessageEl, 'Pronto para iniciar YOLO.');
+  setText(statusMessageEl, 'Aguardando análise.');
   setText(progressTextEl, '0%');
-  setText(playersEl, '0');
-  setText(ballEl, 'Não');
-  setText(framesEl, '0');
+  setText(possessionEl, 'Aguardando análise');
+  setText(bluePassesEl, '0');
+  setText(redPassesEl, '0');
+  setText(turnoversEl, '0');
+  setText(ballEl, 'Não detectada');
   if (progressEl) progressEl.style.width = '0%';
   if (processedVideoEl) {
     processedVideoEl.removeAttribute('src');
@@ -65,18 +111,6 @@ function resetViewer() {
   }
   hideLiveFrame();
   placeholderEl?.classList.remove('hidden');
-}
-
-function getMetrics(analysis) {
-  const metrics = analysis?.result_json?.metrics || {};
-  const progressStats = analysis?.progress_stats || {};
-  return {
-    frames_processed: progressStats.frames_processed ?? metrics.frames_processed ?? 0,
-    players_detected: progressStats.players_detected ?? metrics.players_detected ?? 0,
-    ball_detected: progressStats.ball_detected ?? metrics.ball_detected ?? false,
-    debug_frame_url:
-      progressStats.debug_frame_url ?? analysis?.result_json?.artifacts?.debug_live_frame_url ?? null,
-  };
 }
 
 function showProcessedVideo(analysis) {
@@ -92,14 +126,22 @@ function showProcessedVideo(analysis) {
   processedVideoEl.classList.remove('hidden');
 }
 
-function showLiveFrame(metrics) {
-  if (!metrics.debug_frame_url || !liveFrameEl || !processedVideoEl?.classList.contains('hidden')) return;
+function showLiveFrame(events) {
+  if (!events.debug_frame_url || !liveFrameEl || !processedVideoEl?.classList.contains('hidden')) return;
 
-  if (liveFrameEl.getAttribute('src') !== metrics.debug_frame_url) {
-    liveFrameEl.src = metrics.debug_frame_url;
+  if (liveFrameEl.getAttribute('src') !== events.debug_frame_url) {
+    liveFrameEl.src = events.debug_frame_url;
   }
   placeholderEl?.classList.add('hidden');
   liveFrameEl.classList.remove('hidden');
+}
+
+function renderMatchEvents(events) {
+  setText(possessionEl, possessionLabel(events.current_possession_team));
+  setText(bluePassesEl, String(events.blue_passes ?? 0));
+  setText(redPassesEl, String(events.red_passes ?? 0));
+  setText(turnoversEl, String(events.turnovers ?? 0));
+  setText(ballEl, events.ball_detected ? 'Detectada' : 'Não detectada');
 }
 
 function renderAnalysis(analysis) {
@@ -107,21 +149,19 @@ function renderAnalysis(analysis) {
 
   activeAnalysisId = analysis.id;
   const pct = Math.max(0, Math.min(100, analysis.progress ?? 0));
-  const metrics = getMetrics(analysis);
+  const events = getEvents(analysis);
 
   setText(videoNameEl, analysis.video_name || `Vídeo #${analysis.video_id}`);
   setText(statusTextEl, getAnalysisLabel(analysis.status));
-  setText(statusMessageEl, analysis.message || 'Análise visual YOLO em execução.');
+  setText(statusMessageEl, userFacingMessage(analysis.status, analysis.message));
   setText(progressTextEl, `${pct}%`);
-  setText(playersEl, String(metrics.players_detected));
-  setText(ballEl, metrics.ball_detected ? 'Sim' : 'Não');
-  setText(framesEl, String(metrics.frames_processed));
+  renderMatchEvents(events);
   if (progressEl) progressEl.style.width = `${pct}%`;
 
   if (analysis.status === ANALYSIS_STATUS.COMPLETED) {
     showProcessedVideo(analysis);
   } else {
-    showLiveFrame(metrics);
+    showLiveFrame(events);
   }
 }
 
@@ -176,7 +216,15 @@ async function startAnalysisInVisualization(videoId) {
           ...analysis,
           video_id: videoId,
           status: ANALYSIS_STATUS.ANALYZING,
-          progress_stats: { frames_processed: 0, players_detected: 0, ball_detected: false },
+          progress_stats: {
+            frames_processed: 0,
+            players_detected: 0,
+            ball_detected: false,
+            events: analysis.events || {
+              current_possessor_track_id: null,
+              current_possession_team: null,
+            },
+          },
         });
       },
       onProgress: (pct, msg, analysis) => {
