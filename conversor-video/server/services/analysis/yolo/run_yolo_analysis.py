@@ -24,7 +24,7 @@ from pass_detector import PassDetector
 from possession import PossessionEngine, build_ball_state, build_possession_players
 from roboflow_ball import BallTracker
 from roboflow_soccer_config import SoccerPitchConfiguration
-from roboflow_team import TeamClassifier
+from roboflow_team import TeamClassifier, TeamTrackLock, reject_training_crop
 from roboflow_view import ViewTransformer
 
 
@@ -2296,7 +2296,11 @@ def analyze(args):
         "discarded_empty": 0,
         "discarded_border": 0,
         "discarded_blurry": 0,
+        "discarded_non_player": {},
+        "discarded_low_chroma_official": 0,
+        "kept_low_chroma_official": 0,
     }
+    low_chroma_training_crops = []
     training_capture = cv2.VideoCapture(str(input_path))
     if not training_capture.isOpened():
         raise RuntimeError("Não foi possível abrir o vídeo para treinar TeamClassifier.")
@@ -2348,6 +2352,14 @@ def analyze(args):
             if is_crop_blurry(player_crop, TEAM_CLASSIFIER_MIN_LAPLACIAN_VARIANCE):
                 team_training_stats["discarded_blurry"] += 1
                 continue
+            non_player_reason = reject_training_crop(player_crop)
+            if non_player_reason == "low_chroma_official":
+                low_chroma_training_crops.append(player_crop)
+                continue
+            if non_player_reason:
+                reason_counts = team_training_stats["discarded_non_player"]
+                reason_counts[non_player_reason] = int(reason_counts.get(non_player_reason, 0)) + 1
+                continue
 
             team_classifier_crops.append(player_crop)
             team_training_stats["crops_used_for_fit"] += 1
@@ -2361,6 +2373,11 @@ def analyze(args):
         else:
             team_training_stats["training_stop_reason"] = "video_ended"
     training_capture.release()
+    if len(team_classifier_crops) < 12 and low_chroma_training_crops:
+        team_training_stats["kept_low_chroma_official"] = len(low_chroma_training_crops)
+        team_classifier_crops.extend(low_chroma_training_crops)
+        low_chroma_training_crops = []
+    team_training_stats["discarded_low_chroma_official"] = len(low_chroma_training_crops)
 
     if len(team_classifier_crops) == 0:
         raise RuntimeError("TeamClassifier: nenhum crop de jogador encontrado para treinamento.")
@@ -2377,6 +2394,8 @@ def analyze(args):
         + team_training_stats["discarded_empty"]
         + team_training_stats["discarded_border"]
         + team_training_stats["discarded_blurry"]
+        + sum(team_training_stats["discarded_non_player"].values())
+        + team_training_stats["discarded_low_chroma_official"]
     )
     emit(
         {
@@ -2529,7 +2548,7 @@ def analyze(args):
         "other_filter_frame_counts": {},
     }
     team_prediction_counts = {0: 0, 1: 0}
-    player_team_cache_by_track_id = {}
+    team_track_lock = TeamTrackLock()
     team_classifier_cache_metrics = {
         "predict_calls_before_cache": 0,
         "predict_calls_after_cache": 0,
@@ -3311,44 +3330,49 @@ def analyze(args):
             team_classifier_cache_metrics["predict_calls_before_cache"] += 1
 
         detections_needing_prediction = []
-        cached_team_ids_for_players = [None] * len(accepted_player_detections)
         for idx, detection in enumerate(accepted_player_detections):
             track_id = int(detection.get("track_id", -1))
-            cache_entry = player_team_cache_by_track_id.get(track_id) if track_id >= 0 else None
-            if cache_entry is not None:
-                last_classified_frame = int(cache_entry["last_classified_frame"])
-                if current_frame_number - last_classified_frame <= TEAM_CLASSIFIER_REFRESH_INTERVAL:
-                    cached_team_ids_for_players[idx] = int(cache_entry["team_id"])
-                    team_classifier_cache_metrics["cache_hits"] += 1
-                    continue
-            detections_needing_prediction.append(idx)
+            if track_id >= 0 and not team_track_lock.needs_observation(
+                track_id,
+                current_frame_number,
+                TEAM_CLASSIFIER_REFRESH_INTERVAL,
+            ):
+                detection["team_id"] = int(team_track_lock.current_team(track_id))
+                team_classifier_cache_metrics["cache_hits"] += 1
+                continue
+            verifying = track_id >= 0 and team_track_lock.is_locked(track_id)
+            detections_needing_prediction.append((idx, verifying))
             team_classifier_cache_metrics["cache_misses"] += 1
 
         if detections_needing_prediction:
             team_training_stats["predict_called_count"] += 1
             team_classifier_cache_metrics["predict_calls_after_cache"] += 1
-            detections_to_predict = [accepted_player_detections[idx] for idx in detections_needing_prediction]
+            detections_to_predict = [
+                accepted_player_detections[idx] for idx, _verifying in detections_needing_prediction
+            ]
             prediction_crops = get_player_crops_from_payload(frame, detections_to_predict)
             predicted_team_ids = team_classifier.predict(prediction_crops) if prediction_crops else np.array([])
-            for prediction_idx, detection_idx in enumerate(detections_needing_prediction):
+            for prediction_idx, (detection_idx, verifying) in enumerate(detections_needing_prediction):
                 predicted_team_id = (
                     int(predicted_team_ids[prediction_idx])
                     if prediction_idx < len(predicted_team_ids)
                     else 0
                 )
-                cached_team_ids_for_players[detection_idx] = predicted_team_id
                 detection = accepted_player_detections[detection_idx]
                 track_id = int(detection.get("track_id", -1))
                 if track_id >= 0:
-                    player_team_cache_by_track_id[track_id] = {
-                        "team_id": predicted_team_id,
-                        "last_classified_frame": current_frame_number,
-                    }
+                    detection["team_id"] = team_track_lock.assign(
+                        track_id,
+                        predicted_team_id,
+                        current_frame_number,
+                        verifying,
+                    )
+                else:
+                    detection["team_id"] = predicted_team_id
 
         players_team_id_list = []
-        for idx, detection in enumerate(accepted_player_detections):
-            team_id_value = cached_team_ids_for_players[idx]
-            team_id = int(team_id_value) if team_id_value is not None else 0
+        for detection in accepted_player_detections:
+            team_id = int(detection["team_id"]) if detection.get("team_id") is not None else 0
             detection["team_id"] = team_id
             players_team_id_list.append(team_id)
             if team_id in team_prediction_counts:
@@ -3826,6 +3850,9 @@ def analyze(args):
                 "discarded_empty": team_training_stats["discarded_empty"],
                 "discarded_border": team_training_stats["discarded_border"],
                 "discarded_blurry": team_training_stats["discarded_blurry"],
+                "discarded_non_player": team_training_stats["discarded_non_player"],
+                "discarded_low_chroma_official": team_training_stats["discarded_low_chroma_official"],
+                "kept_low_chroma_official": team_training_stats["kept_low_chroma_official"],
                 "discarded_total": total_discarded_training_crops,
                 "training_completed_frame": team_training_stats["training_completed_frame"],
                 "training_stop_reason": team_training_stats["training_stop_reason"],
@@ -3840,6 +3867,8 @@ def analyze(args):
                 "collecting_after_fit": False,
             },
             "frame_examples": team_classification_frame_examples,
+            "color_anchor": team_classifier.color_anchor,
+            "stability": team_track_lock.metrics(),
         },
         "goalkeeper_assignment": {
             "method": "official centroid proximity heuristic from roboflow/sports",
