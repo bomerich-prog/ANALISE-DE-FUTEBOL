@@ -16,7 +16,7 @@ CONTROL_RADIUS_PX = 90.0
 HOLD_RADIUS_PX = 140.0
 CONTEST_MARGIN_CM = 70.0
 CONTEST_MARGIN_PX = 25.0
-TEAM_NAME_BY_ID = {0: "blue", 1: "red"}
+TEAM_NAME_BY_ID = {0: "Team 0", 1: "Team 1"}
 
 
 @dataclass

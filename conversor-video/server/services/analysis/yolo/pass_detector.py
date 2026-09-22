@@ -87,11 +87,11 @@ def _team_name_from_player(player):
     team_id = player.get("team_id")
     if team_id in TEAM_NAME_BY_ID:
         return TEAM_NAME_BY_ID[team_id]
-    if team_id in ("0", "blue"):
-        return "blue"
-    if team_id in ("1", "red"):
-        return "red"
-    if team_id in {"blue", "red"}:
+    if team_id in (0, "0", "Team 0"):
+        return "Team 0"
+    if team_id in (1, "1", "Team 1"):
+        return "Team 1"
+    if team_id in {"Team 0", "Team 1"}:
         return team_id
     return None
 
@@ -99,7 +99,7 @@ def _team_name_from_player(player):
 def _team_of(snapshot, players, track_id):
     if snapshot is not None and snapshot.current_possessor_track_id == track_id:
         team = snapshot.current_possession_team
-        if team in {"blue", "red"}:
+        if team in {"Team 0", "Team 1"}:
             return team
     return _team_name_from_player(_find_player(players, track_id))
 
@@ -294,7 +294,7 @@ class PassDetector:
             return
 
         from_team = pending.get("from_team")
-        if from_team in {"blue", "red"} and possessor_team in {"blue", "red"} and from_team != possessor_team:
+        if from_team in {"Team 0", "Team 1"} and possessor_team in {"Team 0", "Team 1"} and from_team != possessor_team:
             confidence = _turnover_confidence(trajectory)
             self.turnovers += 1
             self.turnover_events.append(
@@ -313,7 +313,7 @@ class PassDetector:
             )
             return
 
-        if from_team not in {"blue", "red"} or possessor_team not in {"blue", "red"} or from_team != possessor_team:
+        if from_team not in {"Team 0", "Team 1"} or possessor_team not in {"Team 0", "Team 1"} or from_team != possessor_team:
             self.discarded_unstable_possession += 1
             return
 
@@ -391,9 +391,9 @@ def _both_teams_on_ball(players, ball_point):
         if distance is None or space != ball_point["space"] or distance > radius:
             continue
         team = _team_name_from_player(player)
-        if team in {"blue", "red"}:
+        if team in {"Team 0", "Team 1"}:
             teams.add(team)
-    return "blue" in teams and "red" in teams
+    return "Team 0" in teams and "Team 1" in teams
 
 
 def _pass_score(short_interval, distance_plausible, trajectory):

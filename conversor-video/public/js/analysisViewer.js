@@ -61,8 +61,8 @@ function userFacingMessage(status, rawMessage) {
 }
 
 function possessionLabel(team) {
-  if (team === 'blue' || team === 0 || team === '0' || team === 'Time Azul') return 'Time Azul';
-  if (team === 'red' || team === 1 || team === '1' || team === 'Time Vermelho') return 'Time Vermelho';
+  if (team === 'Team 0' || team === 0 || team === '0') return 'Team 0';
+  if (team === 'Team 1' || team === 1 || team === '1') return 'Team 1';
   return 'Aguardando análise';
 }
 

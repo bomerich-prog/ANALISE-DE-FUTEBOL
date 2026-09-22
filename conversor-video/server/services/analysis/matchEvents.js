@@ -4,15 +4,12 @@
  *
  * @typedef {Object} MatchEvents
  * @property {number|null} current_possessor_track_id
- * @property {string|null} current_possession_team  'blue' | 'red' | null
+ * @property {string|null} current_possession_team  'Team 0' | 'Team 1' | null
  */
 
 function normalizePossessionTeam(value) {
-  if (value === 'blue' || value === 'red') return value;
-  if (value === 0 || value === '0') return 'blue';
-  if (value === 1 || value === '1') return 'red';
-  if (value === 'Time Azul') return 'blue';
-  if (value === 'Time Vermelho') return 'red';
+  if (value === 'Team 0' || value === 0 || value === '0') return 'Team 0';
+  if (value === 'Team 1' || value === 1 || value === '1') return 'Team 1';
   return null;
 }
 

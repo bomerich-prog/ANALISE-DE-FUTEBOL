@@ -51,7 +51,7 @@ def valid_pass_sequence(receiver_x=1500.0, ball_xs=None, gap_none_frames=4, hold
     frames = []
     frame = 1
     for _ in range(8):
-        frames.append((frame, 1, "blue", players, ball(0.0, 0.0)))
+        frames.append((frame, 1, "Team 0", players, ball(0.0, 0.0)))
         frame += 1
     lost_frame = frame
     ball_xs = list(ball_xs) if ball_xs is not None else [400.0, 800.0, 1100.0, 1400.0]
@@ -63,7 +63,7 @@ def valid_pass_sequence(receiver_x=1500.0, ball_xs=None, gap_none_frames=4, hold
         ball_x = ball_xs[-1] if ball_xs else receiver_x
         if hold_index == hold_frames - 1:
             ball_x = receiver_x
-        frames.append((frame, 2, "blue", players, ball(ball_x, 0.0)))
+        frames.append((frame, 2, "Team 0", players, ball(ball_x, 0.0)))
         frame += 1
     return frames, lost_frame
 
@@ -99,10 +99,10 @@ def test_ball_near_donor_does_not_veto_confirmed_reception():
     frames = []
     frame = 1
     for _ in range(6):
-        frames.append((frame, 1, "blue", players, ball(0.0, 0.0)))
+        frames.append((frame, 1, "Team 0", players, ball(0.0, 0.0)))
         frame += 1
     for _ in range(5):
-        frames.append((frame, 2, "blue", players, ball(50.0, 0.0)))
+        frames.append((frame, 2, "Team 0", players, ball(50.0, 0.0)))
         frame += 1
     metrics = run_frames(detector, frames)
     assert_equal(metrics["total_passes"], 1, "possession decides, not the stuck ball")
@@ -126,13 +126,13 @@ def test_discards_short_and_long_passes():
     frames = []
     frame = 1
     for _ in range(6):
-        frames.append((frame, 1, "blue", players, ball(0.0, 0.0)))
+        frames.append((frame, 1, "Team 0", players, ball(0.0, 0.0)))
         frame += 1
     for ball_x in (500.0, 700.0, 500.0, 200.0):
         frames.append((frame, None, None, players, ball(ball_x, 0.0)))
         frame += 1
     for _ in range(5):
-        frames.append((frame, 2, "blue", players, ball(80.0, 0.0)))
+        frames.append((frame, 2, "Team 0", players, ball(80.0, 0.0)))
         frame += 1
     short_metrics = run_frames(short_detector, frames)
     assert_equal(short_metrics["total_passes"], 0, "short pass rejected")
@@ -153,13 +153,13 @@ def test_discards_incompatible_ball_direction():
     frames = []
     frame = 1
     for _ in range(6):
-        frames.append((frame, 1, "blue", players, ball(0.0, 0.0)))
+        frames.append((frame, 1, "Team 0", players, ball(0.0, 0.0)))
         frame += 1
     for ball_x in (-200.0, -400.0, -700.0, -900.0):
         frames.append((frame, None, None, players, ball(ball_x, 0.0)))
         frame += 1
     for _ in range(5):
-        frames.append((frame, 2, "blue", players, ball(-1100.0, 0.0)))
+        frames.append((frame, 2, "Team 0", players, ball(-1100.0, 0.0)))
         frame += 1
     metrics = run_frames(detector, frames)
     assert_equal(metrics["total_passes"], 0, "incompatible trajectory stays below the threshold")
@@ -178,15 +178,15 @@ def test_each_possession_transfer_is_its_own_pass():
     frame = frames[-1][0] + 1
     frames.append((frame, None, None, players, ball(800.0, 0.0)))
     frame += 1
-    frames.append((frame, 1, "blue", players, ball(0.0, 0.0)))
+    frames.append((frame, 1, "Team 0", players, ball(0.0, 0.0)))
     frame += 1
-    frames.append((frame, 1, "blue", players, ball(0.0, 0.0)))
+    frames.append((frame, 1, "Team 0", players, ball(0.0, 0.0)))
     frame += 1
     for ball_x in (400.0, 800.0, 1100.0, 1400.0):
         frames.append((frame, None, None, players, ball(ball_x, 0.0)))
         frame += 1
     for _ in range(5):
-        frames.append((frame, 2, "blue", players, ball(1500.0, 0.0)))
+        frames.append((frame, 2, "Team 0", players, ball(1500.0, 0.0)))
         frame += 1
     metrics = run_frames(detector, frames)
     pairs = [(event["from_track_id"], event["to_track_id"]) for event in metrics["events"]]
@@ -197,7 +197,7 @@ def test_each_possession_transfer_is_its_own_pass():
 def test_first_possession_is_not_a_pass():
     detector = PassDetector()
     players = [player(4, 1, 100.0, 100.0)]
-    frames = [(index, 4, "red", players, ball(100.0, 100.0)) for index in range(1, 10)]
+    frames = [(index, 4, "Team 1", players, ball(100.0, 100.0)) for index in range(1, 10)]
     metrics = run_frames(detector, frames)
     assert_equal(metrics["raw_candidate_passes"], 0, "opening possession is not a pass")
     assert_equal(metrics["total_passes"], 0, "no pass")
@@ -211,13 +211,13 @@ def test_confirms_pass_when_ball_disappears_between_possessors():
     frames = []
     frame = 1
     for _ in range(8):
-        frames.append((frame, 1, "blue", players, ball(0.0, 0.0)))
+        frames.append((frame, 1, "Team 0", players, ball(0.0, 0.0)))
         frame += 1
     for _ in range(10):
         frames.append((frame, None, None, players, None))
         frame += 1
     for _ in range(5):
-        frames.append((frame, 2, "blue", players, ball(1500.0, 0.0)))
+        frames.append((frame, 2, "Team 0", players, ball(1500.0, 0.0)))
         frame += 1
     metrics = run_frames(detector, frames)
     assert_equal(metrics["total_passes"], 1, "gap without trajectory is a pass")
@@ -236,13 +236,13 @@ def test_predicted_ball_does_not_block_possession_pass():
     frames = []
     frame = 1
     for _ in range(6):
-        frames.append((frame, 1, "blue", players, ball(0.0, 0.0)))
+        frames.append((frame, 1, "Team 0", players, ball(0.0, 0.0)))
         frame += 1
     for ball_x in (-300.0, -700.0, -1200.0, -1600.0):
         frames.append((frame, None, None, players, ball(ball_x, 0.0, source="predicted")))
         frame += 1
     for _ in range(5):
-        frames.append((frame, 2, "blue", players, ball(1800.0, 0.0)))
+        frames.append((frame, 2, "Team 0", players, ball(1800.0, 0.0)))
         frame += 1
     metrics = run_frames(detector, frames)
     assert_equal(metrics["total_passes"], 1, "predicted flight does not veto the pass")
@@ -259,15 +259,15 @@ def test_predicted_drift_during_reception_does_not_cancel_pass():
     frames = []
     frame = 1
     for _ in range(6):
-        frames.append((frame, 1, "blue", players, ball(0.0, 0.0)))
+        frames.append((frame, 1, "Team 0", players, ball(0.0, 0.0)))
         frame += 1
     for _ in range(4):
         frames.append((frame, None, None, players, None))
         frame += 1
-    frames.append((frame, 2, "blue", players, ball(1500.0, 0.0)))
+    frames.append((frame, 2, "Team 0", players, ball(1500.0, 0.0)))
     frame += 1
     for ball_x in (900.0, 200.0, -400.0, -900.0):
-        frames.append((frame, 2, "blue", players, ball(ball_x, 0.0, source="predicted")))
+        frames.append((frame, 2, "Team 0", players, ball(ball_x, 0.0, source="predicted")))
         frame += 1
     metrics = run_frames(detector, frames)
     assert_equal(metrics["total_passes"], 1, "predicted drift does not cancel the pass")
@@ -283,13 +283,13 @@ def test_missing_ball_still_respects_timeout_and_distance():
     frames = []
     frame = 1
     for _ in range(6):
-        frames.append((frame, 1, "blue", players, ball(0.0, 0.0)))
+        frames.append((frame, 1, "Team 0", players, ball(0.0, 0.0)))
         frame += 1
     for _ in range(30):
         frames.append((frame, None, None, players, None))
         frame += 1
     for _ in range(5):
-        frames.append((frame, 2, "blue", players, ball(1500.0, 0.0)))
+        frames.append((frame, 2, "Team 0", players, ball(1500.0, 0.0)))
         frame += 1
     timeout_metrics = run_frames(timeout_detector, frames)
     assert_equal(timeout_metrics["total_passes"], 0, "long disappearance is not a pass")
@@ -300,13 +300,13 @@ def test_missing_ball_still_respects_timeout_and_distance():
     long_frames = []
     frame = 1
     for _ in range(6):
-        long_frames.append((frame, 1, "blue", [a, far], ball(0.0, 0.0)))
+        long_frames.append((frame, 1, "Team 0", [a, far], ball(0.0, 0.0)))
         frame += 1
     for _ in range(4):
         long_frames.append((frame, None, None, [a, far], None))
         frame += 1
     for _ in range(5):
-        long_frames.append((frame, 2, "blue", [a, far], ball(8000.0, 0.0)))
+        long_frames.append((frame, 2, "Team 0", [a, far], ball(8000.0, 0.0)))
         frame += 1
     long_metrics = run_frames(long_detector, long_frames)
     assert_equal(long_metrics["total_passes"], 0, "over 60m is still rejected")
@@ -321,13 +321,13 @@ def test_different_team_is_not_a_pass():
     frames = []
     frame = 1
     for _ in range(6):
-        frames.append((frame, 1, "blue", players, ball(0.0, 0.0)))
+        frames.append((frame, 1, "Team 0", players, ball(0.0, 0.0)))
         frame += 1
     for _ in range(3):
         frames.append((frame, None, None, players, ball(800.0, 0.0)))
         frame += 1
     for _ in range(6):
-        frames.append((frame, 8, "red", players, ball(1500.0, 0.0)))
+        frames.append((frame, 8, "Team 1", players, ball(1500.0, 0.0)))
         frame += 1
     metrics = run_frames(detector, frames)
     assert_equal(metrics["raw_candidate_passes"], 0, "turnover is not a pass")
@@ -345,11 +345,11 @@ def test_dispute_on_the_frame_before_the_switch():
     frames = []
     frame = 1
     for _ in range(5):
-        frames.append((frame, 1, "blue", players, ball(0.0, 0.0)))
+        frames.append((frame, 1, "Team 0", players, ball(0.0, 0.0)))
         frame += 1
-    frames.append((frame, 1, "blue", players, ball(40.0, 0.0)))
+    frames.append((frame, 1, "Team 0", players, ball(40.0, 0.0)))
     frame += 1
-    frames.append((frame, 2, "blue", players, ball(1500.0, 0.0)))
+    frames.append((frame, 2, "Team 0", players, ball(1500.0, 0.0)))
     metrics = run_frames(detector, frames)
     assert_equal(metrics["disputes"], 1, "the duel before confirmation blocks the pass")
     assert_equal(metrics["total_passes"], 0, "not a pass")
@@ -362,13 +362,13 @@ def test_same_player_return_is_a_carry():
     frames = []
     frame = 1
     for _ in range(6):
-        frames.append((frame, 1, "blue", players, ball(0.0, 0.0)))
+        frames.append((frame, 1, "Team 0", players, ball(0.0, 0.0)))
         frame += 1
     for _ in range(4):
         frames.append((frame, None, None, players, None))
         frame += 1
     for _ in range(3):
-        frames.append((frame, 1, "blue", players, ball(40.0, 0.0)))
+        frames.append((frame, 1, "Team 0", players, ball(40.0, 0.0)))
         frame += 1
     metrics = run_frames(detector, frames)
     assert_equal(metrics["conductions"], 1, "A to empty to A is a carry")
@@ -385,12 +385,12 @@ def test_both_teams_on_the_ball_is_a_dispute():
     frames = []
     frame = 1
     for _ in range(6):
-        frames.append((frame, 1, "blue", players, ball(0.0, 0.0)))
+        frames.append((frame, 1, "Team 0", players, ball(0.0, 0.0)))
         frame += 1
     for _ in range(3):
         frames.append((frame, None, None, players, ball(50.0, 0.0)))
         frame += 1
-    frames.append((frame, 2, "blue", players, ball(1500.0, 0.0)))
+    frames.append((frame, 2, "Team 0", players, ball(1500.0, 0.0)))
     metrics = run_frames(detector, frames)
     assert_equal(metrics["disputes"], 1, "two teams on the ball is a dispute")
     assert_equal(metrics["total_passes"], 0, "a dispute is not a pass")
