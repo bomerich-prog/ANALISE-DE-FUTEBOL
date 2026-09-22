@@ -120,7 +120,7 @@ def anchor_cluster_labels(crops: List[np.ndarray], raw_labels: Iterable[int]):
         for extra in ranked[2:]:
             mapping[extra] = TEAM_RED_ID
     report = {
-        "semantic": {"0": "blue", "1": "red"},
+        "semantic": {"0": "Team 0", "1": "Team 1"},
         "cluster_blueness": {str(label): blueness[label] for label in present},
         "cluster_to_team": {str(label): int(mapping[label]) for label in mapping},
         "labels_were_remapped": any(int(label) != int(mapping[label]) for label in mapping),
@@ -306,7 +306,7 @@ class TeamClassifier:
         self.cluster_model = KMeans(n_clusters=2, random_state=0, n_init=10)
         self.cluster_to_team = {0: TEAM_BLUE_ID, 1: TEAM_RED_ID}
         self.color_anchor = {
-            "semantic": {"0": "blue", "1": "red"},
+            "semantic": {"0": "Team 0", "1": "Team 1"},
             "cluster_blueness": {},
             "cluster_to_team": {"0": TEAM_BLUE_ID, "1": TEAM_RED_ID},
             "labels_were_remapped": False,

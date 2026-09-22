@@ -71,17 +71,17 @@ def _hold_radius(space):
 
 def _team_of(snapshot, players, track_id):
     team = snapshot.current_possession_team if snapshot is not None else None
-    if team in {"blue", "red"} and snapshot is not None and snapshot.current_possessor_track_id == track_id:
+    if team in {"Team 0", "Team 1"} and snapshot is not None and snapshot.current_possessor_track_id == track_id:
         return team
     player = _find_player(players, track_id)
     if not player:
-        return team if team in {"blue", "red"} else None
+        return team if team in {"Team 0", "Team 1"} else None
     team_id = player.get("team_id")
-    if team_id in (0, "0", "blue"):
-        return "blue"
-    if team_id in (1, "1", "red"):
-        return "red"
-    return team if team in {"blue", "red"} else None
+    if team_id in (0, "0", "Team 0"):
+        return "Team 0"
+    if team_id in (1, "1", "Team 1"):
+        return "Team 1"
+    return team if team in {"Team 0", "Team 1"} else None
 
 
 class PassDetector:
