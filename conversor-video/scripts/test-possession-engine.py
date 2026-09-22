@@ -42,7 +42,7 @@ def test_confirms_after_consecutive_observed_frames():
         assert_equal(snapshot.current_possessor_track_id, None, "should still be pending")
     snapshot = engine.update(players, ball("observed"))
     assert_equal(snapshot.current_possessor_track_id, 7, "confirmed possessor")
-    assert_equal(snapshot.current_possession_team, "blue", "confirmed team")
+    assert_equal(snapshot.current_possession_team, "Team 0", "confirmed team")
 
 
 def test_memory_holds_but_does_not_open_possession():
@@ -95,14 +95,14 @@ def test_switch_requires_consecutive_clear_leader():
     b = player(12, 1, 800, 100)
     for _ in range(POSSESSION_CONFIRM_FRAMES):
         engine.update([a, b], ball("observed", field_x=100, field_y=100))
-    assert_equal(engine.snapshot().current_possession_team, "blue", "start blue")
+    assert_equal(engine.snapshot().current_possession_team, "Team 0", "start team 0")
 
     for _ in range(POSSESSION_SWITCH_FRAMES - 1):
         snapshot = engine.update([a, b], ball("observed", field_x=800, field_y=100))
         assert_equal(snapshot.current_possessor_track_id, 11, "switch still pending")
     snapshot = engine.update([a, b], ball("observed", field_x=800, field_y=100))
     assert_equal(snapshot.current_possessor_track_id, 12, "switched to B")
-    assert_equal(snapshot.current_possession_team, "red", "team became red")
+    assert_equal(snapshot.current_possession_team, "Team 1", "team became team 1")
 
 
 if __name__ == "__main__":
