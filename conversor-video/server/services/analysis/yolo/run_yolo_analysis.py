@@ -21,6 +21,7 @@ import supervision as sv
 from ultralytics import YOLO
 
 from pass_detector import PassDetector
+from person_class import PersonClassLock, reject_non_person_detections
 from possession import PossessionEngine, build_ball_state, build_possession_players
 from roboflow_ball import BallTracker
 from roboflow_soccer_config import SoccerPitchConfiguration
@@ -2568,6 +2569,9 @@ def analyze(args):
     last_stabilized_player_referee_class = {}
     player_referee_raw_swap_events = 0
     player_referee_stabilized_swap_events = 0
+    person_class_lock = PersonClassLock()
+    rejected_non_person = 0
+    rejected_non_person_reasons = {}
     team_classification_frame_examples = []
     last_emitted_progress = -1
     possession_engine = PossessionEngine()
@@ -2595,6 +2599,13 @@ def analyze(args):
             classes=[GOALKEEPER_CLASS_ID, PLAYER_CLASS_ID, REFEREE_CLASS_ID],
         )[0]
         tracked_human_detections = sv.Detections.from_ultralytics(result)
+        tracked_human_detections, frame_non_person_reasons = reject_non_person_detections(
+            tracked_human_detections,
+            frame,
+        )
+        for reason, count in frame_non_person_reasons.items():
+            rejected_non_person += int(count)
+            rejected_non_person_reasons[reason] = int(rejected_non_person_reasons.get(reason, 0)) + int(count)
         record_profile_stage(
             profile_state,
             "player_detection",
@@ -2887,28 +2898,22 @@ def analyze(args):
             box = tracked_human_detections.xyxy[detection_index].tolist()
             track_id = int(tracker_ids[detection_index])
             class_id = raw_class_id
-            if track_id >= 0 and raw_class_id in {PLAYER_CLASS_ID, REFEREE_CLASS_ID}:
+            if track_id >= 0 and raw_class_id in {PLAYER_CLASS_ID, GOALKEEPER_CLASS_ID, REFEREE_CLASS_ID}:
                 previous_raw_class = last_raw_player_referee_class.get(track_id)
                 if (
                     previous_raw_class is not None
                     and previous_raw_class != raw_class_id
+                    and raw_class_id in {PLAYER_CLASS_ID, REFEREE_CLASS_ID}
+                    and previous_raw_class in {PLAYER_CLASS_ID, REFEREE_CLASS_ID}
                 ):
                     player_referee_raw_swap_events += 1
                 last_raw_player_referee_class[track_id] = raw_class_id
-
-                class_history = player_referee_class_history.setdefault(
-                    track_id, deque(maxlen=PLAYER_REFEREE_HISTORY_WINDOW)
+                class_id = person_class_lock.assign(
+                    track_id,
+                    raw_class_id,
+                    current_frame_number,
+                    verifying=person_class_lock.is_locked(track_id),
                 )
-                class_history.append(raw_class_id)
-                class_id = stabilize_player_referee_class(class_history, raw_class_id)
-
-                previous_stabilized_class = last_stabilized_player_referee_class.get(track_id)
-                if (
-                    previous_stabilized_class is not None
-                    and previous_stabilized_class != class_id
-                ):
-                    player_referee_stabilized_swap_events += 1
-                last_stabilized_player_referee_class[track_id] = class_id
 
             detection_payload = {
                 "box": box,
@@ -3801,6 +3806,8 @@ def analyze(args):
             "filtered_player_detections": filtered_player_detections,
             "discarded_outside_field": discarded_outside_field,
             "duplicate_player_detections_suppressed": duplicate_player_detections_suppressed,
+            "rejected_non_person": rejected_non_person,
+            "rejected_non_person_reasons": rejected_non_person_reasons,
             "total_ball_detections": total_ball_detections,
             "field_mask_detected_frames": field_mask_detected_frames,
             "avg_player_confidence": avg_player_confidence,
@@ -3834,8 +3841,11 @@ def analyze(args):
                 "recovered_track_ids_count": len(recovered_track_ids),
                 "recovered_track_examples": recovered_track_examples,
                 "player_referee_class_swaps_before_history": player_referee_raw_swap_events,
-                "player_referee_class_swaps_after_history": player_referee_stabilized_swap_events,
+                "player_referee_class_swaps_after_history": person_class_lock.metrics()["class_changes_after_lock"],
                 "player_referee_history_window": PLAYER_REFEREE_HISTORY_WINDOW,
+                "person_class_lock": person_class_lock.metrics(),
+                "rejected_non_person": rejected_non_person,
+                "rejected_non_person_reasons": rejected_non_person_reasons,
             },
         },
         "team_classifier": {
