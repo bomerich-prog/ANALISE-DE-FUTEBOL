@@ -72,8 +72,9 @@ PHYSICAL_CONSECUTIVE_CONFIRMATIONS = 2
 PHYSICAL_RESET_AFTER_MISSING = 10
 PHYSICAL_HIGH_SPEED_THRESHOLD = 120.0
 BALL_DETECTOR_DEFAULT_CONFIDENCE = 0.25
-BALL_YOLO_RECALL_CONFIDENCE = 0.12
+BALL_YOLO_RECALL_CONFIDENCE = 0.02
 BALL_STRONG_CONFIDENCE = 0.25
+BALL_NEARBY_STRONG_DISTANCE_PX = PHYSICAL_ACCEPT_DISTANCE
 BALL_DIAGNOSTIC_MIN_CONFIDENCE = 0.05
 PREDICTIVE_BALL_TRACKING_DEFAULT = os.getenv("PREDICTIVE_BALL_TRACKING", "on").strip().lower()
 if PREDICTIVE_BALL_TRACKING_DEFAULT not in {"on", "off"}:
@@ -1359,35 +1360,55 @@ def keep_recoverable_ball_candidates(
     strong_min_confidence=BALL_STRONG_CONFIDENCE,
     weak_min_confidence=BALL_YOLO_RECALL_CONFIDENCE,
     weak_max_distance_px=BALL_PREDICTION_NEAR_DISTANCE_PX,
+    nearby_strong_distance_px=BALL_NEARBY_STRONG_DISTANCE_PX,
 ):
-    """Keep a low-confidence ball only when it continues the current track.
+    """Keep a low-confidence ball when it continues the current track.
 
-    football-ball-detection.pt often scores a visible ball below 0.25 when the
-    ball is orange, blurred, or small after the 640 resize. Those boxes are
-    usable only next to the last ball. A distant box in the same range is a
-    stable false candidate on the test clip and must not replace the track.
+    On the orange-ball recording the detector often emits the true box between
+    0.02 and 0.25 while a distant box scores higher. That nearby box has to
+    stay in the candidate list. A box at or above 0.25 within 120 px still
+    wins, and a weak box cannot open a track when there is no prediction.
     """
     if not detections:
         return []
     strong_min = float(strong_min_confidence)
-    strong = [detection for detection in detections if float(detection["confidence"]) >= strong_min]
-    if strong:
-        return strong
     if predicted_center is None:
-        return []
+        return [
+            detection
+            for detection in detections
+            if float(detection["confidence"]) >= strong_min
+        ]
+
     predicted = np.asarray(predicted_center, dtype=np.float32)
-    kept = []
+    nearby_strong = []
+    continuation = []
+    distant_strong = []
+    nearby_limit = float(nearby_strong_distance_px)
+    weak_limit = float(weak_max_distance_px)
     for detection in detections:
-        if float(detection["confidence"]) < float(weak_min_confidence):
-            continue
+        confidence = float(detection["confidence"])
         center = detection_center_np(detection["box"])
         distance = float(np.linalg.norm(center - predicted))
-        if distance <= float(weak_max_distance_px):
-            kept.append(detection)
-    return kept
+        if confidence >= strong_min and distance <= nearby_limit:
+            nearby_strong.append(detection)
+        elif confidence >= float(weak_min_confidence) and distance <= weak_limit:
+            continuation.append(detection)
+        elif confidence >= strong_min:
+            distant_strong.append(detection)
+    if nearby_strong:
+        return nearby_strong
+    if continuation:
+        return continuation
+    return distant_strong
 
 
-def select_ball_detection_with_roi(detections, predicted_center, roi_radius_pixels):
+def select_ball_detection_with_roi(
+    detections,
+    predicted_center,
+    roi_radius_pixels,
+    near_min_confidence=BALL_CONFIDENCE_NEAR_MIN,
+    far_min_confidence=BALL_CONFIDENCE_FAR_MIN,
+):
     if not detections:
         return None, False, False
     if predicted_center is None:
@@ -1400,11 +1421,21 @@ def select_ball_detection_with_roi(detections, predicted_center, roi_radius_pixe
         if distance <= roi_radius_pixels:
             roi_candidates.append(detection)
 
-    selected_from_roi = pick_detection_with_confidence_fusion(roi_candidates, predicted_center)
+    selected_from_roi = pick_detection_with_confidence_fusion(
+        roi_candidates,
+        predicted_center,
+        near_min_confidence=near_min_confidence,
+        far_min_confidence=far_min_confidence,
+    )
     if selected_from_roi is not None:
         return selected_from_roi, True, True
 
-    selected_global = pick_detection_with_confidence_fusion(detections, predicted_center)
+    selected_global = pick_detection_with_confidence_fusion(
+        detections,
+        predicted_center,
+        near_min_confidence=near_min_confidence,
+        far_min_confidence=far_min_confidence,
+    )
     return selected_global, True, False
 
 
@@ -3017,10 +3048,21 @@ def analyze(args):
             roi_attempted = ball_detector_roi_xyxy is not None
             roi_success = roi_attempted and selected_ball_detection is not None
         else:
+            yolo_ball_detector = ball_detector_backend == "yolo"
             selected_ball_detection, roi_attempted, roi_success = select_ball_detection_with_roi(
                 selection_ball_candidates,
                 predicted_ball_center,
                 roi_radius_pixels,
+                near_min_confidence=(
+                    BALL_YOLO_RECALL_CONFIDENCE
+                    if yolo_ball_detector
+                    else BALL_CONFIDENCE_NEAR_MIN
+                ),
+                far_min_confidence=(
+                    BALL_STRONG_CONFIDENCE
+                    if yolo_ball_detector
+                    else BALL_CONFIDENCE_FAR_MIN
+                ),
             )
 
         predicted_speed_for_validation = (
@@ -3116,9 +3158,20 @@ def analyze(args):
                 ball_tracking_metrics["ball_prediction_misses"] += 1
 
         previous_missing_frames = int(ball_frames_without_detection)
+        # A box below 0.25 may continue the orange ball, but it must not keep a
+        # false track alive. After the normal 5-frame memory the prediction is
+        # dropped, so a later strong ball can be acquired again.
+        weak_yolo_continuation = (
+            selected_ball_detection is not None
+            and ball_detector_backend == "yolo"
+            and float(selected_ball_detection["confidence"]) < BALL_STRONG_CONFIDENCE
+        )
         if selected_ball_detection is not None:
             ball_detections = [selected_ball_detection]
-            ball_frames_without_detection = 0
+            if weak_yolo_continuation:
+                ball_frames_without_detection += 1
+            else:
+                ball_frames_without_detection = 0
             ball_last_valid_detection = selected_ball_detection
             if hybrid_ball_search_enabled:
                 if detection_source_mode in {"semi_global", "full_global"}:
@@ -3194,6 +3247,14 @@ def analyze(args):
                 )
                 ball_tracking_metrics["prediction_error_field_to_pixel_sum"] += field_to_pixel_error
                 ball_tracking_metrics["prediction_error_field_to_pixel_count"] += 1
+            if (
+                weak_yolo_continuation
+                and ball_frames_without_detection > BALL_MEMORY_MAX_MISSING_FRAMES
+            ):
+                ball_last_valid_detection = None
+                ball_position_history.clear()
+                ball_field_position_history.clear()
+                ball_motion_history.clear()
         else:
             ball_detections = []
             ball_frames_without_detection += 1
