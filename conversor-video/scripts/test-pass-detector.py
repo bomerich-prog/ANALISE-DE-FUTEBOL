@@ -247,6 +247,30 @@ def test_predicted_ball_does_not_block_possession_pass():
     assert_equal(metrics["turnovers"], 0, "same team is not a turnover")
 
 
+def test_predicted_drift_during_reception_does_not_cancel_pass():
+    detector = PassDetector()
+    a = player(1, 0, 0.0, 0.0)
+    b = player(2, 0, 1500.0, 0.0)
+    players = [a, b]
+    frames = []
+    frame = 1
+    for _ in range(6):
+        frames.append((frame, 1, "blue", players, ball(0.0, 0.0)))
+        frame += 1
+    for _ in range(4):
+        frames.append((frame, None, None, players, None))
+        frame += 1
+    frames.append((frame, 2, "blue", players, ball(1500.0, 0.0)))
+    frame += 1
+    for ball_x in (900.0, 200.0, -400.0, -900.0):
+        frames.append((frame, 2, "blue", players, ball(ball_x, 0.0, source="predicted")))
+        frame += 1
+    metrics = run_frames(detector, frames)
+    assert_equal(metrics["total_passes"], 1, "predicted drift does not cancel the pass")
+    assert_equal(metrics["possession_gap_passes"], 1, "accepted from the possession gap")
+    assert_equal(metrics["discarded_direction_check"], 0, "prediction is not the trajectory")
+
+
 def test_missing_ball_still_respects_timeout_and_distance():
     timeout_detector = PassDetector()
     a = player(1, 0, 0.0, 0.0)
@@ -318,6 +342,7 @@ if __name__ == "__main__":
     test_first_possession_is_not_a_pass()
     test_confirms_pass_when_ball_disappears_between_possessors()
     test_predicted_ball_does_not_block_possession_pass()
+    test_predicted_drift_during_reception_does_not_cancel_pass()
     test_missing_ball_still_respects_timeout_and_distance()
     test_different_team_is_not_a_pass()
     print("pass detector tests passed")
