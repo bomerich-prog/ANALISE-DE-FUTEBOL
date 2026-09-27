@@ -2,6 +2,11 @@
 
 This module does not change PossessionEngine. It only consumes each frame's
 confirmed possessor and decides whether a same-team transfer is a real pass.
+
+A same-team pass can be confirmed from the possession states alone when the
+ball disappears between the donor and the receiver. Predicted or remembered
+ball positions are not a trajectory. A fully observed trajectory still has to
+agree with the receiver.
 """
 
 from __future__ import annotations
@@ -69,6 +74,20 @@ def _hold_radius(space):
     return HOLD_RADIUS_CM if space == "field" else HOLD_RADIUS_PX
 
 
+def _observed_ball_point(ball):
+    """Return a ball point only when this frame actually detected the ball.
+
+    Predicted and remembered positions keep possession alive elsewhere. They are
+    not evidence of the pass trajectory.
+    """
+    if not ball:
+        return None
+    source = ball.get("source")
+    if source is not None and source != "observed":
+        return None
+    return _point_from_entity(ball)
+
+
 def _team_of(snapshot, players, track_id):
     team = snapshot.current_possession_team if snapshot is not None else None
     if team in {"blue", "red"} and snapshot is not None and snapshot.current_possessor_track_id == track_id:
@@ -112,6 +131,8 @@ class PassDetector:
         self.discarded_unstable_possession = 0
         self.discarded_timeout = 0
         self.discarded_direction_check = 0
+        self.possession_gap_passes = 0
+        self.turnovers = 0
         self.events = []
 
     def metrics(self):
@@ -123,6 +144,8 @@ class PassDetector:
             "discarded_unstable_possession": self.discarded_unstable_possession,
             "discarded_timeout": self.discarded_timeout,
             "discarded_direction_check": self.discarded_direction_check,
+            "possession_gap_passes": self.possession_gap_passes,
+            "turnovers": self.turnovers,
             "events": list(self.events),
         }
 
@@ -133,16 +156,18 @@ class PassDetector:
         possessor_team = _team_of(snapshot, players, possessor_id)
         possessor_player = _find_player(players, possessor_id)
         possessor_pos = _point_from_entity(possessor_player)
-        ball_point = _point_from_entity(ball)
-        if ball_point is not None:
-            self.ball_history.append((frame_number, ball_point))
+        observed_ball = _observed_ball_point(ball)
+        if observed_ball is not None:
+            self.ball_history.append((frame_number, observed_ball))
 
         if self.pending is not None:
-            self._refresh_pending_radius(players, ball_point)
+            self._refresh_pending_radius(players, observed_ball)
+            if observed_ball is None:
+                self.pending["ball_missing_frames"] = int(self.pending.get("ball_missing_frames") or 0) + 1
 
         if possessor_id is None:
             if self.last_possessor_id is not None:
-                self._handle_loss(frame_number, ball_point)
+                self._handle_loss(frame_number, observed_ball)
             self.last_possessor_id = None
             self.last_possessor_team = None
             return self.metrics()
@@ -156,7 +181,7 @@ class PassDetector:
                 possessor_id,
                 possessor_team,
                 possessor_pos,
-                ball_point,
+                observed_ball,
             )
         else:
             self._handle_hold(frame_number, fps, possessor_id, possessor_team, possessor_pos)
@@ -187,6 +212,7 @@ class PassDetector:
             "gained_frame": None,
             "hold_frames": 0,
             "ball_left_radius": self._ball_left_donor_radius(self.last_possessor_pos, ball_point),
+            "ball_missing_frames": 0 if ball_point is not None else 1,
             "raw_counted": False,
         }
 
@@ -200,6 +226,7 @@ class PassDetector:
             self.pending = None
             return
         if self.pending.get("from_team") != possessor_team or possessor_team is None:
+            self._record_turnover(self.pending.get("from_team"), possessor_team)
             self.pending = None
             return
         self.raw_candidate_passes += 1
@@ -220,6 +247,7 @@ class PassDetector:
             and self.last_possessor_team == possessor_team
         )
         if not same_team:
+            self._record_turnover(self.last_possessor_team, possessor_team)
             self.pending = None
             return
         self.raw_candidate_passes += 1
@@ -234,6 +262,7 @@ class PassDetector:
             "gained_frame": int(frame_number),
             "hold_frames": 1,
             "ball_left_radius": self._ball_left_donor_radius(self.last_possessor_pos, ball_point),
+            "ball_missing_frames": 0 if ball_point is not None else 1,
             "raw_counted": True,
         }
         self._try_confirm(frame_number, fps)
@@ -270,6 +299,13 @@ class PassDetector:
             return
         if int(pending.get("hold_frames") or 0) < self.confirm_frames:
             return
+        trajectory_incomplete = int(pending.get("ball_missing_frames") or 0) > 0
+        if (
+            trajectory_incomplete
+            and not pending.get("ball_left_radius")
+            and self._receiver_outside_hold(pending)
+        ):
+            pending["ball_left_radius"] = True
         if not pending.get("ball_left_radius"):
             self._discard_pending("unstable")
             return
@@ -289,7 +325,7 @@ class PassDetector:
         if distance > self.max_distance_cm:
             self._discard_pending("long")
             return
-        if not self._direction_compatible(pending):
+        if not trajectory_incomplete and not self._direction_compatible(pending):
             self._discard_pending("direction")
             return
         event_pair = (int(pending["from_id"]), int(pending["to_id"]))
@@ -297,6 +333,8 @@ class PassDetector:
             self.pending = None
             return
         self.total_passes += 1
+        if trajectory_incomplete:
+            self.possession_gap_passes += 1
         self.last_event_pair = event_pair
         self.events.append(
             {
@@ -309,6 +347,16 @@ class PassDetector:
             }
         )
         self.pending = None
+
+    def _receiver_outside_hold(self, pending):
+        distance, space = _distance(pending.get("from_pos"), pending.get("to_pos"))
+        if distance is None:
+            return False
+        return distance > _hold_radius(space)
+
+    def _record_turnover(self, from_team, to_team):
+        if from_team in {"blue", "red"} and to_team in {"blue", "red"} and from_team != to_team:
+            self.turnovers += 1
 
     def _direction_compatible(self, pending):
         from_pos = pending.get("from_pos")
