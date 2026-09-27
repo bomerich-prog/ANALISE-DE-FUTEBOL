@@ -72,6 +72,8 @@ PHYSICAL_CONSECUTIVE_CONFIRMATIONS = 2
 PHYSICAL_RESET_AFTER_MISSING = 10
 PHYSICAL_HIGH_SPEED_THRESHOLD = 120.0
 BALL_DETECTOR_DEFAULT_CONFIDENCE = 0.25
+BALL_YOLO_RECALL_CONFIDENCE = 0.12
+BALL_STRONG_CONFIDENCE = 0.25
 BALL_DIAGNOSTIC_MIN_CONFIDENCE = 0.05
 PREDICTIVE_BALL_TRACKING_DEFAULT = os.getenv("PREDICTIVE_BALL_TRACKING", "on").strip().lower()
 if PREDICTIVE_BALL_TRACKING_DEFAULT not in {"on", "off"}:
@@ -1351,6 +1353,40 @@ def pick_detection_with_confidence_fusion(
     return accepted[0][1]
 
 
+def keep_recoverable_ball_candidates(
+    detections,
+    predicted_center,
+    strong_min_confidence=BALL_STRONG_CONFIDENCE,
+    weak_min_confidence=BALL_YOLO_RECALL_CONFIDENCE,
+    weak_max_distance_px=BALL_PREDICTION_NEAR_DISTANCE_PX,
+):
+    """Keep a low-confidence ball only when it continues the current track.
+
+    football-ball-detection.pt often scores a visible ball below 0.25 when the
+    ball is orange, blurred, or small after the 640 resize. Those boxes are
+    usable only next to the last ball. A distant box in the same range is a
+    stable false candidate on the test clip and must not replace the track.
+    """
+    if not detections:
+        return []
+    strong_min = float(strong_min_confidence)
+    strong = [detection for detection in detections if float(detection["confidence"]) >= strong_min]
+    if strong:
+        return strong
+    if predicted_center is None:
+        return []
+    predicted = np.asarray(predicted_center, dtype=np.float32)
+    kept = []
+    for detection in detections:
+        if float(detection["confidence"]) < float(weak_min_confidence):
+            continue
+        center = detection_center_np(detection["box"])
+        distance = float(np.linalg.norm(center - predicted))
+        if distance <= float(weak_max_distance_px):
+            kept.append(detection)
+    return kept
+
+
 def select_ball_detection_with_roi(detections, predicted_center, roi_radius_pixels):
     if not detections:
         return None, False, False
@@ -2217,6 +2253,11 @@ def analyze(args):
         if ball_diagnostics_enabled
         else BALL_DETECTOR_DEFAULT_CONFIDENCE
     )
+    if (
+        not ball_diagnostics_enabled
+        and str(args.ball_detector).strip().lower() == "yolo"
+    ):
+        ball_detector_confidence_for_run = BALL_YOLO_RECALL_CONFIDENCE
 
     player_model_path = resolve_player_model_path(args.model)
     if not player_model_path.exists():
@@ -2927,14 +2968,20 @@ def analyze(args):
             elif class_id == REFEREE_CLASS_ID:
                 referee_detections.append(detection_payload)
 
-        selection_ball_candidates = list(ball_detections_after_nms_dicts)
+        selection_ball_candidates = keep_recoverable_ball_candidates(
+            ball_detections_after_nms_dicts,
+            predicted_ball_center,
+        )
         if (
             hybrid_ball_search_enabled
             and detection_source_mode in {"semi_global", "full_global"}
             and not selection_ball_candidates
             and ball_detector_raw_dicts
         ):
-            selection_ball_candidates = list(ball_detector_raw_dicts)
+            selection_ball_candidates = keep_recoverable_ball_candidates(
+                ball_detector_raw_dicts,
+                predicted_ball_center,
+            )
 
         roi_radius_pixels = (
             max(BALL_ROI_MIN_RADIUS_PX, predictive_roi_size_used * 0.5)
