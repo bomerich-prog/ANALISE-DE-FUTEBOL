@@ -1402,6 +1402,70 @@ def keep_recoverable_ball_candidates(
     return distant_strong
 
 
+def select_player_ball_fallback(
+    ball_candidates,
+    predicted_center,
+    last_valid_detection,
+    max_distance_px=BALL_PREDICTION_NEAR_DISTANCE_PX,
+    min_confidence=BALL_STRONG_CONFIDENCE,
+):
+    """Continue an open ball track with the player detector's ball class.
+
+    The dedicated ball detector keeps its own result whenever it produced a
+    ball. This source is consulted only to fill that absence, and only when a
+    track and a pixel prediction already exist. A box farther than 80 px, or
+    below 0.25, is ignored, including the sideline false balls from the player
+    model. It never opens a track.
+    """
+    decision = {
+        "used": False,
+        "rejected_distance": False,
+        "rejected_confidence": False,
+        "confidence": None,
+        "distance": None,
+    }
+    if not ball_candidates:
+        return None, decision
+
+    min_confidence = float(min_confidence)
+    max_distance = float(max_distance_px)
+    if predicted_center is None or last_valid_detection is None:
+        has_strong_candidate = any(
+            float(candidate["confidence"]) >= min_confidence for candidate in ball_candidates
+        )
+        if has_strong_candidate:
+            decision["rejected_distance"] = True
+        else:
+            decision["rejected_confidence"] = True
+        return None, decision
+
+    predicted = np.asarray(predicted_center, dtype=np.float32)
+    eligible = []
+    saw_near_weak = False
+    for candidate in ball_candidates:
+        confidence = float(candidate["confidence"])
+        center = detection_center_np(candidate["box"])
+        distance = float(np.linalg.norm(center - predicted))
+        if distance <= max_distance and confidence >= min_confidence:
+            eligible.append((distance, -confidence, candidate))
+        elif distance <= max_distance:
+            saw_near_weak = True
+
+    if eligible:
+        eligible.sort(key=lambda item: (item[0], item[1]))
+        chosen = eligible[0][2]
+        decision["used"] = True
+        decision["confidence"] = float(chosen["confidence"])
+        decision["distance"] = float(eligible[0][0])
+        return chosen, decision
+
+    if saw_near_weak:
+        decision["rejected_confidence"] = True
+    else:
+        decision["rejected_distance"] = True
+    return None, decision
+
+
 def select_ball_detection_with_roi(
     detections,
     predicted_center,
@@ -2175,6 +2239,33 @@ def build_performance_profile_report(
                 "high_speed_threshold": float(physical_high_speed_threshold),
             },
         },
+        "ball_source": {
+            "primary_detector_frames": int(ball_tracking_metrics["primary_detector_frames"]),
+            "fallback_frames": int(ball_tracking_metrics["fallback_frames_used"]),
+            "neither_frames": int(ball_tracking_metrics["neither_detector_frames"]),
+        },
+        "ball_fallback": {
+            "frames_considered": int(ball_tracking_metrics["fallback_frames_considered"]),
+            "frames_used": int(ball_tracking_metrics["fallback_frames_used"]),
+            "frames_rejected_distance": int(
+                ball_tracking_metrics["fallback_frames_rejected_distance"]
+            ),
+            "frames_rejected_confidence": int(
+                ball_tracking_metrics["fallback_frames_rejected_confidence"]
+            ),
+            "average_confidence": (
+                float(ball_tracking_metrics["fallback_confidence_sum"])
+                / float(ball_tracking_metrics["fallback_frames_used"])
+                if int(ball_tracking_metrics["fallback_frames_used"]) > 0
+                else 0.0
+            ),
+            "average_distance": (
+                float(ball_tracking_metrics["fallback_distance_sum"])
+                / float(ball_tracking_metrics["fallback_frames_used"])
+                if int(ball_tracking_metrics["fallback_frames_used"]) > 0
+                else 0.0
+            ),
+        },
         "stages": stages,
         "top_5_slowest_stages": top_5_slowest_stages,
         "frame_total_seconds": frame_total_seconds,
@@ -2598,6 +2689,14 @@ def analyze(args):
         "physical_detection_distance_sum": 0.0,
         "physical_detection_distance_count": 0,
         "physical_detection_distance_max": 0.0,
+        "primary_detector_frames": 0,
+        "fallback_frames_used": 0,
+        "neither_detector_frames": 0,
+        "fallback_frames_considered": 0,
+        "fallback_frames_rejected_distance": 0,
+        "fallback_frames_rejected_confidence": 0,
+        "fallback_confidence_sum": 0.0,
+        "fallback_distance_sum": 0.0,
     }
     ball_diagnostics_state = {
         "enabled": ball_diagnostics_enabled,
@@ -2664,9 +2763,27 @@ def analyze(args):
             imgsz=args.imgsz,
             conf=args.conf,
             verbose=False,
-            classes=[GOALKEEPER_CLASS_ID, PLAYER_CLASS_ID, REFEREE_CLASS_ID],
         )[0]
-        tracked_human_detections = sv.Detections.from_ultralytics(result)
+        player_model_detections = sv.Detections.from_ultralytics(result)
+        player_ball_candidates = []
+        if (
+            len(player_model_detections) == 0
+            or player_model_detections.class_id is None
+        ):
+            tracked_human_detections = player_model_detections
+        else:
+            player_class_ids = np.asarray(player_model_detections.class_id)
+            player_ball_mask = player_class_ids == BALL_CLASS_ID
+            human_class_ids = np.asarray(
+                [GOALKEEPER_CLASS_ID, PLAYER_CLASS_ID, REFEREE_CLASS_ID],
+                dtype=player_class_ids.dtype,
+            )
+            human_mask = np.isin(player_class_ids, human_class_ids)
+            player_ball_candidates = ball_detections_to_dicts(
+                player_model_detections[player_ball_mask],
+                source_name="player-detector-ball",
+            )
+            tracked_human_detections = player_model_detections[human_mask]
         record_profile_stage(
             profile_state,
             "player_detection",
@@ -3109,6 +3226,36 @@ def analyze(args):
         else:
             physical_pending_candidate_state = None
 
+        used_player_ball_fallback = False
+        if selected_ball_detection is not None:
+            ball_tracking_metrics["primary_detector_frames"] += 1
+        else:
+            ball_tracking_metrics["fallback_frames_considered"] += 1
+            fallback_detection, fallback_decision = select_player_ball_fallback(
+                player_ball_candidates,
+                predicted_ball_center,
+                ball_last_valid_detection,
+            )
+            if fallback_decision["used"]:
+                selected_ball_detection = fallback_detection
+                used_player_ball_fallback = True
+                ball_tracking_metrics["fallback_frames_used"] += 1
+                ball_tracking_metrics["fallback_confidence_sum"] += float(
+                    fallback_decision["confidence"]
+                )
+                ball_tracking_metrics["fallback_distance_sum"] += float(
+                    fallback_decision["distance"]
+                )
+                # The dedicated detector left no ball. Drop its unconfirmed
+                # far candidate so it cannot replace this continuation later.
+                physical_pending_candidate_state = None
+            else:
+                if fallback_decision["rejected_distance"]:
+                    ball_tracking_metrics["fallback_frames_rejected_distance"] += 1
+                elif fallback_decision["rejected_confidence"]:
+                    ball_tracking_metrics["fallback_frames_rejected_confidence"] += 1
+                ball_tracking_metrics["neither_detector_frames"] += 1
+
         dedicated_ball_detections = ball_dicts_to_detections(
             [selected_ball_detection] if selected_ball_detection is not None else []
         )
@@ -3127,6 +3274,8 @@ def analyze(args):
             tracker_ball_detections = [selected_ball_detection]
         if tracker_ball_detections:
             selected_ball_detection = tracker_ball_detections[0]
+            if used_player_ball_fallback:
+                selected_ball_detection["source"] = "player-detector-ball"
         else:
             selected_ball_detection = None
 
