@@ -199,6 +199,92 @@ def test_first_possession_is_not_a_pass():
     assert_equal(metrics["total_passes"], 0, "no pass")
 
 
+def test_confirms_pass_when_ball_disappears_between_possessors():
+    detector = PassDetector()
+    a = player(1, 0, 0.0, 0.0)
+    b = player(2, 0, 1500.0, 0.0)
+    players = [a, b]
+    frames = []
+    frame = 1
+    for _ in range(8):
+        frames.append((frame, 1, "blue", players, ball(0.0, 0.0)))
+        frame += 1
+    for _ in range(10):
+        frames.append((frame, None, None, players, None))
+        frame += 1
+    for _ in range(5):
+        frames.append((frame, 2, "blue", players, ball(1500.0, 0.0)))
+        frame += 1
+    metrics = run_frames(detector, frames)
+    assert_equal(metrics["total_passes"], 1, "gap without trajectory is a pass")
+    assert_equal(metrics["possession_gap_passes"], 1, "counted from possession states")
+    assert_equal(metrics["discarded_direction_check"], 0, "missing trajectory is not a direction reject")
+    assert_equal(metrics["discarded_timeout"], 0, "gap stays inside one second")
+    assert_equal(metrics["events"][0]["from_track_id"], 1, "donor")
+    assert_equal(metrics["events"][0]["to_track_id"], 2, "receiver")
+
+
+def test_predicted_ball_does_not_block_possession_pass():
+    detector = PassDetector()
+    a = player(1, 0, 0.0, 0.0)
+    b = player(2, 0, 1800.0, 0.0)
+    players = [a, b]
+    frames = []
+    frame = 1
+    for _ in range(6):
+        frames.append((frame, 1, "blue", players, ball(0.0, 0.0)))
+        frame += 1
+    for ball_x in (-300.0, -700.0, -1200.0, -1600.0):
+        frames.append((frame, None, None, players, ball(ball_x, 0.0, source="predicted")))
+        frame += 1
+    for _ in range(5):
+        frames.append((frame, 2, "blue", players, ball(1800.0, 0.0)))
+        frame += 1
+    metrics = run_frames(detector, frames)
+    assert_equal(metrics["total_passes"], 1, "predicted flight does not veto the pass")
+    assert_equal(metrics["possession_gap_passes"], 1, "possession gap pass")
+    assert_equal(metrics["discarded_direction_check"], 0, "prediction is not a trajectory")
+    assert_equal(metrics["turnovers"], 0, "same team is not a turnover")
+
+
+def test_missing_ball_still_respects_timeout_and_distance():
+    timeout_detector = PassDetector()
+    a = player(1, 0, 0.0, 0.0)
+    b = player(2, 0, 1500.0, 0.0)
+    players = [a, b]
+    frames = []
+    frame = 1
+    for _ in range(6):
+        frames.append((frame, 1, "blue", players, ball(0.0, 0.0)))
+        frame += 1
+    for _ in range(30):
+        frames.append((frame, None, None, players, None))
+        frame += 1
+    for _ in range(5):
+        frames.append((frame, 2, "blue", players, ball(1500.0, 0.0)))
+        frame += 1
+    timeout_metrics = run_frames(timeout_detector, frames)
+    assert_equal(timeout_metrics["total_passes"], 0, "long disappearance is not a pass")
+    assert_equal(timeout_metrics["discarded_timeout"], 1, "timeout still applies")
+
+    long_detector = PassDetector()
+    far = player(2, 0, 7000.0, 0.0)
+    long_frames = []
+    frame = 1
+    for _ in range(6):
+        long_frames.append((frame, 1, "blue", [a, far], ball(0.0, 0.0)))
+        frame += 1
+    for _ in range(4):
+        long_frames.append((frame, None, None, [a, far], None))
+        frame += 1
+    for _ in range(5):
+        long_frames.append((frame, 2, "blue", [a, far], ball(7000.0, 0.0)))
+        frame += 1
+    long_metrics = run_frames(long_detector, long_frames)
+    assert_equal(long_metrics["total_passes"], 0, "over 60m is still rejected")
+    assert_equal(long_metrics["discarded_long_passes"], 1, "long counter")
+
+
 def test_different_team_is_not_a_pass():
     detector = PassDetector()
     a = player(1, 0, 0.0, 0.0)
@@ -218,6 +304,7 @@ def test_different_team_is_not_a_pass():
     metrics = run_frames(detector, frames)
     assert_equal(metrics["raw_candidate_passes"], 0, "turnover is not a pass")
     assert_equal(metrics["total_passes"], 0, "no pass")
+    assert_equal(metrics["turnovers"], 1, "other team is a turnover")
 
 
 if __name__ == "__main__":
@@ -229,5 +316,8 @@ if __name__ == "__main__":
     test_discards_incompatible_ball_direction()
     test_does_not_duplicate_same_pair()
     test_first_possession_is_not_a_pass()
+    test_confirms_pass_when_ball_disappears_between_possessors()
+    test_predicted_ball_does_not_block_possession_pass()
+    test_missing_ball_still_respects_timeout_and_distance()
     test_different_team_is_not_a_pass()
     print("pass detector tests passed")
