@@ -4000,6 +4000,12 @@ def analyze(args):
         "discarded_unstable_possession": int(pass_metrics["discarded_unstable_possession"]),
         "discarded_timeout": int(pass_metrics["discarded_timeout"]),
         "discarded_direction_check": int(pass_metrics["discarded_direction_check"]),
+        "possession_gap_passes": int(pass_metrics.get("possession_gap_passes", 0)),
+        "turnovers": int(pass_metrics.get("turnovers", 0)),
+        "disputes": int(pass_metrics.get("disputes", 0)),
+        "conductions": int(pass_metrics.get("conductions", 0)),
+        "unconfirmed_candidates": int(pass_metrics.get("unconfirmed_candidates", 0)),
+        "pass_score_threshold": int(pass_metrics.get("pass_score_threshold", 0)),
     }
     write_performance_profile_report(profile_report_path, profile_report)
     ball_diagnostics_report = None
