@@ -1,29 +1,40 @@
-"""Pass detector refinements on top of the existing possession snapshots.
+"""Possession-oriented pass detector.
 
-This module does not change PossessionEngine. It only consumes each frame's
-confirmed possessor and decides whether a same-team transfer is a real pass.
+The confirmed possessor is the event. Player A had the ball, possession may go
+empty, then player B is confirmed. That sequence is a pass, a turnover, a
+dispute, or a carry. An observed ball trajectory only raises or lowers the
+pass score. A missing trajectory does not veto the pass.
 
-A same-team pass can be confirmed from the possession states alone when the
-ball disappears between the donor and the receiver. Predicted or remembered
-ball positions are not a trajectory. A fully observed trajectory still has to
-agree with the receiver.
+PossessionEngine, the detectors, and the trackers are not modified. This
+module only reads each frame's possession snapshot.
 """
 
 from __future__ import annotations
 
 import math
 from collections import deque
-from typing import Optional
 
-from possession import HOLD_RADIUS_CM, HOLD_RADIUS_PX
+from possession import TEAM_NAME_BY_ID
 
 
-PASS_CONFIRM_FRAMES = 5
 PASS_MAX_GAP_SECONDS = 1.0
-PASS_MIN_DISTANCE_CM = 200.0
-PASS_MAX_DISTANCE_CM = 6000.0
+PASS_MIN_DISTANCE_CM = 150.0
+PASS_MAX_DISTANCE_CM = 7000.0
+PASS_SCORE_SAME_TEAM = 40
+PASS_SCORE_POSSESSOR_CHANGE = 30
+PASS_SCORE_SHORT_INTERVAL = 10
+PASS_SCORE_PLAUSIBLE_DISTANCE = 10
+PASS_SCORE_TRAJECTORY_COMPATIBLE = 10
+PASS_SCORE_TRAJECTORY_INCOMPATIBLE = -20
+PASS_SCORE_THRESHOLD = 80
 PASS_DIRECTION_MIN_MOTION_CM = 80.0
+PASS_DIRECTION_MIN_MOTION_PX = 20.0
+PASS_CONTEST_RADIUS_CM = 120.0
+PASS_CONTEST_RADIUS_PX = 45.0
 PASS_BALL_HISTORY = 32
+TURNOVER_BASE_SCORE = 70
+TURNOVER_TRAJECTORY_BONUS = 10
+TURNOVER_TRAJECTORY_PENALTY = -10
 
 
 def _safe_float(value):
@@ -70,12 +81,31 @@ def _distance(point_a, point_b):
     return math.hypot(point_a["x"] - point_b["x"], point_a["y"] - point_b["y"]), point_a["space"]
 
 
-def _hold_radius(space):
-    return HOLD_RADIUS_CM if space == "field" else HOLD_RADIUS_PX
+def _team_name_from_player(player):
+    if not player:
+        return None
+    team_id = player.get("team_id")
+    if team_id in TEAM_NAME_BY_ID:
+        return TEAM_NAME_BY_ID[team_id]
+    if team_id in ("0", "blue"):
+        return "blue"
+    if team_id in ("1", "red"):
+        return "red"
+    if team_id in {"blue", "red"}:
+        return team_id
+    return None
+
+
+def _team_of(snapshot, players, track_id):
+    if snapshot is not None and snapshot.current_possessor_track_id == track_id:
+        team = snapshot.current_possession_team
+        if team in {"blue", "red"}:
+            return team
+    return _team_name_from_player(_find_player(players, track_id))
 
 
 def _observed_ball_point(ball):
-    """Return a ball point only when this frame actually detected the ball.
+    """Use a ball point only when this frame detected the ball.
 
     Predicted and remembered positions keep possession alive elsewhere. They are
     not evidence of the pass trajectory.
@@ -88,42 +118,35 @@ def _observed_ball_point(ball):
     return _point_from_entity(ball)
 
 
-def _team_of(snapshot, players, track_id):
-    team = snapshot.current_possession_team if snapshot is not None else None
-    if team in {"blue", "red"} and snapshot is not None and snapshot.current_possessor_track_id == track_id:
-        return team
-    player = _find_player(players, track_id)
-    if not player:
-        return team if team in {"blue", "red"} else None
-    team_id = player.get("team_id")
-    if team_id in (0, "0", "blue"):
-        return "blue"
-    if team_id in (1, "1", "red"):
-        return "red"
-    return team if team in {"blue", "red"} else None
+def _contest_radius(space):
+    return PASS_CONTEST_RADIUS_CM if space == "field" else PASS_CONTEST_RADIUS_PX
+
+
+def _min_motion(space):
+    return PASS_DIRECTION_MIN_MOTION_CM if space == "field" else PASS_DIRECTION_MIN_MOTION_PX
 
 
 class PassDetector:
-    """Confirm same-team possession transfers that look like real passes."""
+    """Classify a confirmed possession change without requiring the ball path."""
 
     def __init__(
         self,
-        confirm_frames=PASS_CONFIRM_FRAMES,
         max_gap_seconds=PASS_MAX_GAP_SECONDS,
         min_distance_cm=PASS_MIN_DISTANCE_CM,
         max_distance_cm=PASS_MAX_DISTANCE_CM,
+        score_threshold=PASS_SCORE_THRESHOLD,
     ):
-        self.confirm_frames = int(confirm_frames)
         self.max_gap_seconds = float(max_gap_seconds)
         self.min_distance_cm = float(min_distance_cm)
         self.max_distance_cm = float(max_distance_cm)
+        self.score_threshold = int(score_threshold)
         self.ball_history = deque(maxlen=PASS_BALL_HISTORY)
         self.last_possessor_id = None
         self.last_possessor_team = None
         self.last_possessor_pos = None
         self.last_possessor_frame = None
+        self.recent_contest = False
         self.pending = None
-        self.last_event_pair = None
         self.total_passes = 0
         self.raw_candidate_passes = 0
         self.discarded_short_passes = 0
@@ -133,7 +156,13 @@ class PassDetector:
         self.discarded_direction_check = 0
         self.possession_gap_passes = 0
         self.turnovers = 0
+        self.disputes = 0
+        self.conductions = 0
+        self.unconfirmed_candidates = 0
         self.events = []
+        self.unconfirmed_events = []
+        self.turnover_events = []
+        self.dispute_events = []
 
     def metrics(self):
         return {
@@ -146,7 +175,14 @@ class PassDetector:
             "discarded_direction_check": self.discarded_direction_check,
             "possession_gap_passes": self.possession_gap_passes,
             "turnovers": self.turnovers,
+            "disputes": self.disputes,
+            "conductions": self.conductions,
+            "unconfirmed_candidates": self.unconfirmed_candidates,
+            "pass_score_threshold": self.score_threshold,
             "events": list(self.events),
+            "unconfirmed_events": list(self.unconfirmed_events),
+            "turnover_events": list(self.turnover_events),
+            "dispute_events": list(self.dispute_events),
         }
 
     def update(self, frame_number, fps, snapshot, players, ball):
@@ -161,243 +197,222 @@ class PassDetector:
             self.ball_history.append((frame_number, observed_ball))
 
         if self.pending is not None:
-            self._refresh_pending_radius(players, observed_ball)
             if observed_ball is None:
-                self.pending["ball_missing_frames"] = int(self.pending.get("ball_missing_frames") or 0) + 1
+                self.pending["ball_missing_frames"] += 1
+            elif _both_teams_on_ball(players, observed_ball):
+                self.pending["contested"] = True
 
         if possessor_id is None:
-            if self.last_possessor_id is not None:
-                self._handle_loss(frame_number, observed_ball)
-            self.last_possessor_id = None
-            self.last_possessor_team = None
+            if self.last_possessor_id is not None and self.pending is None:
+                self._open_pending(frame_number, observed_ball, players)
             return self.metrics()
 
-        if self.last_possessor_id is None:
-            self._handle_gain_from_empty(frame_number, fps, possessor_id, possessor_team, possessor_pos)
-        elif possessor_id != self.last_possessor_id:
-            self._handle_direct_switch(
-                frame_number,
-                fps,
-                possessor_id,
-                possessor_team,
-                possessor_pos,
-                observed_ball,
-            )
-        else:
-            self._handle_hold(frame_number, fps, possessor_id, possessor_team, possessor_pos)
+        if self.pending is None and self.last_possessor_id is None:
+            self._remember(possessor_id, possessor_team, possessor_pos, frame_number)
+            return self.metrics()
 
+        if self.pending is None and possessor_id == self.last_possessor_id:
+            self.recent_contest = bool(observed_ball is not None and _both_teams_on_ball(players, observed_ball))
+            self._remember(possessor_id, possessor_team, possessor_pos, frame_number)
+            return self.metrics()
+
+        if self.pending is None:
+            self._open_pending(frame_number, observed_ball, players)
+
+        if possessor_id == self.pending["from_id"]:
+            self.conductions += 1
+            self.pending = None
+            self._remember(possessor_id, possessor_team, possessor_pos, frame_number)
+            return self.metrics()
+
+        self._resolve(
+            frame_number,
+            fps,
+            possessor_id,
+            possessor_team,
+            possessor_pos,
+        )
+        self._remember(possessor_id, possessor_team, possessor_pos, frame_number)
+        return self.metrics()
+
+    def finalize(self):
+        self.pending = None
+        return self.metrics()
+
+    def _remember(self, possessor_id, possessor_team, possessor_pos, frame_number):
         self.last_possessor_id = possessor_id
         self.last_possessor_team = possessor_team
         if possessor_pos is not None:
             self.last_possessor_pos = possessor_pos
         self.last_possessor_frame = frame_number
-        return self.metrics()
 
-    def finalize(self):
-        if self.pending is not None and self.pending.get("to_id") is not None:
-            self._discard_pending("unstable")
+    def _open_pending(self, frame_number, observed_ball, players):
+        self.pending = {
+            "from_id": self.last_possessor_id,
+            "from_team": self.last_possessor_team,
+            "from_pos": self.last_possessor_pos,
+            "from_frame": int(self.last_possessor_frame or frame_number),
+            "lost_frame": int(frame_number),
+            "ball_missing_frames": 0 if observed_ball is not None else 1,
+            "contested": bool(self.recent_contest)
+            or bool(observed_ball is not None and _both_teams_on_ball(players, observed_ball)),
+        }
+        self.recent_contest = False
+
+    def _resolve(self, frame_number, fps, possessor_id, possessor_team, possessor_pos):
+        pending = self.pending
         self.pending = None
-        return self.metrics()
+        if pending is None or pending.get("from_id") is None:
+            return
 
-    def _handle_loss(self, frame_number, ball_point):
-        if self.pending is not None and self.pending.get("to_id") is not None:
-            self._discard_pending("unstable")
-        self.pending = {
-            "from_id": self.last_possessor_id,
-            "from_team": self.last_possessor_team,
-            "from_pos": self.last_possessor_pos,
-            "lost_frame": int(frame_number),
-            "to_id": None,
-            "to_team": None,
-            "gained_frame": None,
-            "hold_frames": 0,
-            "ball_left_radius": self._ball_left_donor_radius(self.last_possessor_pos, ball_point),
-            "ball_missing_frames": 0 if ball_point is not None else 1,
-            "raw_counted": False,
-        }
-
-    def _handle_gain_from_empty(self, frame_number, fps, possessor_id, possessor_team, possessor_pos):
-        if self.pending is None or self.pending.get("from_id") is None:
-            return
-        if self.pending.get("to_id") is not None:
-            self._discard_pending("unstable")
-            return
-        if possessor_id == self.pending["from_id"]:
-            self.pending = None
-            return
-        if self.pending.get("from_team") != possessor_team or possessor_team is None:
-            self._record_turnover(self.pending.get("from_team"), possessor_team)
-            self.pending = None
-            return
-        self.raw_candidate_passes += 1
-        self.pending["to_id"] = possessor_id
-        self.pending["to_team"] = possessor_team
-        self.pending["gained_frame"] = int(frame_number)
-        self.pending["hold_frames"] = 1
-        self.pending["raw_counted"] = True
-        if possessor_pos is not None:
-            self.pending["to_pos"] = possessor_pos
-        self._try_confirm(frame_number, fps)
-
-    def _handle_direct_switch(self, frame_number, fps, possessor_id, possessor_team, possessor_pos, ball_point):
-        if self.pending is not None and self.pending.get("to_id") is not None:
-            self._discard_pending("unstable")
-        same_team = (
-            self.last_possessor_team is not None
-            and self.last_possessor_team == possessor_team
-        )
-        if not same_team:
-            self._record_turnover(self.last_possessor_team, possessor_team)
-            self.pending = None
-            return
-        self.raw_candidate_passes += 1
-        self.pending = {
-            "from_id": self.last_possessor_id,
-            "from_team": self.last_possessor_team,
-            "from_pos": self.last_possessor_pos,
-            "lost_frame": int(frame_number),
-            "to_id": possessor_id,
-            "to_team": possessor_team,
-            "to_pos": possessor_pos,
-            "gained_frame": int(frame_number),
-            "hold_frames": 1,
-            "ball_left_radius": self._ball_left_donor_radius(self.last_possessor_pos, ball_point),
-            "ball_missing_frames": 0 if ball_point is not None else 1,
-            "raw_counted": True,
-        }
-        self._try_confirm(frame_number, fps)
-
-    def _handle_hold(self, frame_number, fps, possessor_id, possessor_team, possessor_pos):
-        if self.pending is None or self.pending.get("to_id") != possessor_id:
-            return
-        self.pending["hold_frames"] = int(self.pending.get("hold_frames") or 0) + 1
-        self.pending["to_team"] = possessor_team or self.pending.get("to_team")
-        if possessor_pos is not None:
-            self.pending["to_pos"] = possessor_pos
-        self._try_confirm(frame_number, fps)
-
-    def _refresh_pending_radius(self, players, ball_point):
-        pending = self.pending
-        if pending is None:
-            return
-        donor = _find_player(players, pending.get("from_id"))
-        donor_pos = _point_from_entity(donor) or pending.get("from_pos")
-        if donor_pos is not None:
-            pending["from_pos"] = donor_pos
-        if self._ball_left_donor_radius(pending.get("from_pos"), ball_point):
-            pending["ball_left_radius"] = True
-
-    def _ball_left_donor_radius(self, donor_pos, ball_point):
-        distance, space = _distance(donor_pos, ball_point)
-        if distance is None:
-            return False
-        return distance > _hold_radius(space)
-
-    def _try_confirm(self, frame_number, fps):
-        pending = self.pending
-        if pending is None or pending.get("to_id") is None:
-            return
-        if int(pending.get("hold_frames") or 0) < self.confirm_frames:
-            return
-        trajectory_incomplete = int(pending.get("ball_missing_frames") or 0) > 0
-        if (
-            trajectory_incomplete
-            and not pending.get("ball_left_radius")
-            and self._receiver_outside_hold(pending)
-        ):
-            pending["ball_left_radius"] = True
-        if not pending.get("ball_left_radius"):
-            self._discard_pending("unstable")
-            return
-        gained_frame = int(pending.get("gained_frame") or frame_number)
-        lost_frame = int(pending.get("lost_frame") or gained_frame)
+        gained_frame = int(frame_number)
+        lost_frame = int(pending["lost_frame"])
         gap_seconds = max(0, gained_frame - lost_frame) / fps
-        if gap_seconds > self.max_gap_seconds:
-            self._discard_pending("timeout")
-            return
-        distance, space = _distance(pending.get("from_pos"), pending.get("to_pos"))
-        if distance is None or space != "field":
-            self._discard_pending("unstable")
-            return
-        if distance < self.min_distance_cm:
-            self._discard_pending("short")
-            return
-        if distance > self.max_distance_cm:
-            self._discard_pending("long")
-            return
-        if not trajectory_incomplete and not self._direction_compatible(pending):
-            self._discard_pending("direction")
-            return
-        event_pair = (int(pending["from_id"]), int(pending["to_id"]))
-        if self.last_event_pair == event_pair:
-            self.pending = None
-            return
-        self.total_passes += 1
-        if trajectory_incomplete:
-            self.possession_gap_passes += 1
-        self.last_event_pair = event_pair
-        self.events.append(
-            {
-                "from_track_id": event_pair[0],
-                "to_track_id": event_pair[1],
-                "team": pending.get("to_team") or pending.get("from_team"),
-                "frame": int(frame_number),
-                "distance_cm": float(distance),
-                "gap_seconds": float(gap_seconds),
-            }
+        distance, space = _distance(pending.get("from_pos"), possessor_pos)
+        distance_cm = distance if space == "field" else None
+        trajectory = self._trajectory_label(
+            int(pending["from_frame"]),
+            gained_frame,
+            pending.get("from_pos"),
+            possessor_pos,
         )
-        self.pending = None
+        contested = bool(pending.get("contested"))
 
-    def _receiver_outside_hold(self, pending):
-        distance, space = _distance(pending.get("from_pos"), pending.get("to_pos"))
-        if distance is None:
-            return False
-        return distance > _hold_radius(space)
+        if contested:
+            self.disputes += 1
+            self.dispute_events.append(
+                {
+                    "type": "dispute",
+                    "from_track_id": int(pending["from_id"]),
+                    "to_track_id": int(possessor_id),
+                    "from_team": pending.get("from_team"),
+                    "to_team": possessor_team,
+                    "frame": gained_frame,
+                    "gap_seconds": float(gap_seconds),
+                }
+            )
+            return
 
-    def _record_turnover(self, from_team, to_team):
-        if from_team in {"blue", "red"} and to_team in {"blue", "red"} and from_team != to_team:
+        from_team = pending.get("from_team")
+        if from_team in {"blue", "red"} and possessor_team in {"blue", "red"} and from_team != possessor_team:
+            confidence = _turnover_confidence(trajectory)
             self.turnovers += 1
+            self.turnover_events.append(
+                {
+                    "type": "turnover",
+                    "from_track_id": int(pending["from_id"]),
+                    "to_track_id": int(possessor_id),
+                    "from_team": from_team,
+                    "to_team": possessor_team,
+                    "frame": gained_frame,
+                    "gap_seconds": float(gap_seconds),
+                    "distance_cm": None if distance_cm is None else float(distance_cm),
+                    "trajectory": trajectory,
+                    "confidence": confidence,
+                }
+            )
+            return
 
-    def _direction_compatible(self, pending):
-        from_pos = pending.get("from_pos")
-        to_pos = pending.get("to_pos")
+        if from_team not in {"blue", "red"} or possessor_team not in {"blue", "red"} or from_team != possessor_team:
+            self.discarded_unstable_possession += 1
+            return
+
+        self.raw_candidate_passes += 1
+        if gap_seconds > self.max_gap_seconds:
+            self.discarded_timeout += 1
+            return
+        if distance_cm is not None and distance_cm < self.min_distance_cm:
+            self.discarded_short_passes += 1
+            return
+        if distance_cm is not None and distance_cm > self.max_distance_cm:
+            self.discarded_long_passes += 1
+            return
+
+        distance_plausible = distance_cm is not None
+        score = _pass_score(
+            short_interval=True,
+            distance_plausible=distance_plausible,
+            trajectory=trajectory,
+        )
+        event = {
+            "type": "pass",
+            "from_track_id": int(pending["from_id"]),
+            "to_track_id": int(possessor_id),
+            "team": possessor_team,
+            "frame": gained_frame,
+            "distance_cm": None if distance_cm is None else float(distance_cm),
+            "gap_seconds": float(gap_seconds),
+            "trajectory": trajectory,
+            "confidence": int(score),
+        }
+        if score < self.score_threshold:
+            self.unconfirmed_candidates += 1
+            self.unconfirmed_events.append(event)
+            return
+
+        self.total_passes += 1
+        if int(pending.get("ball_missing_frames") or 0) > 0:
+            self.possession_gap_passes += 1
+        self.events.append(event)
+
+    def _trajectory_label(self, from_frame, gained_frame, from_pos, to_pos):
         if not from_pos or not to_pos or from_pos.get("space") != to_pos.get("space"):
-            return False
-        lost_frame = int(pending.get("lost_frame") or 0)
+            return "missing"
+        space = from_pos["space"]
         window = [
             point
             for frame, point in self.ball_history
-            if frame >= lost_frame and point.get("space") == from_pos["space"]
+            if from_frame <= int(frame) <= gained_frame and point.get("space") == space
         ]
         if len(window) < 2:
-            window = [point for _, point in self.ball_history if point.get("space") == from_pos["space"]]
-        if len(window) < 2:
-            return True
+            return "missing"
         motion_x = window[-1]["x"] - window[0]["x"]
         motion_y = window[-1]["y"] - window[0]["y"]
         motion_len = math.hypot(motion_x, motion_y)
+        if motion_len < _min_motion(space):
+            return "missing"
         to_receiver_x = to_pos["x"] - window[-1]["x"]
         to_receiver_y = to_pos["y"] - window[-1]["y"]
-        to_receiver_len = math.hypot(to_receiver_x, to_receiver_y)
-        min_motion = PASS_DIRECTION_MIN_MOTION_CM if from_pos["space"] == "field" else 20.0
-        if to_receiver_len <= min_motion:
-            return True
-        if motion_len < min_motion:
-            return True
-        return (motion_x * to_receiver_x + motion_y * to_receiver_y) >= 0.0
+        if math.hypot(to_receiver_x, to_receiver_y) <= _min_motion(space):
+            return "compatible"
+        if (motion_x * to_receiver_x) + (motion_y * to_receiver_y) >= 0.0:
+            return "compatible"
+        return "incompatible"
 
-    def _discard_pending(self, reason):
-        pending = self.pending
-        self.pending = None
-        if not pending or not pending.get("raw_counted"):
-            return
-        if reason == "short":
-            self.discarded_short_passes += 1
-        elif reason == "long":
-            self.discarded_long_passes += 1
-        elif reason == "timeout":
-            self.discarded_timeout += 1
-        elif reason == "direction":
-            self.discarded_direction_check += 1
-        else:
-            self.discarded_unstable_possession += 1
+
+def _both_teams_on_ball(players, ball_point):
+    if ball_point is None:
+        return False
+    radius = _contest_radius(ball_point["space"])
+    teams = set()
+    for player in players or []:
+        point = _point_from_entity(player)
+        distance, space = _distance(point, ball_point)
+        if distance is None or space != ball_point["space"] or distance > radius:
+            continue
+        team = _team_name_from_player(player)
+        if team in {"blue", "red"}:
+            teams.add(team)
+    return "blue" in teams and "red" in teams
+
+
+def _pass_score(short_interval, distance_plausible, trajectory):
+    score = PASS_SCORE_SAME_TEAM + PASS_SCORE_POSSESSOR_CHANGE
+    if short_interval:
+        score += PASS_SCORE_SHORT_INTERVAL
+    if distance_plausible:
+        score += PASS_SCORE_PLAUSIBLE_DISTANCE
+    if trajectory == "compatible":
+        score += PASS_SCORE_TRAJECTORY_COMPATIBLE
+    elif trajectory == "incompatible":
+        score += PASS_SCORE_TRAJECTORY_INCOMPATIBLE
+    return score
+
+
+def _turnover_confidence(trajectory):
+    score = TURNOVER_BASE_SCORE
+    if trajectory == "compatible":
+        score += TURNOVER_TRAJECTORY_BONUS
+    elif trajectory == "incompatible":
+        score += TURNOVER_TRAJECTORY_PENALTY
+    return score
