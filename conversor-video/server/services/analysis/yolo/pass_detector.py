@@ -5,6 +5,13 @@ empty, then player B is confirmed. That sequence is a pass, a turnover, a
 dispute, or a carry. An observed ball trajectory only raises or lowers the
 pass score. A missing trajectory does not veto the pass.
 
+Timing is judged on the ball flight, not on the empty-possession interval. A
+short flight log keeps, per frame, the observed ball and every player. Release
+is the last frame where A was within control radius of the observed ball, and
+arrival is the first later frame where B was. Every relation is measured inside
+one frame because the homography jitters between frames and moves players and
+ball together.
+
 PossessionEngine, the detectors, and the trackers are not modified. This
 module only reads each frame's possession snapshot.
 """
@@ -14,10 +21,18 @@ from __future__ import annotations
 import math
 from collections import deque
 
-from possession import TEAM_NAME_BY_ID
+from possession import CONTROL_RADIUS_CM, CONTROL_RADIUS_PX, TEAM_NAME_BY_ID
 
 
 PASS_MAX_GAP_SECONDS = 1.0
+PASS_MAX_FLIGHT_SECONDS = 4.0
+PASS_MIN_BALL_SPEED_CM_S = 800.0
+PASS_MAX_BALL_SPEED_CM_S = 4000.0
+PASS_RECEPTION_ALLOWANCE_SECONDS = 0.5
+PASS_MAX_RECEPTION_LAG_SECONDS = 1.0
+PASS_FLIGHT_LOG_SECONDS = 8.0
+PASS_INTERCEPT_MIN_SECONDS = 0.25
+PASS_INTERCEPT_MIN_FRAMES = 3
 PASS_MIN_DISTANCE_CM = 150.0
 PASS_MAX_DISTANCE_CM = 7000.0
 PASS_SCORE_SAME_TEAM = 40
@@ -26,15 +41,20 @@ PASS_SCORE_SHORT_INTERVAL = 10
 PASS_SCORE_PLAUSIBLE_DISTANCE = 10
 PASS_SCORE_TRAJECTORY_COMPATIBLE = 10
 PASS_SCORE_TRAJECTORY_INCOMPATIBLE = -20
+PASS_SCORE_UNVERIFIED_EXTENSION = -20
+PASS_EXTENDED_MIN_FLIGHT_SAMPLES = 2
 PASS_SCORE_THRESHOLD = 80
 PASS_DIRECTION_MIN_MOTION_CM = 80.0
 PASS_DIRECTION_MIN_MOTION_PX = 20.0
+PASS_TRAJECTORY_MIN_PROGRESS = 0.5
 PASS_CONTEST_RADIUS_CM = 120.0
 PASS_CONTEST_RADIUS_PX = 45.0
-PASS_BALL_HISTORY = 32
 TURNOVER_BASE_SCORE = 70
 TURNOVER_TRAJECTORY_BONUS = 10
 TURNOVER_TRAJECTORY_PENALTY = -10
+
+TIMING_BASE = "base"
+TIMING_EXTENDED = "extended"
 
 
 def _safe_float(value):
@@ -61,6 +81,33 @@ def _point_from_entity(entity):
     if pixel_x is not None and pixel_y is not None:
         return {"x": pixel_x, "y": pixel_y, "space": "pixel"}
     return None
+
+
+def _both_points(entity):
+    """Field and pixel point of one entity in one frame. Either may be None."""
+    if not entity:
+        return None
+    field_x = _safe_float(entity.get("field_x"))
+    field_y = _safe_float(entity.get("field_y"))
+    pixel_x = _safe_float(entity.get("x"))
+    pixel_y = _safe_float(entity.get("y"))
+    field = (field_x, field_y) if field_x is not None and field_y is not None else None
+    pixel = (pixel_x, pixel_y) if pixel_x is not None and pixel_y is not None else None
+    if field is None and pixel is None:
+        return None
+    return {"field": field, "pixel": pixel}
+
+
+def _inframe_distance(points_a, points_b):
+    """Distance between two entities of the same frame, field first, then pixel."""
+    if not points_a or not points_b:
+        return None, None
+    for space in ("field", "pixel"):
+        a = points_a.get(space)
+        b = points_b.get(space)
+        if a is not None and b is not None:
+            return math.hypot(a[0] - b[0], a[1] - b[1]), space
+    return None, None
 
 
 def _find_player(players, track_id):
@@ -104,16 +151,18 @@ def _team_of(snapshot, players, track_id):
     return _team_name_from_player(_find_player(players, track_id))
 
 
-def _observed_ball_point(ball):
-    """Use a ball point only when this frame detected the ball.
-
-    Predicted and remembered positions keep possession alive elsewhere. They are
+def _is_observed(ball):
+    """Predicted and remembered positions keep possession alive elsewhere. They are
     not evidence of the pass trajectory.
     """
     if not ball:
-        return None
+        return False
     source = ball.get("source")
-    if source is not None and source != "observed":
+    return source is None or source == "observed"
+
+
+def _observed_ball_point(ball):
+    if not _is_observed(ball):
         return None
     return _point_from_entity(ball)
 
@@ -122,8 +171,32 @@ def _contest_radius(space):
     return PASS_CONTEST_RADIUS_CM if space == "field" else PASS_CONTEST_RADIUS_PX
 
 
+def _control_radius(space):
+    return CONTROL_RADIUS_CM if space == "field" else CONTROL_RADIUS_PX
+
+
 def _min_motion(space):
     return PASS_DIRECTION_MIN_MOTION_CM if space == "field" else PASS_DIRECTION_MIN_MOTION_PX
+
+
+def _median(values):
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return 0.5 * (ordered[middle - 1] + ordered[middle])
+
+
+def max_flight_seconds(distance_cm):
+    """Longest plausible release-to-arrival time for a pass of this length.
+
+    A pass slower than PASS_MIN_BALL_SPEED_CM_S on average, plus the time the
+    receiver needs to settle the ball, is a loose ball rather than a pass.
+    """
+    if distance_cm is None:
+        return PASS_MAX_GAP_SECONDS
+    budget = distance_cm / PASS_MIN_BALL_SPEED_CM_S + PASS_RECEPTION_ALLOWANCE_SECONDS
+    return min(PASS_MAX_FLIGHT_SECONDS, max(PASS_MAX_GAP_SECONDS, budget))
 
 
 class PassDetector:
@@ -140,7 +213,7 @@ class PassDetector:
         self.min_distance_cm = float(min_distance_cm)
         self.max_distance_cm = float(max_distance_cm)
         self.score_threshold = int(score_threshold)
-        self.ball_history = deque(maxlen=PASS_BALL_HISTORY)
+        self.flight_log = deque()
         self.last_possessor_id = None
         self.last_possessor_team = None
         self.last_possessor_pos = None
@@ -154,6 +227,9 @@ class PassDetector:
         self.discarded_unstable_possession = 0
         self.discarded_timeout = 0
         self.discarded_direction_check = 0
+        self.discarded_intercepted = 0
+        self.discarded_implausible_speed = 0
+        self.extended_window_passes = 0
         self.possession_gap_passes = 0
         self.turnovers = 0
         self.disputes = 0
@@ -161,6 +237,7 @@ class PassDetector:
         self.unconfirmed_candidates = 0
         self.events = []
         self.unconfirmed_events = []
+        self.rejected_events = []
         self.turnover_events = []
         self.dispute_events = []
 
@@ -173,6 +250,9 @@ class PassDetector:
             "discarded_unstable_possession": self.discarded_unstable_possession,
             "discarded_timeout": self.discarded_timeout,
             "discarded_direction_check": self.discarded_direction_check,
+            "discarded_intercepted": self.discarded_intercepted,
+            "discarded_implausible_speed": self.discarded_implausible_speed,
+            "extended_window_passes": self.extended_window_passes,
             "possession_gap_passes": self.possession_gap_passes,
             "turnovers": self.turnovers,
             "disputes": self.disputes,
@@ -181,6 +261,7 @@ class PassDetector:
             "pass_score_threshold": self.score_threshold,
             "events": list(self.events),
             "unconfirmed_events": list(self.unconfirmed_events),
+            "rejected_events": list(self.rejected_events),
             "turnover_events": list(self.turnover_events),
             "dispute_events": list(self.dispute_events),
         }
@@ -193,8 +274,7 @@ class PassDetector:
         possessor_player = _find_player(players, possessor_id)
         possessor_pos = _point_from_entity(possessor_player)
         observed_ball = _observed_ball_point(ball)
-        if observed_ball is not None:
-            self.ball_history.append((frame_number, observed_ball))
+        self._log_frame(frame_number, fps, players, ball)
 
         if self.pending is not None:
             if observed_ball is None:
@@ -239,6 +319,28 @@ class PassDetector:
         self.pending = None
         return self.metrics()
 
+    def _log_frame(self, frame_number, fps, players, ball):
+        roster = {}
+        for player in players or []:
+            try:
+                track_id = int(player.get("track_id"))
+            except (TypeError, ValueError):
+                continue
+            points = _both_points(player)
+            if points is None:
+                continue
+            roster[track_id] = {"team": _team_name_from_player(player), "points": points}
+        self.flight_log.append(
+            {
+                "frame": frame_number,
+                "ball": _both_points(ball) if _is_observed(ball) else None,
+                "players": roster,
+            }
+        )
+        horizon = frame_number - int(math.ceil(PASS_FLIGHT_LOG_SECONDS * fps))
+        while self.flight_log and self.flight_log[0]["frame"] < horizon:
+            self.flight_log.popleft()
+
     def _remember(self, possessor_id, possessor_team, possessor_pos, frame_number):
         self.last_possessor_id = possessor_id
         self.last_possessor_team = possessor_team
@@ -265,14 +367,19 @@ class PassDetector:
         if pending is None or pending.get("from_id") is None:
             return
 
+        from_id = int(pending["from_id"])
+        to_id = int(possessor_id)
         gained_frame = int(frame_number)
         lost_frame = int(pending["lost_frame"])
         gap_seconds = max(0, gained_frame - lost_frame) / fps
-        distance, space = _distance(pending.get("from_pos"), possessor_pos)
-        distance_cm = distance if space == "field" else None
+        flight = self._flight_evidence(from_id, to_id, int(pending["from_frame"]), lost_frame, gained_frame, fps)
+        distance_cm, distance_source = self._pass_distance(
+            from_id, to_id, flight, pending.get("from_pos"), possessor_pos
+        )
         trajectory = self._trajectory_label(
-            int(pending["from_frame"]),
-            gained_frame,
+            to_id,
+            flight["window_start"],
+            flight["window_end"],
             pending.get("from_pos"),
             possessor_pos,
         )
@@ -283,8 +390,8 @@ class PassDetector:
             self.dispute_events.append(
                 {
                     "type": "dispute",
-                    "from_track_id": int(pending["from_id"]),
-                    "to_track_id": int(possessor_id),
+                    "from_track_id": from_id,
+                    "to_track_id": to_id,
                     "from_team": pending.get("from_team"),
                     "to_team": possessor_team,
                     "frame": gained_frame,
@@ -300,8 +407,8 @@ class PassDetector:
             self.turnover_events.append(
                 {
                     "type": "turnover",
-                    "from_track_id": int(pending["from_id"]),
-                    "to_track_id": int(possessor_id),
+                    "from_track_id": from_id,
+                    "to_track_id": to_id,
                     "from_team": from_team,
                     "to_team": possessor_team,
                     "frame": gained_frame,
@@ -318,66 +425,247 @@ class PassDetector:
             return
 
         self.raw_candidate_passes += 1
-        if gap_seconds > self.max_gap_seconds:
-            self.discarded_timeout += 1
-            return
-        if distance_cm is not None and distance_cm < self.min_distance_cm:
-            self.discarded_short_passes += 1
-            return
-        if distance_cm is not None and distance_cm > self.max_distance_cm:
-            self.discarded_long_passes += 1
-            return
-
-        distance_plausible = distance_cm is not None
-        score = _pass_score(
-            short_interval=True,
-            distance_plausible=distance_plausible,
-            trajectory=trajectory,
-        )
+        timing_seconds = gap_seconds
+        if flight["arrival_observed"] and flight["reception_lag_seconds"] <= PASS_MAX_RECEPTION_LAG_SECONDS:
+            timing_seconds = min(gap_seconds, flight["flight_seconds"])
+        max_timing = max_flight_seconds(distance_cm)
+        tier = TIMING_BASE if timing_seconds <= self.max_gap_seconds else TIMING_EXTENDED
+        implied_speed = self._implied_speed(flight, distance_cm, gained_frame, fps)
         event = {
             "type": "pass",
-            "from_track_id": int(pending["from_id"]),
-            "to_track_id": int(possessor_id),
+            "from_track_id": from_id,
+            "to_track_id": to_id,
             "team": possessor_team,
             "frame": gained_frame,
             "distance_cm": None if distance_cm is None else float(distance_cm),
+            "distance_source": distance_source,
             "gap_seconds": float(gap_seconds),
+            "release_frame": flight["release_frame"],
+            "arrival_frame": flight["arrival_frame"],
+            "flight_seconds": float(flight["flight_seconds"]),
+            "timing_seconds": float(timing_seconds),
+            "max_timing_seconds": float(max_timing),
+            "timing_tier": tier,
+            "in_flight_samples": flight["in_flight_samples"],
+            "implied_speed_mps": None if implied_speed is None else round(implied_speed / 100.0, 2),
             "trajectory": trajectory,
-            "confidence": int(score),
         }
+
+        if timing_seconds > max_timing:
+            self.discarded_timeout += 1
+            self._reject(event, "timeout")
+            return
+        if distance_cm is not None and distance_cm < self.min_distance_cm:
+            self.discarded_short_passes += 1
+            self._reject(event, "short")
+            return
+        if distance_cm is not None and distance_cm > self.max_distance_cm:
+            self.discarded_long_passes += 1
+            self._reject(event, "long")
+            return
+        if implied_speed is not None and implied_speed > PASS_MAX_BALL_SPEED_CM_S:
+            self.discarded_implausible_speed += 1
+            self._reject(event, "implausible_speed")
+            return
+        interceptor = self._interceptor(from_team, flight, fps)
+        if interceptor is not None:
+            self.discarded_intercepted += 1
+            event["interceptor_track_id"] = interceptor
+            self._reject(event, "intercepted")
+            return
+
+        components = _pass_score_components(
+            short_interval=tier == TIMING_BASE,
+            distance_plausible=distance_cm is not None,
+            trajectory=trajectory,
+            flight_verified=flight["in_flight_samples"] >= PASS_EXTENDED_MIN_FLIGHT_SAMPLES,
+        )
+        score = sum(components.values())
+        event["score_components"] = components
+        event["confidence"] = int(score)
         if score < self.score_threshold:
             self.unconfirmed_candidates += 1
             self.unconfirmed_events.append(event)
             return
 
         self.total_passes += 1
+        if tier == TIMING_EXTENDED:
+            self.extended_window_passes += 1
         if int(pending.get("ball_missing_frames") or 0) > 0:
             self.possession_gap_passes += 1
         self.events.append(event)
 
-    def _trajectory_label(self, from_frame, gained_frame, from_pos, to_pos):
+    def _reject(self, event, reason):
+        rejected = dict(event)
+        rejected["type"] = "rejected_pass"
+        rejected["reason"] = reason
+        self.rejected_events.append(rejected)
+
+    def _entries(self, first_frame, last_frame):
+        return [entry for entry in self.flight_log if first_frame <= entry["frame"] <= last_frame]
+
+    def _flight_evidence(self, from_id, to_id, from_frame, lost_frame, gained_frame, fps):
+        release_frame = None
+        for entry in reversed(self.flight_log):
+            if entry["frame"] > lost_frame:
+                continue
+            if _within_control(entry, from_id):
+                release_frame = entry["frame"]
+                break
+        release_observed = release_frame is not None
+        if release_frame is None:
+            release_frame = from_frame
+
+        arrival_frame = None
+        for entry in self._entries(release_frame + 1, gained_frame):
+            if _within_control(entry, to_id):
+                arrival_frame = entry["frame"]
+                break
+        arrival_observed = arrival_frame is not None
+        if arrival_frame is None:
+            arrival_frame = gained_frame
+        in_flight_samples = sum(
+            1 for entry in self._entries(release_frame + 1, arrival_frame - 1) if entry["ball"] is not None
+        )
+
+        return {
+            "release_frame": int(release_frame),
+            "arrival_frame": int(arrival_frame),
+            "release_observed": release_observed,
+            "arrival_observed": arrival_observed,
+            "flight_seconds": max(0, arrival_frame - release_frame) / fps,
+            "reception_lag_seconds": max(0, gained_frame - arrival_frame) / fps,
+            "in_flight_samples": int(in_flight_samples),
+            "window_start": int(min(release_frame, from_frame)),
+            "window_end": int(arrival_frame),
+        }
+
+    def _pass_distance(self, from_id, to_id, flight, from_pos, to_pos):
+        """A-to-B distance read inside one frame, so homography jitter cancels out."""
+        for frame in (flight["release_frame"], flight["arrival_frame"]):
+            entry = self._entry_at(frame)
+            if entry is None:
+                continue
+            a = entry["players"].get(from_id)
+            b = entry["players"].get(to_id)
+            distance, space = _inframe_distance(a and a["points"], b and b["points"])
+            if space == "field":
+                return distance, "same_frame"
+        distance, space = _distance(from_pos, to_pos)
+        if space == "field":
+            return distance, "cross_frame"
+        return None, None
+
+    def _entry_at(self, frame):
+        for entry in reversed(self.flight_log):
+            if entry["frame"] == frame:
+                return entry
+            if entry["frame"] < frame:
+                return None
+        return None
+
+    def _implied_speed(self, flight, distance_cm, gained_frame, fps):
+        """Ball speed needed to cover the pass, using the most generous time span."""
+        if distance_cm is None or not flight["release_observed"] or not flight["arrival_observed"]:
+            return None
+        frames = max(1, gained_frame - flight["release_frame"])
+        return distance_cm / (frames / fps)
+
+    def _interceptor(self, from_team, flight, fps):
+        """Opponent that stayed alone on the ball during the flight, if any."""
+        needed = max(PASS_INTERCEPT_MIN_FRAMES, int(math.ceil(PASS_INTERCEPT_MIN_SECONDS * fps)))
+        run_id = None
+        run_length = 0
+        for entry in self._entries(flight["release_frame"] + 1, flight["arrival_frame"] - 1):
+            nearest_id, nearest_team = _nearest_within_contest(entry)
+            if nearest_id is not None and nearest_team in {"Team 0", "Team 1"} and nearest_team != from_team:
+                run_length = run_length + 1 if nearest_id == run_id else 1
+                run_id = nearest_id
+                if run_length >= needed:
+                    return int(run_id)
+            elif entry["ball"] is not None:
+                run_id = None
+                run_length = 0
+        return None
+
+    def _trajectory_label(self, to_id, window_start, window_end, from_pos, to_pos):
+        """Did the observed ball get closer to the receiver during the flight?
+
+        Each sample is the ball-to-B distance inside one frame. The first and last
+        samples are medians, so one jittered frame cannot flip the label.
+        """
+        series = {"field": [], "pixel": []}
+        for entry in self._entries(window_start, window_end):
+            receiver = entry["players"].get(to_id)
+            if entry["ball"] is None or receiver is None:
+                continue
+            for space in ("field", "pixel"):
+                ball_point = entry["ball"].get(space)
+                receiver_point = receiver["points"].get(space)
+                if ball_point is not None and receiver_point is not None:
+                    series[space].append(
+                        math.hypot(ball_point[0] - receiver_point[0], ball_point[1] - receiver_point[1])
+                    )
+        for space in ("field", "pixel"):
+            samples = series[space]
+            if len(samples) < 2:
+                continue
+            k = max(1, min(3, len(samples) // 2))
+            start = _median(samples[:k])
+            end = _median(samples[-k:])
+            if start - end >= max(_min_motion(space), PASS_TRAJECTORY_MIN_PROGRESS * start):
+                return "compatible"
+            if end - start >= _min_motion(space):
+                return "incompatible"
+            return "missing"
+        return self._cross_frame_trajectory(window_start, window_end, from_pos, to_pos)
+
+    def _cross_frame_trajectory(self, window_start, window_end, from_pos, to_pos):
+        """Fallback when the receiver is not visible next to the ball."""
         if not from_pos or not to_pos or from_pos.get("space") != to_pos.get("space"):
             return "missing"
         space = from_pos["space"]
         window = [
-            point
-            for frame, point in self.ball_history
-            if from_frame <= int(frame) <= gained_frame and point.get("space") == space
+            entry["ball"][space]
+            for entry in self._entries(window_start, window_end)
+            if entry["ball"] is not None and entry["ball"].get(space) is not None
         ]
         if len(window) < 2:
             return "missing"
-        motion_x = window[-1]["x"] - window[0]["x"]
-        motion_y = window[-1]["y"] - window[0]["y"]
-        motion_len = math.hypot(motion_x, motion_y)
-        if motion_len < _min_motion(space):
+        motion_x = window[-1][0] - window[0][0]
+        motion_y = window[-1][1] - window[0][1]
+        if math.hypot(motion_x, motion_y) < _min_motion(space):
             return "missing"
-        to_receiver_x = to_pos["x"] - window[-1]["x"]
-        to_receiver_y = to_pos["y"] - window[-1]["y"]
+        to_receiver_x = to_pos["x"] - window[-1][0]
+        to_receiver_y = to_pos["y"] - window[-1][1]
         if math.hypot(to_receiver_x, to_receiver_y) <= _min_motion(space):
             return "compatible"
         if (motion_x * to_receiver_x) + (motion_y * to_receiver_y) >= 0.0:
             return "compatible"
         return "incompatible"
+
+
+def _within_control(entry, track_id):
+    player = entry["players"].get(track_id)
+    if entry["ball"] is None or player is None:
+        return False
+    distance, space = _inframe_distance(player["points"], entry["ball"])
+    return distance is not None and distance <= _control_radius(space)
+
+
+def _nearest_within_contest(entry):
+    if entry["ball"] is None:
+        return None, None
+    best = None
+    for track_id, player in entry["players"].items():
+        distance, space = _inframe_distance(player["points"], entry["ball"])
+        if distance is None or distance > _contest_radius(space):
+            continue
+        if best is None or distance < best[0]:
+            best = (distance, track_id, player["team"])
+    if best is None:
+        return None, None
+    return best[1], best[2]
 
 
 def _both_teams_on_ball(players, ball_point):
@@ -396,17 +684,22 @@ def _both_teams_on_ball(players, ball_point):
     return "Team 0" in teams and "Team 1" in teams
 
 
-def _pass_score(short_interval, distance_plausible, trajectory):
-    score = PASS_SCORE_SAME_TEAM + PASS_SCORE_POSSESSOR_CHANGE
-    if short_interval:
-        score += PASS_SCORE_SHORT_INTERVAL
-    if distance_plausible:
-        score += PASS_SCORE_PLAUSIBLE_DISTANCE
+def _pass_score_components(short_interval, distance_plausible, trajectory, flight_verified=False):
+    components = {
+        "same_team": PASS_SCORE_SAME_TEAM,
+        "possessor_change": PASS_SCORE_POSSESSOR_CHANGE,
+        "short_interval": PASS_SCORE_SHORT_INTERVAL if short_interval else 0,
+        "plausible_distance": PASS_SCORE_PLAUSIBLE_DISTANCE if distance_plausible else 0,
+        "trajectory": 0,
+        "unverified_extension": 0,
+    }
     if trajectory == "compatible":
-        score += PASS_SCORE_TRAJECTORY_COMPATIBLE
+        components["trajectory"] = PASS_SCORE_TRAJECTORY_COMPATIBLE
     elif trajectory == "incompatible":
-        score += PASS_SCORE_TRAJECTORY_INCOMPATIBLE
-    return score
+        components["trajectory"] = PASS_SCORE_TRAJECTORY_INCOMPATIBLE
+    if not short_interval and not (trajectory == "compatible" and flight_verified):
+        components["unverified_extension"] = PASS_SCORE_UNVERIFIED_EXTENSION
+    return components
 
 
 def _turnover_confidence(trajectory):

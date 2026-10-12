@@ -10,7 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server/services/an
 from pass_detector import PassDetector  # noqa: E402
 
 
-FPS = 25.0
+# Low enough that the synthetic 15 m passes stay under the physical ball-speed ceiling.
+FPS = 10.0
 
 
 def snapshot(track_id, team=None):
@@ -110,12 +111,156 @@ def test_ball_near_donor_does_not_veto_confirmed_reception():
     assert_equal(metrics["events"][0]["confidence"], 90, "missing trajectory keeps the medium score")
 
 
-def test_discards_timeout_over_one_second():
+def test_discards_flight_beyond_distance_budget():
     detector = PassDetector()
     frames, _lost = valid_pass_sequence(gap_none_frames=30, ball_xs=[400.0, 800.0, 1200.0, 1500.0])
     metrics = run_frames(detector, frames)
-    assert_equal(metrics["total_passes"], 0, "timed out")
+    assert_equal(metrics["total_passes"], 0, "3 s for 15 m is a loose ball")
     assert_equal(metrics["discarded_timeout"], 1, "timeout counter")
+    assert_equal(metrics["rejected_events"][0]["reason"], "timeout", "rejection reason")
+    assert_equal(metrics["rejected_events"][0]["max_timing_seconds"], 2.375, "15 m budget")
+
+
+def slow_pass_frames(distance=2300.0, flight_frames=16, ball_visible=True, field_jitter=None):
+    """A holds, the ball travels for flight_frames, then B is confirmed."""
+
+    def entity(track_id, team_id, x, frame):
+        offset = field_jitter[frame % len(field_jitter)] if field_jitter else 0.0
+        return {
+            "track_id": track_id,
+            "team_id": team_id,
+            "field_x": x + offset,
+            "field_y": offset * 0.5,
+            "x": x / 10.0,
+            "y": 0.0,
+        }
+
+    def ball_at(x, frame):
+        offset = field_jitter[frame % len(field_jitter)] if field_jitter else 0.0
+        return {"source": "observed", "field_x": x + offset, "field_y": offset * 0.5, "x": x / 10.0, "y": 0.0}
+
+    frames = []
+    frame = 1
+    for _ in range(8):
+        frames.append((frame, 1, "Team 0", [entity(1, 0, 0.0, frame), entity(2, 0, distance, frame)], ball_at(0.0, frame)))
+        frame += 1
+    for index in range(flight_frames):
+        players = [entity(1, 0, 0.0, frame), entity(2, 0, distance, frame)]
+        ball_state = ball_at(distance * (index + 1) / flight_frames, frame) if ball_visible else None
+        frames.append((frame, None, None, players, ball_state))
+        frame += 1
+    for _ in range(5):
+        frames.append((frame, 2, "Team 0", [entity(1, 0, 0.0, frame), entity(2, 0, distance, frame)], ball_at(distance, frame)))
+        frame += 1
+    return frames
+
+
+def test_extended_window_accepts_observed_slow_pass():
+    detector = PassDetector()
+    metrics = run_frames(detector, slow_pass_frames())
+    assert_equal(metrics["total_passes"], 1, "23 m in 1.6 s with an observed flight is a pass")
+    assert_equal(metrics["extended_window_passes"], 1, "accepted through the extended window")
+    assert_equal(metrics["discarded_timeout"], 0, "not a timeout")
+    event = metrics["events"][0]
+    assert_equal(event["timing_tier"], "extended", "tier")
+    assert_equal(event["trajectory"], "compatible", "in-frame progress toward B")
+    assert_equal(event["confidence"], 90, "no short-interval bonus, trajectory bonus kept")
+    assert_equal(event["score_components"]["unverified_extension"], 0, "flight was observed")
+    assert_equal(event["distance_source"], "same_frame", "distance read inside one frame")
+
+
+def test_extended_window_without_flight_evidence_stays_unconfirmed():
+    detector = PassDetector()
+    metrics = run_frames(detector, slow_pass_frames(ball_visible=False))
+    assert_equal(metrics["total_passes"], 0, "1.6 s with no ball seen is not enough evidence")
+    assert_equal(metrics["unconfirmed_candidates"], 1, "scored, then left unconfirmed")
+    event = metrics["unconfirmed_events"][0]
+    assert_equal(event["in_flight_samples"], 0, "no observed ball during the flight")
+    assert_equal(event["score_components"]["unverified_extension"], -20, "extension penalty")
+    assert_equal(event["confidence"], 70, "below the threshold")
+
+
+def test_flight_budget_scales_with_distance():
+    short_detector = PassDetector()
+    short_metrics = run_frames(short_detector, slow_pass_frames(distance=400.0, flight_frames=20))
+    assert_equal(short_metrics["total_passes"], 0, "4 m in 2 s is a loose ball")
+    assert_equal(short_metrics["discarded_timeout"], 1, "short pass keeps the 1 s budget")
+
+    long_detector = PassDetector()
+    long_metrics = run_frames(long_detector, slow_pass_frames(distance=3000.0, flight_frames=20))
+    assert_equal(long_metrics["total_passes"], 1, "30 m in 2 s is a pass")
+    assert_equal(long_metrics["events"][0]["max_timing_seconds"], 4.0, "30 m budget hits the ceiling")
+
+
+def test_reception_lag_does_not_count_as_flight():
+    detector = PassDetector()
+    a = player(1, 0, 0.0, 0.0)
+    b = player(2, 0, 1500.0, 0.0)
+    players = [a, b]
+    frames = []
+    frame = 1
+    for _ in range(8):
+        frames.append((frame, 1, "Team 0", players, ball(0.0, 0.0)))
+        frame += 1
+    for ball_x in (400.0, 800.0, 1100.0, 1400.0, 1450.0, 1480.0, 1500.0, 1500.0, 1500.0, 1500.0, 1500.0, 1500.0):
+        frames.append((frame, None, None, players, ball(ball_x, 0.0)))
+        frame += 1
+    for _ in range(5):
+        frames.append((frame, 2, "Team 0", players, ball(1500.0, 0.0)))
+        frame += 1
+    metrics = run_frames(detector, frames)
+    assert_equal(metrics["total_passes"], 1, "possession confirmation delay is not flight time")
+    event = metrics["events"][0]
+    assert_equal(event["gap_seconds"] > 1.0, True, "empty possession exceeded one second")
+    assert_equal(event["timing_tier"], "base", "the ball itself arrived in time")
+    assert_equal(event["confidence"], 100, "full score")
+
+
+def test_opponent_alone_on_the_ball_intercepts():
+    detector = PassDetector()
+    a = player(1, 0, 0.0, 0.0)
+    b = player(2, 0, 1500.0, 0.0)
+    opponent = player(7, 1, 750.0, 300.0)
+    players = [a, b, opponent]
+    frames = []
+    frame = 1
+    for _ in range(8):
+        frames.append((frame, 1, "Team 0", players, ball(0.0, 0.0)))
+        frame += 1
+    path = [(300.0, 100.0), (600.0, 250.0), (750.0, 300.0), (750.0, 300.0), (750.0, 300.0), (750.0, 300.0), (1000.0, 200.0), (1300.0, 50.0)]
+    for ball_x, ball_y in path:
+        frames.append((frame, None, None, players, ball(ball_x, ball_y)))
+        frame += 1
+    for _ in range(5):
+        frames.append((frame, 2, "Team 0", players, ball(1500.0, 0.0)))
+        frame += 1
+    metrics = run_frames(detector, frames)
+    assert_equal(metrics["total_passes"], 0, "the opponent touched the ball")
+    assert_equal(metrics["disputes"], 0, "one team on the ball is not a dispute")
+    assert_equal(metrics["discarded_intercepted"], 1, "interception counter")
+    assert_equal(metrics["rejected_events"][0]["interceptor_track_id"], 7, "interceptor")
+
+
+def test_ball_faster_than_physics_is_rejected():
+    detector = PassDetector()
+    a = player(1, 0, 0.0, 0.0)
+    b = player(2, 0, 6000.0, 0.0)
+    players = [a, b]
+    frames = [(frame, 1, "Team 0", players, ball(0.0, 0.0)) for frame in range(1, 7)]
+    frames.append((7, 2, "Team 0", players, ball(6000.0, 0.0)))
+    metrics = run_frames(detector, frames)
+    assert_equal(metrics["total_passes"], 0, "60 m in one frame is not a pass")
+    assert_equal(metrics["discarded_implausible_speed"], 1, "speed counter")
+
+
+def test_homography_jitter_does_not_break_trajectory_or_distance():
+    detector = PassDetector()
+    jitter = [0.0, 3000.0, -2500.0, 1800.0, -900.0, 2600.0, -3100.0]
+    metrics = run_frames(detector, slow_pass_frames(field_jitter=jitter))
+    assert_equal(metrics["total_passes"], 1, "per-frame jitter cancels inside each frame")
+    event = metrics["events"][0]
+    assert_equal(event["trajectory"], "compatible", "trajectory from in-frame distances")
+    assert_equal(round(event["distance_cm"]), 2300, "distance from one frame")
 
 
 def test_discards_short_and_long_passes():
@@ -176,8 +321,9 @@ def test_each_possession_transfer_is_its_own_pass():
     b = player(2, 0, 1500.0, 0.0)
     players = [a, b]
     frame = frames[-1][0] + 1
-    frames.append((frame, None, None, players, ball(800.0, 0.0)))
-    frame += 1
+    for ball_x in (1100.0, 700.0, 400.0, 100.0):
+        frames.append((frame, None, None, players, ball(ball_x, 0.0)))
+        frame += 1
     frames.append((frame, 1, "Team 0", players, ball(0.0, 0.0)))
     frame += 1
     frames.append((frame, 1, "Team 0", players, ball(0.0, 0.0)))
@@ -403,7 +549,14 @@ if __name__ == "__main__":
     test_confirms_stable_same_team_pass()
     test_confirmed_snapshot_is_enough()
     test_ball_near_donor_does_not_veto_confirmed_reception()
-    test_discards_timeout_over_one_second()
+    test_discards_flight_beyond_distance_budget()
+    test_extended_window_accepts_observed_slow_pass()
+    test_extended_window_without_flight_evidence_stays_unconfirmed()
+    test_flight_budget_scales_with_distance()
+    test_reception_lag_does_not_count_as_flight()
+    test_opponent_alone_on_the_ball_intercepts()
+    test_ball_faster_than_physics_is_rejected()
+    test_homography_jitter_does_not_break_trajectory_or_distance()
     test_discards_short_and_long_passes()
     test_discards_incompatible_ball_direction()
     test_each_possession_transfer_is_its_own_pass()
