@@ -4,6 +4,7 @@ const path = require('path');
 
 const { db, dataDir } = require('../../../db');
 const { AnalysisProvider, updateAnalysisProgress } = require('../AnalysisProvider');
+const { passProgressFromPayload } = require('./passProgress');
 const { resolvePythonCached } = require('./pythonResolver');
 
 const WINDOWS_STORE_ALIAS_HINT =
@@ -137,6 +138,8 @@ class YoloAnalysisProvider extends AnalysisProvider {
               },
             },
           };
+          const passes = passProgressFromPayload(payload);
+          if (passes) details.progress_stats.passes = passes;
           if (payload.debugFrameUpdated) {
             details.progress_stats.debug_frame_url = `/api/analyses/${analysisId}/debug-frame?t=${Date.now()}`;
             if (payload.debugFrameJpeg) {

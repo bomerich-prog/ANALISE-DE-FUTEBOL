@@ -3,24 +3,30 @@ import {
   getAnalysis,
   getLatestAnalysisForVideo,
 } from './analysisClient.js';
+import { countPassesByTeam } from './passCounts.js';
 import { ANALYSIS_STATUS, getAnalysisLabel } from './pipelineStatus.js';
 
 const POLL_INTERVAL_MS = 500;
 
-const modal = document.getElementById('analysisVisualization');
-const videoNameEl = document.getElementById('analysisVideoName');
-const statusTextEl = document.getElementById('analysisStatusText');
-const statusMessageEl = document.getElementById('analysisStatusMessage');
-const progressEl = document.getElementById('analysisViewerProgress');
-const progressTextEl = document.getElementById('analysisViewerProgressText');
-const possessionEl = document.getElementById('analysisPossessionTeam');
-const bluePassesEl = document.getElementById('analysisBluePasses');
-const redPassesEl = document.getElementById('analysisRedPasses');
-const turnoversEl = document.getElementById('analysisTurnovers');
-const ballEl = document.getElementById('analysisBallFound');
-const processedVideoEl = document.getElementById('analysisProcessedVideo');
-const liveFrameEl = document.getElementById('analysisLiveFrame');
-const placeholderEl = document.getElementById('analysisVideoPlaceholder');
+function byId(id) {
+  if (typeof document === 'undefined') return null;
+  return document.getElementById(id);
+}
+
+const modal = byId('analysisVisualization');
+const videoNameEl = byId('analysisVideoName');
+const statusTextEl = byId('analysisStatusText');
+const statusMessageEl = byId('analysisStatusMessage');
+const progressEl = byId('analysisViewerProgress');
+const progressTextEl = byId('analysisViewerProgressText');
+const possessionEl = byId('analysisPossessionTeam');
+const bluePassesEl = byId('analysisBluePasses');
+const redPassesEl = byId('analysisRedPasses');
+const turnoversEl = byId('analysisTurnovers');
+const ballEl = byId('analysisBallFound');
+const processedVideoEl = byId('analysisProcessedVideo');
+const liveFrameEl = byId('analysisLiveFrame');
+const placeholderEl = byId('analysisVideoPlaceholder');
 
 let pollTimer = null;
 let activeAnalysisId = null;
@@ -66,19 +72,28 @@ function possessionLabel(team) {
   return 'Aguardando análise';
 }
 
-function getEvents(analysis) {
+function backendPasses(analysis) {
+  const live = analysis?.progress_stats?.passes;
+  if (live && typeof live === 'object') return live;
+  const saved = analysis?.result_json?.passes;
+  if (saved && typeof saved === 'object') return saved;
+  return null;
+}
+
+export function getEvents(analysis) {
   const progressEvents = analysis?.progress_stats?.events || analysis?.events || {};
   const resultEvents = analysis?.result_json?.events || {};
   const metrics = analysis?.result_json?.metrics || {};
   const progressStats = analysis?.progress_stats || {};
+  const passes = countPassesByTeam(backendPasses(analysis));
 
   return {
     current_possessor_track_id:
       progressEvents.current_possessor_track_id ?? resultEvents.current_possessor_track_id ?? null,
     current_possession_team:
       progressEvents.current_possession_team ?? resultEvents.current_possession_team ?? null,
-    blue_passes: 0,
-    red_passes: 0,
+    blue_passes: passes.team0,
+    red_passes: passes.team1,
     turnovers: 0,
     ball_detected: Boolean(
       progressEvents.ball_detected ??
@@ -251,18 +266,20 @@ async function startAnalysisInVisualization(videoId) {
   }
 }
 
-document.querySelectorAll('[data-analysis-close]').forEach((el) => {
-  el.addEventListener('click', closeModal);
-});
+if (typeof document !== 'undefined') {
+  document.querySelectorAll('[data-analysis-close]').forEach((el) => {
+    el.addEventListener('click', closeModal);
+  });
 
-window.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape' && !modal?.classList.contains('hidden')) {
-    closeModal();
-  }
-});
+  window.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !modal?.classList.contains('hidden')) {
+      closeModal();
+    }
+  });
 
-window.addEventListener('analysis-visualization:open', (event) => {
-  openAnalysisVisualization(event.detail);
-});
+  window.addEventListener('analysis-visualization:open', (event) => {
+    openAnalysisVisualization(event.detail);
+  });
+}
 
-export { openAnalysisVisualization, startAnalysisInVisualization };
+export { openAnalysisVisualization, startAnalysisInVisualization, renderAnalysis };

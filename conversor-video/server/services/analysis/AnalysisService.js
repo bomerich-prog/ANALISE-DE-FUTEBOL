@@ -13,6 +13,7 @@ const {
   normalizeMatchEvents,
   toUserFacingAnalysisMessage,
 } = require('./matchEvents');
+const { passProgressFromPayload } = require('./yolo/passProgress');
 
 /**
  * Orquestrador de análises — ponto único de entrada para rotas e jobs.
@@ -45,6 +46,8 @@ class AnalysisService {
       ball_detected: Boolean(metrics.ball_detected),
       events: normalizeMatchEvents(result?.events),
     };
+    const passes = passProgressFromPayload({ passes: result?.passes });
+    if (passes) stats.passes = passes;
     if (result?.artifacts?.debug_live_frame_url) {
       stats.debug_frame_url = result.artifacts.debug_live_frame_url;
     }

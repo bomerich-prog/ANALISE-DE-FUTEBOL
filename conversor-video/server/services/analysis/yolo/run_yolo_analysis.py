@@ -3776,7 +3776,7 @@ def analyze(args):
         possession_changed = possession_events != last_possession_events
         last_possession_events = possession_events
         pass_detection_stage_start = time.perf_counter()
-        pass_detector.update(
+        pass_metrics_live = pass_detector.update(
             frame_number=current_frame_number,
             fps=fps,
             snapshot=possession_snapshot,
@@ -3904,6 +3904,10 @@ def analyze(args):
                 "playersDetected": max_players_detected,
                 "ballDetected": ball_detected or frame_ball,
                 "events": possession_events,
+                "passes": {
+                    "total_passes": int(pass_metrics_live["total_passes"]),
+                    "events": pass_metrics_live["events"],
+                },
                 "playerDetections": [
                     {
                         "track_id": int(detection.get("track_id", -1)),
@@ -4185,6 +4189,10 @@ def analyze(args):
             "playersDetected": max_players_detected,
             "ballDetected": ball_detected,
             "events": possession_engine.snapshot().as_dict(),
+            "passes": {
+                "total_passes": int(pass_metrics["total_passes"]),
+                "events": pass_metrics["events"],
+            },
         }
     )
     emit({"type": "result", "result": result})
