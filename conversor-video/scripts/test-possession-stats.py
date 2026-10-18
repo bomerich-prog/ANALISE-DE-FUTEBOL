@@ -45,6 +45,68 @@ def test_unknown_team_stays_without_possessor():
     assert_equal(report["frames_without_possessor"], 2, "unknown names have no possessor")
 
 
+def test_same_team_pass_reassigns_the_open_interval_once():
+    stats = PossessionTeamAccumulator(fps=10)
+    stats.observe("Team 1")
+    for _ in range(10):
+        during = stats.observe(None)
+    assert_equal(during["frames_without_possessor"], 10, "the flight stays open while the pass is unresolved")
+    assert_equal(during["frames_team_1"], 1, "only the confirmed frame counts before the pass")
+    confirmed = {
+        "type": "pass",
+        "team": "Team 1",
+        "from_track_id": 15,
+        "to_track_id": 11,
+    }
+    after = stats.observe("Team 1", [confirmed])
+    assert_equal(after["frames_team_1"], 12, "the 10 open frames join the confirmation frame and the start")
+    assert_equal(after["frames_without_possessor"], 0, "the open interval left the empty bucket")
+    assert_equal(after["frames_reassigned_team_1"], 10, "exactly the open interval was moved")
+    assert_equal(after["frames_total"], 12, "no frame was added twice")
+    again = stats.observe("Team 1", [confirmed])
+    assert_equal(again["frames_reassigned_team_1"], 10, "the same pass is not applied twice")
+    assert_equal(again["frames_without_possessor"], 0, "a repeated event list does not move frames again")
+
+
+def test_conduction_turnover_and_unconfirmed_keep_the_gap_empty():
+    for label, closing_team, events in (
+        ("conduction", "Team 1", None),
+        ("turnover", "Team 0", None),
+        ("unconfirmed", "Team 1", []),
+    ):
+        stats = PossessionTeamAccumulator(fps=10)
+        stats.observe("Team 1")
+        for _ in range(4):
+            stats.observe(None)
+        report = stats.observe(closing_team, events)
+        assert_equal(report["frames_reassigned_team_1"], 0, label)
+        assert_equal(report["frames_reassigned_team_0"], 0, label)
+        assert_equal(report["frames_without_possessor"], 4, label)
+
+
+def test_a_later_pass_does_not_reclaim_an_earlier_gap():
+    stats = PossessionTeamAccumulator(fps=10)
+    stats.observe("Team 1")
+    for _ in range(10):
+        stats.observe(None)
+    stats.observe("Team 1")
+    for _ in range(5):
+        stats.observe(None)
+    report = stats.observe("Team 1", [{"type": "pass", "team": "Team 1"}])
+    assert_equal(report["frames_reassigned_team_1"], 5, "only the gap closed by the pass moves")
+    assert_equal(report["frames_without_possessor"], 10, "the earlier conduction gap stays empty")
+
+
+def test_video_that_ends_open_keeps_the_gap_empty():
+    stats = PossessionTeamAccumulator(fps=30)
+    stats.observe("Team 0")
+    for _ in range(3):
+        report = stats.observe(None)
+    assert_equal(report["frames_team_0"], 1, "the opening possession stays")
+    assert_equal(report["frames_without_possessor"], 3, "an unfinished gap is not given to a team")
+    assert_equal(report["frames_reassigned_team_0"], 0, "nothing was reassigned")
+
+
 def test_missing_fps_still_counts_frames():
     stats = PossessionTeamAccumulator(fps=0)
     stats.observe("Team 1")
@@ -56,5 +118,9 @@ def test_missing_fps_still_counts_frames():
 if __name__ == "__main__":
     test_splits_confirmed_teams_and_empty_frames()
     test_unknown_team_stays_without_possessor()
+    test_same_team_pass_reassigns_the_open_interval_once()
+    test_conduction_turnover_and_unconfirmed_keep_the_gap_empty()
+    test_a_later_pass_does_not_reclaim_an_earlier_gap()
+    test_video_that_ends_open_keeps_the_gap_empty()
     test_missing_fps_still_counts_frames()
     print("possession stats tests passed")

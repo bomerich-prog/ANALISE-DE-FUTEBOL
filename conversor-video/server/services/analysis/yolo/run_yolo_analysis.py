@@ -3775,9 +3775,6 @@ def analyze(args):
         )
         possession_snapshot = possession_engine.update(possession_players, possession_ball)
         possession_events = possession_snapshot.as_dict()
-        possession_by_team_live = possession_team_stats.observe(
-            possession_snapshot.current_possession_team
-        )
         possession_changed = possession_events != last_possession_events
         last_possession_events = possession_events
         pass_detection_stage_start = time.perf_counter()
@@ -3787,6 +3784,10 @@ def analyze(args):
             snapshot=possession_snapshot,
             players=possession_players,
             ball=possession_ball,
+        )
+        possession_by_team_live = possession_team_stats.observe(
+            possession_snapshot.current_possession_team,
+            pass_metrics_live["events"],
         )
         record_profile_stage(
             profile_state,

@@ -62,6 +62,8 @@ assert.deepEqual(forwarded, {
   percent_team_0: 50,
   percent_team_1: 25,
   percent_without_possessor: 25,
+  frames_reassigned_team_0: 0,
+  frames_reassigned_team_1: 0,
 });
 assert.equal(possessionProgressFromPayload({ passes: saved }), null);
 

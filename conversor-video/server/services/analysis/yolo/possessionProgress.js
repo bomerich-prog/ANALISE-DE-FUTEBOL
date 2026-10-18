@@ -17,6 +17,8 @@ function possessionProgressFromPayload(payload) {
     percent_team_0: numeric(stats.percent_team_0),
     percent_team_1: numeric(stats.percent_team_1),
     percent_without_possessor: numeric(stats.percent_without_possessor),
+    frames_reassigned_team_0: numeric(stats.frames_reassigned_team_0),
+    frames_reassigned_team_1: numeric(stats.frames_reassigned_team_1),
   };
 }
 
