@@ -14,6 +14,11 @@ ball together.
 
 PossessionEngine, the detectors, and the trackers are not modified. This
 module only reads each frame's possession snapshot.
+
+A return to the same player is a carry. If a teammate met the observed ball
+inside the contest radius and the ball then left that teammate toward the
+original player, the carry is split into two passes. Each leg still has to
+clear the existing score. Possession confirmation is not involved.
 """
 
 from __future__ import annotations
@@ -55,6 +60,7 @@ TURNOVER_TRAJECTORY_PENALTY = -10
 
 TIMING_BASE = "base"
 TIMING_EXTENDED = "extended"
+_WALL_PHYSICAL_REJECTIONS = {"timeout", "short", "long", "implausible_speed", "intercepted"}
 
 
 def _safe_float(value):
@@ -234,6 +240,7 @@ class PassDetector:
         self.turnovers = 0
         self.disputes = 0
         self.conductions = 0
+        self.wall_passes = 0
         self.unconfirmed_candidates = 0
         self.events = []
         self.unconfirmed_events = []
@@ -257,6 +264,7 @@ class PassDetector:
             "turnovers": self.turnovers,
             "disputes": self.disputes,
             "conductions": self.conductions,
+            "wall_passes": self.wall_passes,
             "unconfirmed_candidates": self.unconfirmed_candidates,
             "pass_score_threshold": self.score_threshold,
             "events": list(self.events),
@@ -300,6 +308,10 @@ class PassDetector:
             self._open_pending(frame_number, observed_ball, players)
 
         if possessor_id == self.pending["from_id"]:
+            if self._apply_wall(frame_number, fps, possessor_team, possessor_pos):
+                self.pending = None
+                self._remember(possessor_id, possessor_team, possessor_pos, frame_number)
+                return self.metrics()
             self.conductions += 1
             self.pending = None
             self._remember(possessor_id, possessor_team, possessor_pos, frame_number)
@@ -424,19 +436,198 @@ class PassDetector:
             self.discarded_unstable_possession += 1
             return
 
-        self.raw_candidate_passes += 1
+        prepared = self._prepare_pass(
+            from_id,
+            to_id,
+            from_team,
+            possessor_team,
+            pending.get("from_pos"),
+            possessor_pos,
+            int(pending["from_frame"]),
+            lost_frame,
+            gained_frame,
+            fps,
+            wall=False,
+        )
+        self._record_prepared(prepared, pending.get("ball_missing_frames"))
+
+    def _apply_wall(self, frame_number, fps, possessor_team, possessor_pos):
+        """Split a same-player return into two passes when a teammate was the wall."""
+        pending = self.pending
+        if pending is None or pending.get("from_id") is None:
+            return False
+        wall = self._find_wall(pending, int(frame_number), fps)
+        if wall is None:
+            return False
+        from_id = int(pending["from_id"])
+        from_team = pending.get("from_team")
+        legs = (
+            self._prepare_pass(
+                from_id,
+                wall["id"],
+                from_team,
+                wall["team"],
+                pending.get("from_pos"),
+                wall["pos"],
+                int(pending["from_frame"]),
+                int(pending["lost_frame"]),
+                wall["frame"],
+                fps,
+                wall=True,
+            ),
+            self._prepare_pass(
+                wall["id"],
+                from_id,
+                wall["team"],
+                possessor_team,
+                wall["pos"],
+                possessor_pos,
+                wall["frame"],
+                wall["frame"],
+                int(frame_number),
+                fps,
+                wall=True,
+            ),
+        )
+        if any(leg["_status"] in _WALL_PHYSICAL_REJECTIONS for leg in legs):
+            return False
+        for leg in legs:
+            self._record_prepared(leg, pending.get("ball_missing_frames"))
+        return True
+
+    def _find_wall(self, pending, gained_frame, fps):
+        from_id = int(pending["from_id"])
+        from_team = pending.get("from_team")
+        if from_team not in {"Team 0", "Team 1"} or pending.get("contested"):
+            return None
+        release_frame = self._release_frame(from_id, int(pending["lost_frame"]), int(pending["from_frame"]))
+        if self._opponent_owns_ball(from_team, release_frame, gained_frame, fps):
+            return None
+
+        closest = {}
+        for entry in self._entries(release_frame + 1, gained_frame - 1):
+            if entry["ball"] is None or _entry_both_teams(entry):
+                if _entry_both_teams(entry):
+                    return None
+                continue
+            nearest_id, nearest_team = _nearest_within_contest(entry)
+            if nearest_id is None or nearest_id == from_id or nearest_team != from_team:
+                continue
+            player = entry["players"].get(nearest_id)
+            distance, _space = _inframe_distance(player["points"], entry["ball"])
+            if distance is None:
+                continue
+            current = closest.get(nearest_id)
+            if current is None or distance < current["distance"]:
+                closest[nearest_id] = {
+                    "frame": entry["frame"],
+                    "distance": distance,
+                    "points": player["points"],
+                }
+        if not closest:
+            return None
+        wall_id, info = min(closest.items(), key=lambda item: item[1]["distance"])
+        if not self._ball_approaches_and_leaves(from_id, wall_id, release_frame, info["frame"], gained_frame):
+            return None
+        return {
+            "id": int(wall_id),
+            "team": from_team,
+            "frame": int(info["frame"]),
+            "pos": _point_from_logged(info["points"]),
+        }
+
+    def _release_frame(self, from_id, lost_frame, from_frame):
+        for entry in reversed(self.flight_log):
+            if entry["frame"] > lost_frame:
+                continue
+            if _within_control(entry, from_id):
+                return entry["frame"]
+        return from_frame
+
+    def _opponent_owns_ball(self, from_team, first_frame, last_frame, fps):
+        needed = max(PASS_INTERCEPT_MIN_FRAMES, int(math.ceil(PASS_INTERCEPT_MIN_SECONDS * fps)))
+        run_id = None
+        run_length = 0
+        for entry in self._entries(first_frame, last_frame):
+            if entry["ball"] is None:
+                continue
+            nearest_id, nearest_team = _nearest_within_contest(entry)
+            opponent = nearest_id is not None and nearest_team in {"Team 0", "Team 1"} and nearest_team != from_team
+            if opponent:
+                run_length = run_length + 1 if nearest_id == run_id else 1
+                run_id = nearest_id
+                if run_length >= needed:
+                    return True
+            else:
+                run_id = None
+                run_length = 0
+        return False
+
+    def _ball_approaches_and_leaves(self, from_id, wall_id, release_frame, touch_frame, gained_frame):
+        to_wall = self._distance_series(wall_id, release_frame, gained_frame)
+        to_carrier = self._distance_series(from_id, touch_frame, gained_frame)
+        touch = [sample for sample in to_wall if sample[0] == touch_frame]
+        before = [sample[1] for sample in to_wall if sample[0] < touch_frame]
+        after = [sample[1] for sample in to_wall if sample[0] > touch_frame]
+        if not touch or not before or not after or len(to_carrier) < 2:
+            return False
+        motion = _min_motion(touch[0][2])
+        approached = before[0] - touch[0][1] >= motion
+        left_wall = after[-1] - touch[0][1] >= motion
+        toward_carrier = to_carrier[0][1] - to_carrier[-1][1] >= motion
+        return approached and left_wall and toward_carrier
+
+    def _distance_series(self, track_id, first_frame, last_frame):
+        samples = []
+        for entry in self._entries(first_frame, last_frame):
+            player = entry["players"].get(track_id)
+            if entry["ball"] is None or player is None:
+                continue
+            distance, space = _inframe_distance(player["points"], entry["ball"])
+            if distance is None:
+                continue
+            samples.append((entry["frame"], distance, space))
+        field = [sample for sample in samples if sample[2] == "field"]
+        return field or samples
+
+    def _prepare_pass(
+        self,
+        from_id,
+        to_id,
+        from_team,
+        possessor_team,
+        from_pos,
+        possessor_pos,
+        from_frame,
+        lost_frame,
+        gained_frame,
+        fps,
+        wall,
+    ):
+        gap_seconds = max(0, int(gained_frame) - int(lost_frame)) / fps
+        flight = self._flight_evidence(from_id, to_id, int(from_frame), int(lost_frame), int(gained_frame), fps)
+        distance_cm, distance_source = self._pass_distance(
+            from_id, to_id, flight, from_pos, possessor_pos
+        )
+        trajectory = self._trajectory_label(
+            to_id,
+            flight["window_start"],
+            flight["window_end"],
+            from_pos,
+            possessor_pos,
+        )
         timing_seconds = gap_seconds
         if flight["arrival_observed"] and flight["reception_lag_seconds"] <= PASS_MAX_RECEPTION_LAG_SECONDS:
             timing_seconds = min(gap_seconds, flight["flight_seconds"])
         max_timing = max_flight_seconds(distance_cm)
         tier = TIMING_BASE if timing_seconds <= self.max_gap_seconds else TIMING_EXTENDED
-        implied_speed = self._implied_speed(flight, distance_cm, gained_frame, fps)
+        implied_speed = self._implied_speed(flight, distance_cm, int(gained_frame), fps)
         event = {
             "type": "pass",
             "from_track_id": from_id,
             "to_track_id": to_id,
             "team": possessor_team,
-            "frame": gained_frame,
+            "frame": int(gained_frame),
             "distance_cm": None if distance_cm is None else float(distance_cm),
             "distance_source": distance_source,
             "gap_seconds": float(gap_seconds),
@@ -450,29 +641,26 @@ class PassDetector:
             "implied_speed_mps": None if implied_speed is None else round(implied_speed / 100.0, 2),
             "trajectory": trajectory,
         }
+        if wall:
+            event["wall"] = True
 
         if timing_seconds > max_timing:
-            self.discarded_timeout += 1
-            self._reject(event, "timeout")
-            return
+            event["_status"] = "timeout"
+            return event
         if distance_cm is not None and distance_cm < self.min_distance_cm:
-            self.discarded_short_passes += 1
-            self._reject(event, "short")
-            return
+            event["_status"] = "short"
+            return event
         if distance_cm is not None and distance_cm > self.max_distance_cm:
-            self.discarded_long_passes += 1
-            self._reject(event, "long")
-            return
+            event["_status"] = "long"
+            return event
         if implied_speed is not None and implied_speed > PASS_MAX_BALL_SPEED_CM_S:
-            self.discarded_implausible_speed += 1
-            self._reject(event, "implausible_speed")
-            return
+            event["_status"] = "implausible_speed"
+            return event
         interceptor = self._interceptor(from_team, flight, fps)
         if interceptor is not None:
-            self.discarded_intercepted += 1
             event["interceptor_track_id"] = interceptor
-            self._reject(event, "intercepted")
-            return
+            event["_status"] = "intercepted"
+            return event
 
         components = _pass_score_components(
             short_interval=tier == TIMING_BASE,
@@ -483,17 +671,38 @@ class PassDetector:
         score = sum(components.values())
         event["score_components"] = components
         event["confidence"] = int(score)
-        if score < self.score_threshold:
-            self.unconfirmed_candidates += 1
-            self.unconfirmed_events.append(event)
-            return
+        event["_status"] = "pass" if score >= self.score_threshold else "unconfirmed"
+        return event
 
-        self.total_passes += 1
-        if tier == TIMING_EXTENDED:
-            self.extended_window_passes += 1
-        if int(pending.get("ball_missing_frames") or 0) > 0:
-            self.possession_gap_passes += 1
-        self.events.append(event)
+    def _record_prepared(self, prepared, ball_missing_frames):
+        status = prepared.pop("_status")
+        self.raw_candidate_passes += 1
+        if status == "pass":
+            self.total_passes += 1
+            if prepared.get("timing_tier") == TIMING_EXTENDED:
+                self.extended_window_passes += 1
+            if int(ball_missing_frames or 0) > 0:
+                self.possession_gap_passes += 1
+            if prepared.get("wall"):
+                self.wall_passes += 1
+            self.events.append(prepared)
+            return status
+        if status == "unconfirmed":
+            self.unconfirmed_candidates += 1
+            self.unconfirmed_events.append(prepared)
+            return status
+        if status == "timeout":
+            self.discarded_timeout += 1
+        elif status == "short":
+            self.discarded_short_passes += 1
+        elif status == "long":
+            self.discarded_long_passes += 1
+        elif status == "implausible_speed":
+            self.discarded_implausible_speed += 1
+        elif status == "intercepted":
+            self.discarded_intercepted += 1
+        self._reject(prepared, status)
+        return status
 
     def _reject(self, event, reason):
         rejected = dict(event)
@@ -651,6 +860,31 @@ def _within_control(entry, track_id):
         return False
     distance, space = _inframe_distance(player["points"], entry["ball"])
     return distance is not None and distance <= _control_radius(space)
+
+
+def _point_from_logged(points):
+    if not points:
+        return None
+    field = points.get("field")
+    if field is not None:
+        return {"x": field[0], "y": field[1], "space": "field"}
+    pixel = points.get("pixel")
+    if pixel is not None:
+        return {"x": pixel[0], "y": pixel[1], "space": "pixel"}
+    return None
+
+
+def _entry_both_teams(entry):
+    if not entry or entry.get("ball") is None:
+        return False
+    teams = set()
+    for player in entry["players"].values():
+        distance, space = _inframe_distance(player["points"], entry["ball"])
+        if distance is None or distance > _contest_radius(space):
+            continue
+        if player.get("team") in {"Team 0", "Team 1"}:
+            teams.add(player["team"])
+    return "Team 0" in teams and "Team 1" in teams
 
 
 def _nearest_within_contest(entry):

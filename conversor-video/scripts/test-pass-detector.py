@@ -8,6 +8,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server/services/analysis/yolo"))
 
 from pass_detector import PassDetector  # noqa: E402
+from possession import POSSESSION_CONFIRM_FRAMES  # noqa: E402
 
 
 # Low enough that the synthetic 15 m passes stay under the physical ball-speed ceiling.
@@ -522,6 +523,88 @@ def test_same_player_return_is_a_carry():
     assert_equal(metrics["turnovers"], 0, "a carry is not a turnover")
 
 
+def one_two_frames(wall_x, ball_xs, opponent=None):
+    carrier = player(1, 0, 0.0, 0.0)
+    wall = player(2, 0, wall_x, 0.0)
+    players = [carrier, wall]
+    if opponent is not None:
+        players.append(opponent)
+    frames = []
+    frame = 1
+    for _ in range(6):
+        frames.append((frame, 1, "Team 0", players, ball(0.0, 0.0)))
+        frame += 1
+    for ball_x in ball_xs:
+        frames.append((frame, None, None, players, ball(ball_x, 0.0)))
+        frame += 1
+    for _ in range(4):
+        frames.append((frame, 1, "Team 0", players, ball(0.0, 0.0)))
+        frame += 1
+    return frames
+
+
+def test_wall_pass_becomes_two_passes():
+    detector = PassDetector()
+    metrics = run_frames(detector, one_two_frames(800.0, [400.0, 800.0, 800.0, 400.0]))
+    pairs = [(event["from_track_id"], event["to_track_id"]) for event in metrics["events"]]
+    assert_equal(pairs, [(1, 2), (2, 1)], "a wall is a pass each way")
+    assert_equal(metrics["total_passes"], 2, "two passes")
+    assert_equal(metrics["wall_passes"], 2, "both legs are wall passes")
+    assert_equal(metrics["conductions"], 0, "the return is not a carry")
+    assert_equal(all(event.get("wall") for event in metrics["events"]), True, "events are marked")
+    assert_equal(all(event["confidence"] >= 80 for event in metrics["events"]), True, "both legs clear the score")
+    assert_equal(POSSESSION_CONFIRM_FRAMES, 5, "possession confirmation stays at five frames")
+
+
+def test_same_player_recovery_without_a_wall_stays_a_carry():
+    detector = PassDetector()
+    metrics = run_frames(detector, one_two_frames(5000.0, [400.0, 700.0, 400.0]))
+    assert_equal(metrics["total_passes"], 0, "a far teammate is not a wall")
+    assert_equal(metrics["wall_passes"], 0, "no wall pass")
+    assert_equal(metrics["conductions"], 1, "A recovering the ball is a carry")
+    assert_equal(metrics["events"], [], "no invented pass")
+
+
+def test_opponent_on_the_ball_is_not_a_wall():
+    detector = PassDetector()
+    opponent = player(7, 1, 800.0, 0.0)
+    metrics = run_frames(
+        detector,
+        one_two_frames(1600.0, [800.0, 800.0, 800.0, 800.0], opponent=opponent),
+    )
+    assert_equal(metrics["total_passes"], 0, "an opponent on the ball is not a wall")
+    assert_equal(metrics["wall_passes"], 0, "no wall pass")
+    assert_equal(metrics["conductions"], 1, "the return stays a carry")
+    assert_equal(metrics["events"], [], "a dispute does not create passes")
+
+
+def test_teammate_outside_contest_radius_is_not_a_wall():
+    detector = PassDetector()
+    metrics = run_frames(detector, one_two_frames(800.0, [300.0, 650.0, 300.0]))
+    assert_equal(metrics["total_passes"], 0, "150 cm from the ball is not a touch")
+    assert_equal(metrics["wall_passes"], 0, "no wall pass")
+    assert_equal(metrics["conductions"], 1, "a pass without a wall stays a carry")
+
+
+def test_wall_leg_below_the_score_is_not_created():
+    detector = PassDetector(score_threshold=101)
+    metrics = run_frames(detector, one_two_frames(800.0, [400.0, 800.0, 400.0]))
+    assert_equal(metrics["total_passes"], 0, "a leg under the score is not a pass")
+    assert_equal(metrics["events"], [], "nothing is invented")
+    assert_equal(metrics["unconfirmed_candidates"], 2, "both legs stay unconfirmed")
+    assert_equal(metrics["conductions"], 0, "the wall was still recognized")
+
+
+def test_one_frame_wall_touch_is_still_two_passes():
+    detector = PassDetector()
+    metrics = run_frames(detector, one_two_frames(800.0, [400.0, 800.0, 400.0]))
+    pairs = [(event["from_track_id"], event["to_track_id"]) for event in metrics["events"]]
+    assert_equal(pairs, [(1, 2), (2, 1)], "one observed touch is enough")
+    assert_equal(metrics["total_passes"], 2, "the short touch still makes two passes")
+    assert_equal(metrics["conductions"], 0, "the short touch is not a carry")
+    assert_equal(metrics["events"][0]["in_flight_samples"] >= 1, True, "the ball was seen between the players")
+
+
 def test_both_teams_on_the_ball_is_a_dispute():
     detector = PassDetector()
     donor = player(1, 0, 0.0, 0.0)
@@ -568,5 +651,11 @@ if __name__ == "__main__":
     test_different_team_is_not_a_pass()
     test_dispute_on_the_frame_before_the_switch()
     test_same_player_return_is_a_carry()
+    test_wall_pass_becomes_two_passes()
+    test_same_player_recovery_without_a_wall_stays_a_carry()
+    test_opponent_on_the_ball_is_not_a_wall()
+    test_teammate_outside_contest_radius_is_not_a_wall()
+    test_wall_leg_below_the_score_is_not_created()
+    test_one_frame_wall_touch_is_still_two_passes()
     test_both_teams_on_the_ball_is_a_dispute()
     print("pass detector tests passed")
