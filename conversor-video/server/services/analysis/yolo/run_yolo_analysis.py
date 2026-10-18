@@ -23,6 +23,7 @@ from ultralytics import YOLO
 from pass_detector import PassDetector
 from person_class import PersonClassLock, reject_non_person_detections
 from possession import PossessionEngine, build_ball_state, build_possession_players
+from possession_stats import PossessionTeamAccumulator
 from roboflow_ball import BallTracker
 from roboflow_soccer_config import SoccerPitchConfiguration
 from roboflow_team import TeamClassifier, TeamTrackLock, reject_training_crop
@@ -2746,6 +2747,7 @@ def analyze(args):
     team_classification_frame_examples = []
     last_emitted_progress = -1
     possession_engine = PossessionEngine()
+    possession_team_stats = PossessionTeamAccumulator(fps)
     last_possession_events = possession_engine.snapshot().as_dict()
     pass_detector = PassDetector()
 
@@ -3773,6 +3775,9 @@ def analyze(args):
         )
         possession_snapshot = possession_engine.update(possession_players, possession_ball)
         possession_events = possession_snapshot.as_dict()
+        possession_by_team_live = possession_team_stats.observe(
+            possession_snapshot.current_possession_team
+        )
         possession_changed = possession_events != last_possession_events
         last_possession_events = possession_events
         pass_detection_stage_start = time.perf_counter()
@@ -3908,6 +3913,7 @@ def analyze(args):
                     "total_passes": int(pass_metrics_live["total_passes"]),
                     "events": pass_metrics_live["events"],
                 },
+                "possession_by_team": possession_by_team_live,
                 "playerDetections": [
                     {
                         "track_id": int(detection.get("track_id", -1)),
@@ -4170,6 +4176,7 @@ def analyze(args):
         "machine_learning": {"status": "pending"},
         "events": possession_engine.snapshot().as_dict(),
         "possession": possession_engine.metrics(),
+        "possession_by_team": possession_team_stats.as_dict(),
         "passes": pass_metrics,
         "artifacts": {
             "processed_video_path": str(output_path),
@@ -4193,6 +4200,7 @@ def analyze(args):
                 "total_passes": int(pass_metrics["total_passes"]),
                 "events": pass_metrics["events"],
             },
+            "possession_by_team": possession_team_stats.as_dict(),
         }
     )
     emit({"type": "result", "result": result})

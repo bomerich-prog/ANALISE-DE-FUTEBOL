@@ -4,6 +4,11 @@ import {
   getLatestAnalysisForVideo,
 } from './analysisClient.js';
 import { countPassesByTeam } from './passCounts.js';
+import {
+  readPossessionByTeam,
+  formatPossessionPercent,
+  formatPossessionDetail,
+} from './possessionCounts.js';
 import { ANALYSIS_STATUS, getAnalysisLabel } from './pipelineStatus.js';
 
 const POLL_INTERVAL_MS = 500;
@@ -24,6 +29,15 @@ const bluePassesEl = byId('analysisBluePasses');
 const redPassesEl = byId('analysisRedPasses');
 const turnoversEl = byId('analysisTurnovers');
 const ballEl = byId('analysisBallFound');
+const possessionTeam0PercentEl = byId('possessionTeam0Percent');
+const possessionTeam1PercentEl = byId('possessionTeam1Percent');
+const possessionNonePercentEl = byId('possessionNonePercent');
+const possessionTeam0DetailEl = byId('possessionTeam0Detail');
+const possessionTeam1DetailEl = byId('possessionTeam1Detail');
+const possessionNoneDetailEl = byId('possessionNoneDetail');
+const possessionBarTeam0El = byId('possessionBarTeam0');
+const possessionBarTeam1El = byId('possessionBarTeam1');
+const possessionBarNoneEl = byId('possessionBarNone');
 const processedVideoEl = byId('analysisProcessedVideo');
 const liveFrameEl = byId('analysisLiveFrame');
 const placeholderEl = byId('analysisVideoPlaceholder');
@@ -118,6 +132,7 @@ function resetViewer() {
   setText(redPassesEl, '0');
   setText(turnoversEl, '0');
   setText(ballEl, 'Não detectada');
+  renderPossessionByTeam(null);
   if (progressEl) progressEl.style.width = '0%';
   if (processedVideoEl) {
     processedVideoEl.removeAttribute('src');
@@ -159,6 +174,35 @@ function renderMatchEvents(events) {
   setText(ballEl, events.ball_detected ? 'Detectada' : 'Não detectada');
 }
 
+function setBarWidth(el, percent) {
+  if (!el) return;
+  const value = Number(percent);
+  const width = Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0;
+  el.style.width = `${width}%`;
+}
+
+function renderPossessionByTeam(analysis) {
+  const stats = readPossessionByTeam(analysis);
+  setText(possessionTeam0PercentEl, formatPossessionPercent(stats.percent_team_0));
+  setText(possessionTeam1PercentEl, formatPossessionPercent(stats.percent_team_1));
+  setText(possessionNonePercentEl, formatPossessionPercent(stats.percent_without_possessor));
+  setText(
+    possessionTeam0DetailEl,
+    formatPossessionDetail(stats.frames_team_0, stats.seconds_team_0)
+  );
+  setText(
+    possessionTeam1DetailEl,
+    formatPossessionDetail(stats.frames_team_1, stats.seconds_team_1)
+  );
+  setText(
+    possessionNoneDetailEl,
+    formatPossessionDetail(stats.frames_without_possessor, stats.seconds_without_possessor)
+  );
+  setBarWidth(possessionBarTeam0El, stats.percent_team_0);
+  setBarWidth(possessionBarTeam1El, stats.percent_team_1);
+  setBarWidth(possessionBarNoneEl, stats.percent_without_possessor);
+}
+
 function renderAnalysis(analysis) {
   if (!analysis) return;
 
@@ -171,6 +215,7 @@ function renderAnalysis(analysis) {
   setText(statusMessageEl, userFacingMessage(analysis.status, analysis.message));
   setText(progressTextEl, `${pct}%`);
   renderMatchEvents(events);
+  renderPossessionByTeam(analysis);
   if (progressEl) progressEl.style.width = `${pct}%`;
 
   if (analysis.status === ANALYSIS_STATUS.COMPLETED) {

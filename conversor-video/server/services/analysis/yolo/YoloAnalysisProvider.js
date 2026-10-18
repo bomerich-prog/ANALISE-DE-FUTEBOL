@@ -5,6 +5,7 @@ const path = require('path');
 const { db, dataDir } = require('../../../db');
 const { AnalysisProvider, updateAnalysisProgress } = require('../AnalysisProvider');
 const { passProgressFromPayload } = require('./passProgress');
+const { possessionProgressFromPayload } = require('./possessionProgress');
 const { resolvePythonCached } = require('./pythonResolver');
 
 const WINDOWS_STORE_ALIAS_HINT =
@@ -140,6 +141,8 @@ class YoloAnalysisProvider extends AnalysisProvider {
           };
           const passes = passProgressFromPayload(payload);
           if (passes) details.progress_stats.passes = passes;
+          const possessionByTeam = possessionProgressFromPayload(payload);
+          if (possessionByTeam) details.progress_stats.possession_by_team = possessionByTeam;
           if (payload.debugFrameUpdated) {
             details.progress_stats.debug_frame_url = `/api/analyses/${analysisId}/debug-frame?t=${Date.now()}`;
             if (payload.debugFrameJpeg) {

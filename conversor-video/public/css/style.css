@@ -1356,6 +1356,49 @@ body {
   padding: 0.7rem;
 }
 
+.possession-bar {
+  display: flex;
+  height: 8px;
+  border-radius: 99px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.possession-bar span {
+  display: block;
+  height: 100%;
+  width: 0;
+}
+
+.possession-bar-team0 { background: var(--green); }
+.possession-bar-team1 { background: #4FC3F7; }
+.possession-bar-none { background: var(--text-dim); }
+
+.analysis-possession-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+}
+
+.analysis-possession-rows strong {
+  display: block;
+  margin-top: 0.2rem;
+  font-size: 1.2rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.analysis-possession-rows article:nth-child(1) strong { color: var(--green-light); }
+.analysis-possession-rows article:nth-child(2) strong { color: #4FC3F7; }
+.analysis-possession-rows article:nth-child(3) strong { color: var(--text); }
+
+.analysis-possession-rows small {
+  display: block;
+  margin-top: 0.15rem;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+}
+
 /* Settings */
 .settings-grid {
   display: grid;
