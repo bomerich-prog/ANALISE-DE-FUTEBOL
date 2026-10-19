@@ -20,6 +20,7 @@ import numpy as np
 import supervision as sv
 from ultralytics import YOLO
 
+from ball_heatmap import BallHeatmapAccumulator
 from pass_detector import PassDetector
 from person_class import PersonClassLock, reject_non_person_detections
 from possession import PossessionEngine, build_ball_state, build_possession_players
@@ -2748,6 +2749,7 @@ def analyze(args):
     last_emitted_progress = -1
     possession_engine = PossessionEngine()
     possession_team_stats = PossessionTeamAccumulator(fps)
+    ball_heatmap = BallHeatmapAccumulator(pitch=SOCCER_PITCH_CONFIGURATION)
     last_possession_events = possession_engine.snapshot().as_dict()
     pass_detector = PassDetector()
 
@@ -3747,6 +3749,7 @@ def analyze(args):
                         break
                 if len(homography_examples) >= 8:
                     break
+        ball_heatmap.observe(ball_detections)
         record_profile_stage(
             profile_state,
             "homography",
@@ -3916,6 +3919,7 @@ def analyze(args):
                     "turnovers": int(pass_metrics_live.get("turnovers", 0)),
                 },
                 "possession_by_team": possession_by_team_live,
+                "ball_heatmap": ball_heatmap.as_dict(),
                 "playerDetections": [
                     {
                         "track_id": int(detection.get("track_id", -1)),
@@ -4179,6 +4183,7 @@ def analyze(args):
         "events": possession_engine.snapshot().as_dict(),
         "possession": possession_engine.metrics(),
         "possession_by_team": possession_team_stats.as_dict(),
+        "ball_heatmap": ball_heatmap.as_dict(),
         "passes": pass_metrics,
         "artifacts": {
             "processed_video_path": str(output_path),
@@ -4204,6 +4209,7 @@ def analyze(args):
                 "turnovers": int(pass_metrics.get("turnovers", 0)),
             },
             "possession_by_team": possession_team_stats.as_dict(),
+            "ball_heatmap": ball_heatmap.as_dict(),
         }
     )
     emit({"type": "result", "result": result})

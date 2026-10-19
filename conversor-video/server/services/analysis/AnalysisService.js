@@ -15,6 +15,7 @@ const {
 } = require('./matchEvents');
 const { passProgressFromPayload } = require('./yolo/passProgress');
 const { possessionProgressFromPayload } = require('./yolo/possessionProgress');
+const { ballHeatmapFromPayload } = require('./yolo/ballHeatmapProgress');
 
 /**
  * Orquestrador de análises — ponto único de entrada para rotas e jobs.
@@ -53,6 +54,8 @@ class AnalysisService {
       possession_by_team: result?.possession_by_team,
     });
     if (possessionByTeam) stats.possession_by_team = possessionByTeam;
+    const ballHeatmap = ballHeatmapFromPayload({ ball_heatmap: result?.ball_heatmap });
+    if (ballHeatmap) stats.ball_heatmap = ballHeatmap;
     if (result?.artifacts?.debug_live_frame_url) {
       stats.debug_frame_url = result.artifacts.debug_live_frame_url;
     }

@@ -461,6 +461,39 @@
           </section>
         </aside>
       </div>
+
+      <section class="analysis-heatmap-card" aria-labelledby="analysisBallHeatmapTitle">
+        <div class="analysis-heatmap-header">
+          <h3 id="analysisBallHeatmapTitle">Mapa de Calor da Bola</h3>
+          <div class="analysis-heatmap-legend" aria-hidden="true">
+            <span>Menos</span>
+            <i class="analysis-heatmap-scale"></i>
+            <span>Mais</span>
+          </div>
+        </div>
+        <div class="analysis-heatmap-body">
+          <div class="analysis-heatmap-pitch">
+            <canvas id="ballHeatmapCanvas" width="720" height="420" role="img" aria-label="Mapa de calor das posições observadas da bola no campo"></canvas>
+            <p class="analysis-heatmap-empty" id="ballHeatmapEmpty">Aguardando bola observada com coordenada de campo.</p>
+          </div>
+          <div class="analysis-heatmap-stats">
+            <article>
+              <span>Bolas no mapa</span>
+              <strong id="ballHeatmapObserved">0</strong>
+            </article>
+            <article>
+              <span>Zona mais usada</span>
+              <strong id="ballHeatmapHotZone">—</strong>
+              <small id="ballHeatmapHotDetail">Aguardando bola observada</small>
+            </article>
+            <article>
+              <span>Bola fora do mapa</span>
+              <strong id="ballHeatmapNoField">0</strong>
+              <small>Sem homografia ou fora do campo</small>
+            </article>
+          </div>
+        </div>
+      </section>
     </section>
   </div>
 

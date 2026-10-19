@@ -9,6 +9,13 @@ import {
   formatPossessionPercent,
   formatPossessionDetail,
 } from './possessionCounts.js';
+import {
+  readBallHeatmap,
+  drawBallHeatmap,
+  hottestCell,
+  formatHottestZone,
+  formatHottestDetail,
+} from './ballHeatmap.js';
 import { ANALYSIS_STATUS, getAnalysisLabel } from './pipelineStatus.js';
 
 const POLL_INTERVAL_MS = 500;
@@ -38,6 +45,12 @@ const possessionNoneDetailEl = byId('possessionNoneDetail');
 const possessionBarTeam0El = byId('possessionBarTeam0');
 const possessionBarTeam1El = byId('possessionBarTeam1');
 const possessionBarNoneEl = byId('possessionBarNone');
+const ballHeatmapCanvasEl = byId('ballHeatmapCanvas');
+const ballHeatmapEmptyEl = byId('ballHeatmapEmpty');
+const ballHeatmapObservedEl = byId('ballHeatmapObserved');
+const ballHeatmapHotZoneEl = byId('ballHeatmapHotZone');
+const ballHeatmapHotDetailEl = byId('ballHeatmapHotDetail');
+const ballHeatmapNoFieldEl = byId('ballHeatmapNoField');
 const processedVideoEl = byId('analysisProcessedVideo');
 const liveFrameEl = byId('analysisLiveFrame');
 const placeholderEl = byId('analysisVideoPlaceholder');
@@ -139,6 +152,7 @@ function resetViewer() {
   setText(turnoversEl, '0');
   setText(ballEl, 'Não detectada');
   renderPossessionByTeam(null);
+  renderBallHeatmap(null);
   if (progressEl) progressEl.style.width = '0%';
   if (processedVideoEl) {
     processedVideoEl.removeAttribute('src');
@@ -209,6 +223,27 @@ function renderPossessionByTeam(analysis) {
   setBarWidth(possessionBarNoneEl, stats.percent_without_possessor);
 }
 
+function renderBallHeatmap(analysis) {
+  const heatmap = readBallHeatmap(analysis);
+  if (ballHeatmapCanvasEl) {
+    drawBallHeatmap(
+      ballHeatmapCanvasEl.getContext('2d'),
+      ballHeatmapCanvasEl.width,
+      ballHeatmapCanvasEl.height,
+      heatmap
+    );
+  }
+  ballHeatmapEmptyEl?.classList.toggle('hidden', heatmap.observed_points > 0);
+  const hottest = hottestCell(heatmap);
+  setText(ballHeatmapObservedEl, String(heatmap.observed_points));
+  setText(ballHeatmapHotZoneEl, formatHottestZone(hottest));
+  setText(ballHeatmapHotDetailEl, formatHottestDetail(hottest));
+  setText(
+    ballHeatmapNoFieldEl,
+    String(heatmap.frames_without_field_point + heatmap.frames_outside_field)
+  );
+}
+
 function renderAnalysis(analysis) {
   if (!analysis) return;
 
@@ -222,6 +257,7 @@ function renderAnalysis(analysis) {
   setText(progressTextEl, `${pct}%`);
   renderMatchEvents(events);
   renderPossessionByTeam(analysis);
+  renderBallHeatmap(analysis);
   if (progressEl) progressEl.style.width = `${pct}%`;
 
   if (analysis.status === ANALYSIS_STATUS.COMPLETED) {

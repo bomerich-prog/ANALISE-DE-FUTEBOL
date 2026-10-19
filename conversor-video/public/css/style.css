@@ -1399,6 +1399,110 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+.analysis-heatmap-card {
+  margin: 0 1.5rem 1.5rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem;
+}
+
+.analysis-heatmap-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.9rem;
+}
+
+.analysis-heatmap-header h3 {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.analysis-heatmap-legend {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--text-muted);
+  font-size: 0.7rem;
+}
+
+.analysis-heatmap-scale {
+  display: block;
+  width: 96px;
+  height: 8px;
+  border-radius: 99px;
+  background: linear-gradient(90deg, rgba(255, 235, 59, 0.4), #ff9800, #e53935);
+}
+
+.analysis-heatmap-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 240px;
+  gap: 1rem;
+  align-items: start;
+}
+
+.analysis-heatmap-pitch {
+  position: relative;
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.analysis-heatmap-pitch canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 12 / 7;
+}
+
+.analysis-heatmap-empty {
+  position: absolute;
+  inset: auto 0 0.75rem;
+  text-align: center;
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 0.8rem;
+}
+
+.analysis-heatmap-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.analysis-heatmap-stats article {
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.7rem;
+}
+
+.analysis-heatmap-stats span {
+  display: block;
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.analysis-heatmap-stats strong {
+  display: block;
+  margin-top: 0.25rem;
+  color: #ff9800;
+  font-size: 1.2rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.analysis-heatmap-stats small {
+  display: block;
+  margin-top: 0.15rem;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
 /* Settings */
 .settings-grid {
   display: grid;
@@ -1481,6 +1585,7 @@ body {
   .stats-grid { grid-template-columns: repeat(2, 1fr); }
   .dashboard-grid { grid-template-columns: 1fr; }
   .analysis-visual-grid { grid-template-columns: 1fr; }
+  .analysis-heatmap-body { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 900px) {
@@ -1503,6 +1608,7 @@ body {
   .analysis-modal { padding: 0.75rem; }
   .analysis-modal-header,
   .analysis-visual-grid { padding: 1rem; }
+  .analysis-heatmap-card { margin: 0 1rem 1rem; }
   .analysis-player-card,
   .analysis-video,
   .analysis-video-placeholder { min-height: 260px; }
