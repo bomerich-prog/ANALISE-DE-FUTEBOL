@@ -3913,6 +3913,7 @@ def analyze(args):
                 "passes": {
                     "total_passes": int(pass_metrics_live["total_passes"]),
                     "events": pass_metrics_live["events"],
+                    "turnovers": int(pass_metrics_live.get("turnovers", 0)),
                 },
                 "possession_by_team": possession_by_team_live,
                 "playerDetections": [
@@ -4200,6 +4201,7 @@ def analyze(args):
             "passes": {
                 "total_passes": int(pass_metrics["total_passes"]),
                 "events": pass_metrics["events"],
+                "turnovers": int(pass_metrics.get("turnovers", 0)),
             },
             "possession_by_team": possession_team_stats.as_dict(),
         }

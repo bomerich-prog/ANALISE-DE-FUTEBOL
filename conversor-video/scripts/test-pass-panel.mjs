@@ -35,6 +35,7 @@ const live = getEvents({
 });
 assert.equal(live.blue_passes, 0, 'Team 0 counter while the analysis is running');
 assert.equal(live.red_passes, 5, 'Team 1 counter while the analysis is running');
+assert.equal(live.turnovers, 0, 'same-team passes do not add a turnover');
 assert.equal(live.current_possession_team, 'Team 1', 'possession still comes from the progress payload');
 
 const finished = getEvents({
@@ -58,6 +59,39 @@ assert.equal(newerLive.red_passes, 0, 'the saved Team 1 total is not mixed in');
 const empty = getEvents({});
 assert.equal(empty.blue_passes, 0, 'missing passes stay at zero for Team 0');
 assert.equal(empty.red_passes, 0, 'missing passes stay at zero for Team 1');
+assert.equal(empty.turnovers, 0, 'the turnover card starts at zero');
+
+const beforeTurnover = getEvents({
+  progress_stats: {
+    passes: { total_passes: 0, events: [], turnovers: 0 },
+    events: { current_possession_team: 'Team 1' },
+  },
+});
+assert.equal(beforeTurnover.turnovers, 0, 'no turnover while the same team still has the ball');
+
+const otherTeamConfirmed = getEvents({
+  progress_stats: {
+    passes: { total_passes: 0, events: [], turnovers: 1 },
+    events: { current_possession_team: 'Team 0' },
+  },
+});
+assert.equal(otherTeamConfirmed.turnovers, 1, 'the count rises when the other team is confirmed');
+
+const dispute = getEvents({
+  progress_stats: {
+    passes: { total_passes: 0, events: [], turnovers: 0, disputes: 1 },
+    events: { current_possession_team: 'Team 0' },
+  },
+});
+assert.equal(dispute.turnovers, 0, 'a dispute is not a turnover');
+
+const finishedTurnovers = getEvents({
+  result_json: {
+    passes: { total_passes: 4, events: [], turnovers: 2 },
+    events: {},
+  },
+});
+assert.equal(finishedTurnovers.turnovers, 2, 'the stored total stays on the card');
 
 const forwarded = passProgressFromPayload({
   passes: {
@@ -69,7 +103,14 @@ const forwarded = passProgressFromPayload({
 assert.deepEqual(forwarded, {
   total_passes: 2,
   events: [{ team: 'Team 0' }, { team: 'Team 1' }],
+  turnovers: 0,
 });
+
+const forwardedTurnovers = passProgressFromPayload({
+  passes: { total_passes: 0, events: [], turnovers: 3, disputes: 1 },
+});
+assert.equal(forwardedTurnovers.turnovers, 3, 'live progress keeps the turnover total');
+assert.equal(forwardedTurnovers.disputes, undefined, 'a dispute is not forwarded as a turnover');
 assert.equal(passProgressFromPayload({ events: {} }), null, 'possession events are not pass counts');
 
 const split = countPassesByTeam(forwarded);

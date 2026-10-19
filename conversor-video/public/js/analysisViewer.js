@@ -94,6 +94,12 @@ function backendPasses(analysis) {
   return null;
 }
 
+function readTurnovers(passes) {
+  const number = Number(passes?.turnovers);
+  if (!Number.isFinite(number) || number < 0) return 0;
+  return Math.round(number);
+}
+
 export function getEvents(analysis) {
   const progressEvents = analysis?.progress_stats?.events || analysis?.events || {};
   const resultEvents = analysis?.result_json?.events || {};
@@ -108,7 +114,7 @@ export function getEvents(analysis) {
       progressEvents.current_possession_team ?? resultEvents.current_possession_team ?? null,
     blue_passes: passes.team0,
     red_passes: passes.team1,
-    turnovers: 0,
+    turnovers: readTurnovers(backendPasses(analysis)),
     ball_detected: Boolean(
       progressEvents.ball_detected ??
         resultEvents.ball_detected ??
