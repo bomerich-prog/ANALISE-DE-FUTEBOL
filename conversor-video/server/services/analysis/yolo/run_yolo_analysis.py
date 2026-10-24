@@ -23,7 +23,7 @@ from ultralytics import YOLO
 from ball_heatmap import BallHeatmapAccumulator
 from pass_detector import PassDetector
 from player_stats import PlayerStatsAccumulator
-from person_class import PersonClassLock, reject_non_person_detections
+from person_class import PersonClassLock, TrackAppearanceGate, reject_non_person_detections
 from possession import PossessionEngine, build_ball_state, build_possession_players
 from possession_stats import PossessionTeamAccumulator
 from roboflow_ball import BallTracker
@@ -2744,6 +2744,7 @@ def analyze(args):
     player_referee_raw_swap_events = 0
     player_referee_stabilized_swap_events = 0
     person_class_lock = PersonClassLock()
+    appearance_gate = TrackAppearanceGate()
     rejected_non_person = 0
     rejected_non_person_reasons = {}
     team_classification_frame_examples = []
@@ -3087,6 +3088,8 @@ def analyze(args):
                     )
             human_track_last_seen_frame[track_id] = current_frame_number
 
+        appearance_gate.begin_frame()
+        pending_humans = []
         for detection_index in range(len(tracked_human_detections)):
             raw_class_id = int(tracked_human_detections.class_id[detection_index])
             confidence = float(tracked_human_detections.confidence[detection_index])
@@ -3110,14 +3113,44 @@ def analyze(args):
                     verifying=person_class_lock.is_locked(track_id),
                 )
 
-            detection_payload = {
-                "box": box,
-                "bounding_box": box,
-                "confidence": confidence,
-                "track_id": track_id,
-                "field_x": None,
-                "field_y": None,
-            }
+            foot_field = None
+            if view_transformer is not None:
+                field_point = transform_image_point_to_field(
+                    view_transformer,
+                    detection_foot_point(box),
+                )
+                if field_point is not None:
+                    foot_field = (float(field_point[0]), float(field_point[1]))
+            appearance_gate.consider(
+                track_id=track_id,
+                box=box,
+                frame=frame,
+                raw_class_id=raw_class_id,
+                locked_class_id=class_id,
+                foot_field=foot_field,
+            )
+            pending_humans.append(
+                (
+                    {
+                        "box": box,
+                        "bounding_box": box,
+                        "confidence": confidence,
+                        "track_id": track_id,
+                        "field_x": None,
+                        "field_y": None,
+                    },
+                    class_id,
+                )
+            )
+
+        for (detection_payload, class_id), verdict in zip(pending_humans, appearance_gate.finish_frame()):
+            if verdict["action"] == "drop":
+                rejected_non_person += 1
+                reason = verdict["reason"]
+                rejected_non_person_reasons[reason] = int(rejected_non_person_reasons.get(reason, 0)) + 1
+                continue
+            if verdict["action"] == "referee":
+                class_id = REFEREE_CLASS_ID
 
             if class_id == PLAYER_CLASS_ID:
                 raw_player_detections += 1
@@ -4135,6 +4168,7 @@ def analyze(args):
                 "player_referee_class_swaps_after_history": person_class_lock.metrics()["class_changes_after_lock"],
                 "player_referee_history_window": PLAYER_REFEREE_HISTORY_WINDOW,
                 "person_class_lock": person_class_lock.metrics(),
+                "appearance_gate": appearance_gate.metrics(),
                 "rejected_non_person": rejected_non_person,
                 "rejected_non_person_reasons": rejected_non_person_reasons,
             },
