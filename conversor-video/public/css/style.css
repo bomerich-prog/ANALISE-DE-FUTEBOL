@@ -1399,12 +1399,151 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-.analysis-heatmap-card {
+.analysis-insights {
   margin: 0 1.5rem 1.5rem;
+}
+
+.analysis-tabs {
+  display: flex;
+  gap: 0.35rem;
+  margin-bottom: 0.65rem;
+}
+
+.analysis-tab {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  border-radius: var(--radius);
+  padding: 0.4rem 0.75rem;
+  font: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.analysis-tab.active,
+.analysis-tab[aria-selected="true"] {
+  color: var(--text);
+  border-color: #3d3d3d;
+  background: var(--card);
+}
+
+.analysis-heatmap-card {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 1rem;
+}
+
+.analysis-players-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem;
+}
+
+.analysis-players-header h3 {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.analysis-players-header p,
+.player-stats-note,
+.player-stats-empty {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  margin-top: 0.35rem;
+}
+
+.player-table-wrap {
+  margin-top: 0.85rem;
+  max-height: 320px;
+  overflow: auto;
+}
+
+.player-table-head,
+.player-expand {
+  display: grid;
+  grid-template-columns: 1.1fr 1fr 1fr 0.8fr 1rem;
+  gap: 0.75rem;
+  align-items: center;
+  width: 100%;
+}
+
+.player-table-head {
+  padding: 0 0.75rem 0.4rem;
+  color: var(--text-dim);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.player-row + .player-row {
+  margin-top: 0.35rem;
+}
+
+.player-expand {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--text);
+  border-radius: var(--radius);
+  padding: 0.65rem 0.75rem;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.player-expand span:first-child {
+  font-variant-numeric: tabular-nums;
+}
+
+.player-expand .player-chevron {
+  justify-self: end;
+  color: var(--text-muted);
+  transition: transform var(--transition);
+}
+
+.player-expand[aria-expanded="true"] .player-chevron {
+  transform: rotate(90deg);
+}
+
+.player-expand[aria-expanded="true"] {
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.player-detail[hidden] {
+  display: none;
+}
+
+.player-detail {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.65rem 1rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-top: none;
+  border-radius: 0 0 var(--radius) var(--radius);
+  background: #161616;
+}
+
+.player-detail div {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.player-detail span {
+  color: var(--text-muted);
+  font-size: 0.7rem;
+}
+
+.player-detail strong {
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
 }
 
 .analysis-heatmap-header {
@@ -1608,7 +1747,8 @@ body {
   .analysis-modal { padding: 0.75rem; }
   .analysis-modal-header,
   .analysis-visual-grid { padding: 1rem; }
-  .analysis-heatmap-card { margin: 0 1rem 1rem; }
+  .analysis-insights { margin: 0 1rem 1rem; }
+  .player-detail { grid-template-columns: 1fr; }
   .analysis-player-card,
   .analysis-video,
   .analysis-video-placeholder { min-height: 260px; }

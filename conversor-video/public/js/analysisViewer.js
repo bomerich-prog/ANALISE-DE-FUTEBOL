@@ -16,6 +16,16 @@ import {
   formatHottestZone,
   formatHottestDetail,
 } from './ballHeatmap.js';
+import {
+  readPlayerStats,
+  sortPlayerTracks,
+  formatPlayerSummary,
+  formatPlayerTeam,
+  formatPlayerPossession,
+  formatPlayerPercent,
+  formatMeanPosition,
+  toggleOpenTrack,
+} from './playerStats.js';
 import { ANALYSIS_STATUS, getAnalysisLabel } from './pipelineStatus.js';
 
 const POLL_INTERVAL_MS = 500;
@@ -51,12 +61,21 @@ const ballHeatmapObservedEl = byId('ballHeatmapObserved');
 const ballHeatmapHotZoneEl = byId('ballHeatmapHotZone');
 const ballHeatmapHotDetailEl = byId('ballHeatmapHotDetail');
 const ballHeatmapNoFieldEl = byId('ballHeatmapNoField');
+const heatmapPanelEl = byId('analysisHeatmapPanel');
+const playersPanelEl = byId('analysisPlayersPanel');
+const heatmapTabEl = byId('analysisTabHeatmap');
+const playersTabEl = byId('analysisTabPlayers');
+const playerStatsSummaryEl = byId('playerStatsSummary');
+const playerStatsBodyEl = byId('playerStatsBody');
+const playerStatsWrapEl = byId('playerStatsWrap');
+const playerStatsEmptyEl = byId('playerStatsEmpty');
 const processedVideoEl = byId('analysisProcessedVideo');
 const liveFrameEl = byId('analysisLiveFrame');
 const placeholderEl = byId('analysisVideoPlaceholder');
 
 let pollTimer = null;
 let activeAnalysisId = null;
+let openPlayerTracks = new Set();
 
 function setText(el, value) {
   if (el) el.textContent = value;
@@ -153,6 +172,8 @@ function resetViewer() {
   setText(ballEl, 'Não detectada');
   renderPossessionByTeam(null);
   renderBallHeatmap(null);
+  openPlayerTracks = new Set();
+  renderPlayerStats(null);
   if (progressEl) progressEl.style.width = '0%';
   if (processedVideoEl) {
     processedVideoEl.removeAttribute('src');
@@ -223,6 +244,77 @@ function renderPossessionByTeam(analysis) {
   setBarWidth(possessionBarNoneEl, stats.percent_without_possessor);
 }
 
+function selectAnalysisTab(name) {
+  const showPlayers = name === 'players';
+  heatmapPanelEl?.classList.toggle('hidden', showPlayers);
+  playersPanelEl?.classList.toggle('hidden', !showPlayers);
+  heatmapTabEl?.classList.toggle('active', !showPlayers);
+  playersTabEl?.classList.toggle('active', showPlayers);
+  heatmapTabEl?.setAttribute('aria-selected', showPlayers ? 'false' : 'true');
+  playersTabEl?.setAttribute('aria-selected', showPlayers ? 'true' : 'false');
+}
+
+function playerDetailLine(label, value) {
+  const item = document.createElement('div');
+  const caption = document.createElement('span');
+  caption.textContent = label;
+  const strong = document.createElement('strong');
+  strong.textContent = value;
+  item.append(caption, strong);
+  return item;
+}
+
+function buildPlayerRow(track, open) {
+  const row = document.createElement('div');
+  row.className = 'player-row';
+
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'player-expand';
+  button.dataset.playerTrack = String(track.track_id);
+  button.setAttribute('aria-expanded', open ? 'true' : 'false');
+
+  const id = document.createElement('span');
+  id.textContent = `Trilha ${track.track_id}`;
+  const team = document.createElement('span');
+  team.textContent = formatPlayerTeam(track.team);
+  const possession = document.createElement('span');
+  possession.textContent = formatPlayerPossession(track.seconds_with_ball);
+  const passes = document.createElement('span');
+  passes.textContent = String(track.passes_made);
+  const chevron = document.createElement('span');
+  chevron.className = 'player-chevron';
+  chevron.setAttribute('aria-hidden', 'true');
+  chevron.textContent = '›';
+  button.append(id, team, possession, passes, chevron);
+
+  const detail = document.createElement('div');
+  detail.className = 'player-detail';
+  detail.hidden = !open;
+  detail.append(
+    playerDetailLine('Vezes com a bola', String(track.possession_spells)),
+    playerDetailLine('Posse no time', formatPlayerPercent(track.percent_of_team)),
+    playerDetailLine('Quadros em campo', String(track.frames_seen)),
+    playerDetailLine('Posição média', formatMeanPosition(track)),
+    playerDetailLine('Passes recebidos', String(track.passes_received)),
+  );
+  row.append(button, detail);
+  return row;
+}
+
+function renderPlayerStats(analysis) {
+  const tracks = sortPlayerTracks(readPlayerStats(analysis).tracks);
+  setText(playerStatsSummaryEl, formatPlayerSummary(tracks));
+  playerStatsWrapEl?.classList.toggle('hidden', tracks.length === 0);
+  playerStatsEmptyEl?.classList.toggle('hidden', tracks.length > 0);
+  if (!playerStatsBodyEl) return;
+  const scroll = playerStatsWrapEl ? playerStatsWrapEl.scrollTop : 0;
+  playerStatsBodyEl.replaceChildren(
+    ...tracks.map((track) => buildPlayerRow(track, openPlayerTracks.has(track.track_id))),
+  );
+  if (playerStatsWrapEl) playerStatsWrapEl.scrollTop = scroll;
+}
+
 function renderBallHeatmap(analysis) {
   const heatmap = readBallHeatmap(analysis);
   if (ballHeatmapCanvasEl) {
@@ -258,6 +350,7 @@ function renderAnalysis(analysis) {
   renderMatchEvents(events);
   renderPossessionByTeam(analysis);
   renderBallHeatmap(analysis);
+  renderPlayerStats(analysis);
   if (progressEl) progressEl.style.width = `${pct}%`;
 
   if (analysis.status === ANALYSIS_STATUS.COMPLETED) {
@@ -356,6 +449,19 @@ async function startAnalysisInVisualization(videoId) {
 if (typeof document !== 'undefined') {
   document.querySelectorAll('[data-analysis-close]').forEach((el) => {
     el.addEventListener('click', closeModal);
+  });
+
+  heatmapTabEl?.addEventListener('click', () => selectAnalysisTab('heatmap'));
+  playersTabEl?.addEventListener('click', () => selectAnalysisTab('players'));
+  playerStatsBodyEl?.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-player-track]');
+    if (!button) return;
+    const trackId = Number(button.dataset.playerTrack);
+    openPlayerTracks = toggleOpenTrack(openPlayerTracks, trackId);
+    const open = openPlayerTracks.has(trackId);
+    button.setAttribute('aria-expanded', open ? 'true' : 'false');
+    const detail = button.parentElement?.querySelector('.player-detail');
+    if (detail) detail.hidden = !open;
   });
 
   window.addEventListener('keydown', (event) => {

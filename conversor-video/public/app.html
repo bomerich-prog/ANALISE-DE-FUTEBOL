@@ -462,7 +462,13 @@
         </aside>
       </div>
 
-      <section class="analysis-heatmap-card" aria-labelledby="analysisBallHeatmapTitle">
+      <section class="analysis-insights" aria-label="Detalhes da análise">
+        <div class="analysis-tabs" role="tablist" aria-label="Detalhes da análise">
+          <button type="button" class="analysis-tab active" id="analysisTabHeatmap" role="tab" aria-selected="true" aria-controls="analysisHeatmapPanel">Mapa da bola</button>
+          <button type="button" class="analysis-tab" id="analysisTabPlayers" role="tab" aria-selected="false" aria-controls="analysisPlayersPanel">Jogadores</button>
+        </div>
+
+      <section class="analysis-heatmap-card" id="analysisHeatmapPanel" role="tabpanel" aria-labelledby="analysisTabHeatmap">
         <div class="analysis-heatmap-header">
           <h3 id="analysisBallHeatmapTitle">Mapa de Calor da Bola</h3>
           <div class="analysis-heatmap-legend" aria-hidden="true">
@@ -493,6 +499,26 @@
             </article>
           </div>
         </div>
+      </section>
+
+        <section class="analysis-players-card hidden" id="analysisPlayersPanel" role="tabpanel" aria-labelledby="analysisTabPlayers">
+          <div class="analysis-players-header">
+            <h3 id="analysisPlayersTitle">Jogadores</h3>
+            <p id="playerStatsSummary">Nenhuma trilha ainda.</p>
+          </div>
+          <div class="player-table-wrap" id="playerStatsWrap">
+            <div class="player-table-head" aria-hidden="true">
+              <span>Trilha</span>
+              <span>Time</span>
+              <span>Posse</span>
+              <span>Passes</span>
+              <span></span>
+            </div>
+            <div id="playerStatsBody"></div>
+          </div>
+          <p class="player-stats-empty" id="playerStatsEmpty">As trilhas aparecem conforme a análise encontra jogadores.</p>
+          <p class="player-stats-note">Cada linha é uma trilha do rastreamento. O número não é o da camisa.</p>
+        </section>
       </section>
     </section>
   </div>

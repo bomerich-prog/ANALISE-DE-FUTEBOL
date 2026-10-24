@@ -22,6 +22,7 @@ from ultralytics import YOLO
 
 from ball_heatmap import BallHeatmapAccumulator
 from pass_detector import PassDetector
+from player_stats import PlayerStatsAccumulator
 from person_class import PersonClassLock, reject_non_person_detections
 from possession import PossessionEngine, build_ball_state, build_possession_players
 from possession_stats import PossessionTeamAccumulator
@@ -2749,6 +2750,7 @@ def analyze(args):
     last_emitted_progress = -1
     possession_engine = PossessionEngine()
     possession_team_stats = PossessionTeamAccumulator(fps)
+    player_stats = PlayerStatsAccumulator(fps, pitch=SOCCER_PITCH_CONFIGURATION)
     ball_heatmap = BallHeatmapAccumulator(pitch=SOCCER_PITCH_CONFIGURATION)
     last_possession_events = possession_engine.snapshot().as_dict()
     pass_detector = PassDetector()
@@ -3792,6 +3794,12 @@ def analyze(args):
             possession_snapshot.current_possession_team,
             pass_metrics_live["events"],
         )
+        player_stats_live = player_stats.observe(
+            list(accepted_player_detections) + list(accepted_goalkeeper_detections),
+            possession_snapshot.current_possessor_track_id,
+            possession_snapshot.current_possession_team,
+            pass_metrics_live["events"],
+        )
         record_profile_stage(
             profile_state,
             "pass_detection",
@@ -3919,6 +3927,7 @@ def analyze(args):
                     "turnovers": int(pass_metrics_live.get("turnovers", 0)),
                 },
                 "possession_by_team": possession_by_team_live,
+                "player_stats": player_stats_live,
                 "ball_heatmap": ball_heatmap.as_dict(),
                 "playerDetections": [
                     {
@@ -4183,6 +4192,7 @@ def analyze(args):
         "events": possession_engine.snapshot().as_dict(),
         "possession": possession_engine.metrics(),
         "possession_by_team": possession_team_stats.as_dict(),
+        "player_stats": player_stats.as_dict(),
         "ball_heatmap": ball_heatmap.as_dict(),
         "passes": pass_metrics,
         "artifacts": {
@@ -4209,6 +4219,7 @@ def analyze(args):
                 "turnovers": int(pass_metrics.get("turnovers", 0)),
             },
             "possession_by_team": possession_team_stats.as_dict(),
+            "player_stats": player_stats.as_dict(),
             "ball_heatmap": ball_heatmap.as_dict(),
         }
     )

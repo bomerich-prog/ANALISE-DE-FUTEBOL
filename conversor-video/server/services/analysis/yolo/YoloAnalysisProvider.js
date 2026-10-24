@@ -6,6 +6,7 @@ const { db, dataDir } = require('../../../db');
 const { AnalysisProvider, updateAnalysisProgress } = require('../AnalysisProvider');
 const { passProgressFromPayload } = require('./passProgress');
 const { possessionProgressFromPayload } = require('./possessionProgress');
+const { playerStatsFromPayload } = require('./playerStatsProgress');
 const { ballHeatmapFromPayload } = require('./ballHeatmapProgress');
 const { resolvePythonCached } = require('./pythonResolver');
 
@@ -144,6 +145,8 @@ class YoloAnalysisProvider extends AnalysisProvider {
           if (passes) details.progress_stats.passes = passes;
           const possessionByTeam = possessionProgressFromPayload(payload);
           if (possessionByTeam) details.progress_stats.possession_by_team = possessionByTeam;
+          const playerStats = playerStatsFromPayload(payload);
+          if (playerStats) details.progress_stats.player_stats = playerStats;
           const ballHeatmap = ballHeatmapFromPayload(payload);
           if (ballHeatmap) details.progress_stats.ball_heatmap = ballHeatmap;
           if (payload.debugFrameUpdated) {

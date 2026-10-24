@@ -15,6 +15,7 @@ const {
 } = require('./matchEvents');
 const { passProgressFromPayload } = require('./yolo/passProgress');
 const { possessionProgressFromPayload } = require('./yolo/possessionProgress');
+const { playerStatsFromPayload } = require('./yolo/playerStatsProgress');
 const { ballHeatmapFromPayload } = require('./yolo/ballHeatmapProgress');
 
 /**
@@ -54,6 +55,8 @@ class AnalysisService {
       possession_by_team: result?.possession_by_team,
     });
     if (possessionByTeam) stats.possession_by_team = possessionByTeam;
+    const playerStats = playerStatsFromPayload({ player_stats: result?.player_stats });
+    if (playerStats) stats.player_stats = playerStats;
     const ballHeatmap = ballHeatmapFromPayload({ ball_heatmap: result?.ball_heatmap });
     if (ballHeatmap) stats.ball_heatmap = ballHeatmap;
     if (result?.artifacts?.debug_live_frame_url) {
