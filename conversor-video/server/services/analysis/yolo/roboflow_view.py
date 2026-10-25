@@ -33,6 +33,16 @@ class ViewTransformer:
         if self.m is None:
             raise ValueError("Homography matrix could not be calculated.")
 
+    @classmethod
+    def from_matrix(cls, matrix: npt.NDArray[np.float64]) -> "ViewTransformer":
+        """Wrap a homography that another step already accepted."""
+        array = np.asarray(matrix, dtype=np.float64)
+        if array.shape != (3, 3) or not np.isfinite(array).all():
+            raise ValueError("Homography matrix must be a finite 3x3 matrix.")
+        transformer = cls.__new__(cls)
+        transformer.m = array
+        return transformer
+
     def transform_points(self, points: npt.NDArray[np.float32]) -> npt.NDArray[np.float32]:
         """
         Transform the given points using the homography matrix.

@@ -29,6 +29,7 @@ from possession_stats import PossessionTeamAccumulator
 from roboflow_ball import BallTracker
 from roboflow_soccer_config import SoccerPitchConfiguration
 from roboflow_team import TeamClassifier, TeamTrackLock, reject_training_crop
+from pitch_homography import PitchHomographyGate, draw_projected_pitch
 from roboflow_view import ViewTransformer
 
 
@@ -545,6 +546,7 @@ def detection_foot_point(box):
 
 
 def build_view_transformer_from_pitch_keypoints(keypoints):
+    """Fit every supplied point. The analysis loop uses PitchHomographyGate instead."""
     keypoints_by_index = {}
     for keypoint in keypoints:
         keypoint_index = int(keypoint["index"])
@@ -982,6 +984,17 @@ def extract_pitch_keypoints(pitch_result, confidence_threshold):
             )
 
     return visible_keypoints
+
+
+def _draw_homography_debug(frame, decision):
+    """Green lines passed the paint check. Red lines are the rejected candidate."""
+    if decision.get("reason") == "accepted" and decision.get("matrix") is not None:
+        draw_projected_pitch(frame, decision["matrix"], (0, 200, 0))
+        return
+    if decision.get("candidate_matrix") is not None:
+        draw_projected_pitch(frame, decision["candidate_matrix"], (0, 0, 255))
+    if decision.get("held") and decision.get("matrix") is not None:
+        draw_projected_pitch(frame, decision["matrix"], (0, 200, 0))
 
 
 def draw_pitch_keypoints(frame, keypoints):
@@ -2753,6 +2766,8 @@ def analyze(args):
     possession_team_stats = PossessionTeamAccumulator(fps)
     player_stats = PlayerStatsAccumulator(fps, pitch=SOCCER_PITCH_CONFIGURATION)
     ball_heatmap = BallHeatmapAccumulator(pitch=SOCCER_PITCH_CONFIGURATION)
+    pitch_homography_gate = PitchHomographyGate(pitch=SOCCER_PITCH_CONFIGURATION)
+    pitch_homography_debug = os.getenv("PITCH_HOMOGRAPHY_DEBUG", "").strip().lower() in {"1", "true", "on", "yes"}
     last_possession_events = possession_engine.snapshot().as_dict()
     pass_detector = PassDetector()
 
@@ -2832,7 +2847,10 @@ def analyze(args):
         )
 
         homography_stage_start = time.perf_counter()
-        view_transformer = build_view_transformer_from_pitch_keypoints(pitch_keypoints)
+        grass_mask = build_grass_support_mask(frame)
+        white_line_mask = build_white_line_mask(frame, grass_mask)
+        homography_decision = pitch_homography_gate.update(pitch_keypoints, white_line_mask)
+        view_transformer = homography_decision["transformer"]
         if view_transformer is not None:
             homography_valid_frames += 1
         record_profile_stage(
@@ -3848,6 +3866,10 @@ def analyze(args):
         draw_pitch_keypoints(output_frame, pitch_keypoints)
         if debug_frame is not None:
             draw_pitch_keypoints(debug_frame, pitch_keypoints)
+        if pitch_homography_debug:
+            _draw_homography_debug(output_frame, homography_decision)
+            if debug_frame is not None:
+                _draw_homography_debug(debug_frame, homography_decision)
 
         render_bounding_boxes_stage_start = time.perf_counter()
         for detection in accepted_player_detections:
@@ -4215,11 +4237,12 @@ def analyze(args):
             "frame_examples": goalkeeper_assignment_frame_examples,
         },
         "homography": {
-            "status": "implemented (official ViewTransformer)",
+            "status": "gated ViewTransformer (RANSAC + white-line support)",
             "valid_frames": homography_valid_frames,
             "total_frames": frames_processed,
             "avg_keypoints_detected": avg_pitch_keypoints_detected,
             "examples": homography_examples,
+            "gate": pitch_homography_gate.metrics(),
         },
         "features": {"status": "implemented (ball possession state machine + pass detector refinements)"},
         "machine_learning": {"status": "pending"},
