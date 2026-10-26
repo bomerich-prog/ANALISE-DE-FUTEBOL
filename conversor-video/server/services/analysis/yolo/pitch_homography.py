@@ -32,6 +32,297 @@ MIN_SPAN_PX = 100.0
 MIN_SAMPLES_INSIDE = 40
 _LINE_DILATION = 9
 _KEYPOINT_LINE_RADIUS_PX = 18
+# The painted penalty area is 16.5m deep and the arc is 9.15m about the
+# 11m spot. The keypoint template's 20.15m box never meets that arc, so a
+# broadcast frame has to be registered from the paint itself.
+_PENALTY_DEPTH_CM = 1650.0
+_SPOT_FROM_GOAL_CM = 1100.0
+_ARC_RADIUS_CM = 915.0
+_SPOT_FROM_FRONT_CM = _PENALTY_DEPTH_CM - _SPOT_FROM_GOAL_CM
+
+
+def _clean_paint(white_line_mask):
+    """Drop player-sized blobs. A pitch line is only a few pixels thick."""
+    if white_line_mask is None or white_line_mask.size == 0:
+        return None
+    if int(np.count_nonzero(white_line_mask)) < 80:
+        return None
+    distance = cv2.distanceTransform(white_line_mask, cv2.DIST_L2, 3)
+    core = np.zeros_like(white_line_mask)
+    core[distance >= 5.5] = 255
+    players = cv2.dilate(core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17)))
+    paint = cv2.bitwise_and(white_line_mask, cv2.bitwise_not(players))
+    # Advertising boards sit above the grass and look like a long white line.
+    paint[: int(paint.shape[0] * 0.14), :] = 0
+    if int(np.count_nonzero(paint)) < 80:
+        return None
+    return paint
+
+
+def _line_segments(paint):
+    edges = cv2.Canny(paint, 40, 120)
+    found = cv2.HoughLinesP(edges, 1, np.pi / 180, 36, minLineLength=70, maxLineGap=22)
+    if found is None:
+        return []
+    rows = []
+    for x1, y1, x2, y2 in found.reshape(-1, 4):
+        length = float(np.hypot(x2 - x1, y2 - y1))
+        angle = float(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+        if angle > 90:
+            angle -= 180
+        if angle < -90:
+            angle += 180
+        rows.append((length, angle, float(x1), float(y1), float(x2), float(y2)))
+    return rows
+
+
+def _penalty_line(paint):
+    """The long painted edge of the penalty area, as a point and a unit direction."""
+    families = []
+    for segment in _line_segments(paint):
+        length, angle, x1, y1, x2, y2 = segment
+        if length < 80 or not (16 <= abs(angle) <= 55):
+            continue
+        if min(y1, y2) < paint.shape[0] * 0.28:
+            continue
+        for family in families:
+            if abs(angle - family[0][1]) < 8:
+                family.append(segment)
+                break
+        else:
+            families.append([segment])
+    if not families:
+        return None
+    family = max(families, key=lambda items: sum(item[0] for item in items))
+    if sum(item[0] for item in family) < 220:
+        return None
+    points = []
+    for _, _, x1, y1, x2, y2 in family:
+        points.extend(((x1, y1), (x2, y2)))
+    vx, vy, x0, y0 = cv2.fitLine(np.array(points, np.float32), cv2.DIST_L2, 0, 0.01, 0.01).reshape(-1)
+    direction = np.array([float(vx), float(vy)], np.float64)
+    norm = float(np.linalg.norm(direction))
+    if norm < 1e-6:
+        return None
+    direction /= norm
+    if direction[1] < 0:
+        direction = -direction
+    return np.array([float(x0), float(y0)], np.float64), direction
+
+
+def _circle_through(points):
+    """Circle through three points. Six-point fits never land on this thin arc."""
+    design = np.stack([points[:, 0], points[:, 1], np.ones(3)], axis=1)
+    try:
+        linear, eccentricity, constant = np.linalg.solve(design, -(points[:, 0] ** 2 + points[:, 1] ** 2))
+    except np.linalg.LinAlgError:
+        return None
+    center_x = -linear / 2
+    center_y = -eccentricity / 2
+    radius2 = center_x * center_x + center_y * center_y - constant
+    if radius2 <= 1:
+        return None
+    return np.array([float(center_x), float(center_y)], np.float64), float(np.sqrt(radius2))
+
+
+def _painted_arc_distance(matrix, paint, positive_x):
+    """Median distance, in pixels, from the painted penalty arc to the mask.
+
+    The front line is on the paint by construction, so only the arc outside
+    the box is scored. None when that arc leaves the frame.
+    """
+    try:
+        inverse = np.linalg.inv(matrix).astype(np.float32)
+    except np.linalg.LinAlgError:
+        return None
+    length = 12000.0
+    front = length - _PENALTY_DEPTH_CM if positive_x else _PENALTY_DEPTH_CM
+    spot = length - _SPOT_FROM_GOAL_CM if positive_x else _SPOT_FROM_GOAL_CM
+    samples = []
+    for angle in np.linspace(0, 2 * np.pi, 48):
+        x = spot + _ARC_RADIUS_CM * np.cos(angle)
+        y = 3500.0 + _ARC_RADIUS_CM * np.sin(angle)
+        outside = x < front if positive_x else x > front
+        if outside:
+            samples.append((x, y))
+    projected = cv2.perspectiveTransform(np.array(samples, np.float32).reshape(-1, 1, 2), inverse).reshape(-1, 2)
+    height, width = paint.shape[:2]
+    distance = cv2.distanceTransform(cv2.bitwise_not(paint), cv2.DIST_L2, 3)
+    inside = []
+    for x, y in projected:
+        if np.isfinite(x) and np.isfinite(y) and 0 <= x < width and 0 <= y < height:
+            inside.append((float(x), float(y), distance[int(y), int(x)]))
+    if len(inside) < 10:
+        return None
+    xs = [point[0] for point in inside]
+    ys = [point[1] for point in inside]
+    # A handful of pixels on a sock is not the arc.
+    if max(xs) - min(xs) < 70 and max(ys) - min(ys) < 70:
+        return None
+    return float(np.median([point[2] for point in inside]))
+
+
+def _affine_matrix(origin, along, perp, px_per_cm, front_x, width_cm, positive_x):
+    sign = 1.0 if positive_x else -1.0
+    scale = float(px_per_cm)
+    ox, oy = float(origin[0]), float(origin[1])
+    px, py = float(perp[0]), float(perp[1])
+    ax, ay = float(along[0]), float(along[1])
+    return np.array(
+        [
+            [sign * px / scale, sign * py / scale, front_x - sign * (px * ox + py * oy) / scale],
+            [ax / scale, ay / scale, width_cm / 2 - (ax * ox + ay * oy) / scale],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _arc_candidates(paint, origin, direction):
+    """Circles centred on the penalty spot: 5.5m behind the line, radius 9.15m."""
+    ys, xs = np.where(paint > 0)
+    if len(xs) < 40:
+        return []
+    points = np.stack([xs, ys], axis=1).astype(np.float64)
+    offset = (points - origin)[:, 0] * direction[1] - (points - origin)[:, 1] * direction[0]
+    beside = points[(np.abs(offset) > 14) & (np.abs(offset) < 240) & (points[:, 1] > paint.shape[0] * 0.42)]
+    if len(beside) < 40:
+        return []
+    rng = np.random.default_rng(0)
+    found = []
+    for _ in range(1600):
+        sample = beside[rng.choice(len(beside), 3, replace=False)]
+        if min(
+            np.hypot(*(sample[0] - sample[1])),
+            np.hypot(*(sample[0] - sample[2])),
+            np.hypot(*(sample[1] - sample[2])),
+        ) < 25:
+            continue
+        circle = _circle_through(sample)
+        if circle is None:
+            continue
+        center, radius = circle
+        if not (90 <= radius <= 260):
+            continue
+        signed = float((center[0] - origin[0]) * direction[1] - (center[1] - origin[1]) * direction[0])
+        gap = abs(signed)
+        if gap < 40 or not (0.48 <= gap / radius <= 0.72):
+            continue
+        residual = np.abs(np.hypot(beside[:, 0] - center[0], beside[:, 1] - center[1]) - radius)
+        keep = beside[residual < 6]
+        inliers = int(len(keep))
+        if inliers < 100:
+            continue
+        # The painted penalty arc is the short cap outside the box, about 106 degrees.
+        # A centre-circle fit covers far more of the circle and must not win.
+        angles = np.sort(np.arctan2(keep[:, 1] - center[1], keep[:, 0] - center[0]))
+        gaps = np.diff(angles)
+        wrap = angles[0] + 2 * np.pi - angles[-1]
+        span = 2 * np.pi - max(float(gaps.max()) if len(gaps) else 0.0, float(wrap))
+        if not (np.radians(80) <= span <= np.radians(130)):
+            continue
+        found.append((inliers, center, radius, signed))
+    return found
+
+
+_GOAL_WIDTH_CM = 732.0
+
+
+def _goal_post_groups(frame):
+    """Thin bright verticals on the far half of the frame. One pass per frame."""
+    if frame is None:
+        return ()
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    white = ((hsv[:, :, 2] >= 185) & (hsv[:, :, 1] <= 50)).astype(np.uint8) * 255
+    posts = cv2.morphologyEx(white, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 22)))
+    height, width = posts.shape[:2]
+    posts[: int(height * 0.08), :] = 0
+    posts[int(height * 0.62) :, :] = 0
+    count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(posts, 8)
+    groups = []
+    for index in range(1, count):
+        x, y, box_w, box_h, _area = stats[index]
+        if box_h < 36 or not (2 <= box_w <= 40):
+            continue
+        groups.append((float(x), float(x + box_w / 2.0), float(y), float(y + box_h), float(width)))
+    return tuple(groups)
+
+
+def _goal_mouth_contradicts(post_groups, center, gap, perp, positive_x):
+    """True when the goal posts are visible and the arc does not face them.
+
+    The arc fixes the scale: the spot is 5.5m behind the line, so the 7.32m
+    goal has a known width in pixels and its centre is 11m past the spot.
+    A centre-circle cap can satisfy the same arc test, but the real posts
+    then sit well away from that predicted centre.
+    """
+    if not post_groups or gap < 40:
+        return False
+    groups = []
+    for x, midpoint_x, y0, y1, width in post_groups:
+        # The scoreboard sits on the left. Posts are searched on the goal's side.
+        if positive_x and x < width * 0.45:
+            continue
+        if not positive_x and x > width * 0.55:
+            continue
+        groups.append((midpoint_x, y0, y1))
+    expect = _GOAL_WIDTH_CM * gap / _SPOT_FROM_FRONT_CM
+    goal_x = float(center[0] + perp[0] * (2.0 * gap))
+    nearest = None
+    for i in range(len(groups)):
+        for j in range(i + 1, len(groups)):
+            separation = abs(groups[i][0] - groups[j][0])
+            if not (0.55 * expect <= separation <= 1.6 * expect):
+                continue
+            overlap = min(groups[i][2], groups[j][2]) - max(groups[i][1], groups[j][1])
+            if overlap < 10:
+                continue
+            midpoint = 0.5 * (groups[i][0] + groups[j][0])
+            error = abs(midpoint - goal_x)
+            if nearest is None or error < nearest:
+                nearest = error
+    return nearest is not None and nearest > 2.2 * expect
+
+
+def fit_broadcast_penalty(white_line_mask, pitch, frame=None):
+    """Image-to-field matrix from the penalty line and the arc outside it.
+
+    The keypoint model on a broadcast frame labels the right-hand penalty
+    marks and then draws them in open grass. The white paint still has the
+    penalty line and the arc, and the spot sits 5.5m behind that line on a
+    9.15m arc. Returns None when that pair is not on the paint, or when the
+    goal posts are visible and this arc does not face them.
+    """
+    paint = _clean_paint(white_line_mask)
+    if paint is None:
+        return None
+    line = _penalty_line(paint)
+    if line is None:
+        return None
+    origin, direction = line
+    post_groups = _goal_post_groups(frame)
+    best = None
+    for inliers, center, _radius, _signed in _arc_candidates(paint, origin, direction):
+        foot = origin + direction * float(np.dot(center - origin, direction))
+        gap = float(np.linalg.norm(center - foot))
+        if gap < 40:
+            continue
+        perp = (center - foot) / gap
+        positive_x = float(center[0]) >= float(foot[0])
+        if _goal_mouth_contradicts(post_groups, center, gap, perp, positive_x):
+            continue
+        front_x = float(pitch.length) - _PENALTY_DEPTH_CM if positive_x else _PENALTY_DEPTH_CM
+        matrix = _affine_matrix(foot, direction, perp, gap / _SPOT_FROM_FRONT_CM, front_x, float(pitch.width), positive_x)
+        distance = _painted_arc_distance(matrix, paint, positive_x)
+        if distance is None or distance > 8.0:
+            continue
+        # The arc has to sit on the paint. Inlier count breaks the remaining ties.
+        rank = (distance, -inliers)
+        if best is None or rank < best[0]:
+            best = (rank, matrix)
+    if best is None:
+        return None
+    return best[1]
 
 
 class PitchHomographyGate:
@@ -58,8 +349,22 @@ class PitchHomographyGate:
         self.held_frames = 0
         self.reasons = Counter()
 
-    def update(self, keypoints, white_line_mask):
+    def update(self, keypoints, white_line_mask, frame=None):
         decision = self._fit(keypoints, white_line_mask)
+        if not decision["accepted"]:
+            painted = fit_broadcast_penalty(white_line_mask, self.pitch, frame)
+            if painted is not None:
+                decision = {
+                    "accepted": True,
+                    "held": False,
+                    "reason": "accepted",
+                    "transformer": ViewTransformer.from_matrix(painted),
+                    "matrix": painted,
+                    "candidate_matrix": painted,
+                    "inliers": decision["inliers"],
+                    "support": line_support(painted, white_line_mask, self.pitch),
+                    "candidate_support": line_support(painted, white_line_mask, self.pitch),
+                }
         if decision["accepted"]:
             self.held = decision["transformer"]
             self.hold_left = self.hold_frames
@@ -190,11 +495,18 @@ class PitchHomographyGate:
         if self.held is None or self.hold_left <= 0:
             return False
         support = line_support(self.held.m, white_line_mask, self.pitch)
-        if support is None or support < self.min_line_support:
-            self.held = None
-            self.hold_left = 0
-            return False
-        return True
+        if support is not None and support >= self.min_line_support:
+            return True
+        # A broadcast fit only explains the penalty arc, not every template line.
+        paint = _clean_paint(white_line_mask)
+        if paint is not None:
+            for positive_x in (True, False):
+                distance = _painted_arc_distance(self.held.m, paint, positive_x)
+                if distance is not None and distance <= 8.0:
+                    return True
+        self.held = None
+        self.hold_left = 0
+        return False
 
     def _on_white_lines(self, by_index, white_line_mask):
         if white_line_mask is None:

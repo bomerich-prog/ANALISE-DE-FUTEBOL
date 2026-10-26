@@ -2849,7 +2849,7 @@ def analyze(args):
         homography_stage_start = time.perf_counter()
         grass_mask = build_grass_support_mask(frame)
         white_line_mask = build_white_line_mask(frame, grass_mask)
-        homography_decision = pitch_homography_gate.update(pitch_keypoints, white_line_mask)
+        homography_decision = pitch_homography_gate.update(pitch_keypoints, white_line_mask, frame)
         view_transformer = homography_decision["transformer"]
         if view_transformer is not None:
             homography_valid_frames += 1
