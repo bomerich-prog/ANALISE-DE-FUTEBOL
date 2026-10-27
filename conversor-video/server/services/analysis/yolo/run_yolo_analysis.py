@@ -24,6 +24,7 @@ from ball_heatmap import BallHeatmapAccumulator
 from pass_detector import PassDetector
 from player_stats import PlayerStatsAccumulator
 from person_class import PersonClassLock, TrackAppearanceGate, reject_non_person_detections
+from player_track_stitch import PlayerTrackStitch
 from possession import PossessionEngine, build_ball_state, build_possession_players
 from possession_stats import PossessionTeamAccumulator
 from roboflow_ball import BallTracker
@@ -2609,6 +2610,7 @@ def analyze(args):
         minimum_matching_threshold=BYTE_TRACK_MINIMUM_MATCHING_THRESHOLD,
         frame_rate=float(fps),
     )
+    player_track_stitch = PlayerTrackStitch()
     raw_output_path = output_path.with_name(f"{output_path.stem}.opencv{output_path.suffix}")
     writer = open_writer(raw_output_path, fps, width, height)
 
@@ -2825,6 +2827,16 @@ def analyze(args):
 
         bytetrack_stage_start = time.perf_counter()
         tracked_human_detections = player_tracker.update_with_detections(tracked_human_detections)
+        if tracked_human_detections.tracker_id is None:
+            player_track_stitch.apply(current_frame_number, [], [])
+        else:
+            tracked_human_detections.tracker_id = player_track_stitch.apply(
+                current_frame_number,
+                tracked_human_detections.tracker_id,
+                tracked_human_detections.xyxy,
+                frame,
+                classes=tracked_human_detections.class_id,
+            )
         record_profile_stage(
             profile_state,
             "bytetrack",
@@ -3751,6 +3763,8 @@ def analyze(args):
         ]
         if player_team_ids_before_goalkeeper_assignment != player_team_ids_after_goalkeeper_assignment:
             player_team_mutation_violations += 1
+        for detection in list(accepted_player_detections) + list(accepted_goalkeeper_detections):
+            player_track_stitch.note_team(detection.get("track_id"), detection.get("team_id"))
         record_profile_stage(
             profile_state,
             "goalkeeper_assignment",
@@ -4191,6 +4205,7 @@ def analyze(args):
                 "player_referee_history_window": PLAYER_REFEREE_HISTORY_WINDOW,
                 "person_class_lock": person_class_lock.metrics(),
                 "appearance_gate": appearance_gate.metrics(),
+                "player_track_stitch": player_track_stitch.metrics(),
                 "rejected_non_person": rejected_non_person,
                 "rejected_non_person_reasons": rejected_non_person_reasons,
             },
