@@ -1759,13 +1759,8 @@ def draw_label(frame, x1, y1, label, color):
     )
 
 
-def draw_detection(frame, box, class_name, confidence, color=None):
-    x1, y1, x2, y2 = [int(v) for v in box]
-    x1 = clamp(x1, 0, frame.shape[1] - 1)
-    x2 = clamp(x2, 0, frame.shape[1] - 1)
-    y1 = clamp(y1, 0, frame.shape[0] - 1)
-    y2 = clamp(y2, 0, frame.shape[0] - 1)
-
+def detection_label(class_name) -> str:
+    """Id and team for a person. Confidence stays out of the overlay."""
     track_id = None
     team_id = None
     display_name = class_name
@@ -1775,15 +1770,24 @@ def draw_detection(frame, box, class_name, confidence, color=None):
             track_id = class_name[1]
         if len(class_name) > 2:
             team_id = class_name[2]
-    color = color or CLASS_COLOR_OVERRIDES.get(display_name, (0, 179, 255))
     if display_name in {"Player", "Goalkeeper"} and track_id is not None and team_id is not None:
-        label = f"{display_name} #{track_id} [Team {team_id}]"
-    elif track_id is not None:
-        label = f"{display_name} #{track_id} - {round(confidence * 100)}%"
-    else:
-        label = f"{display_name} - {round(confidence * 100)}%"
+        return f"{display_name} #{track_id} [Team {team_id}]"
+    if track_id is not None:
+        return f"{display_name} #{track_id}"
+    return str(display_name)
+
+
+def draw_detection(frame, box, class_name, _confidence, color=None):
+    x1, y1, x2, y2 = [int(v) for v in box]
+    x1 = clamp(x1, 0, frame.shape[1] - 1)
+    x2 = clamp(x2, 0, frame.shape[1] - 1)
+    y1 = clamp(y1, 0, frame.shape[0] - 1)
+    y2 = clamp(y2, 0, frame.shape[0] - 1)
+
+    display_name = class_name[0] if isinstance(class_name, tuple) else class_name
+    color = color or CLASS_COLOR_OVERRIDES.get(display_name, (0, 179, 255))
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-    draw_label(frame, x1, y1, label, color)
+    draw_label(frame, x1, y1, detection_label(class_name), color)
 
 
 def open_writer(output_path, fps, width, height):
