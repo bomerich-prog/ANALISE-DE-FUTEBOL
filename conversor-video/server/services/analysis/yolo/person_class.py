@@ -5,7 +5,9 @@ exists. A confirmed class stays until several consecutive frames disagree.
 
 Flags and sideline equipment whose box is wide enough to pass that first
 cut are removed after ByteTrack, once color, motion and pitch position agree.
-The track id stays alive; only the emitted class changes.
+A neon yellow torso that holds for a few frames is the center referee,
+even when the detector calls that track a player. A goalkeeper stays a
+goalkeeper. The track id stays alive; only the emitted class changes.
 """
 
 from __future__ import annotations
@@ -220,6 +222,14 @@ REFEREE_VOTE_WINDOW = 8
 REFEREE_VOTE_MIN = 3
 REFEREE_CLEAR_FRAMES = 8
 
+YELLOW_HUE_MIN = 16
+YELLOW_HUE_MAX = 45
+YELLOW_SATURATION_MIN = 120
+YELLOW_VALUE_MIN = 120
+YELLOW_TORSO_MIN = 0.40
+YELLOW_CONFIRM_FRAMES = 3
+YELLOW_CLEAR_FRAMES = 6
+
 PITCH_LENGTH_CM = 12000.0
 PITCH_WIDTH_CM = 7000.0
 
@@ -250,6 +260,22 @@ def _flag_hue_mask(hsv) -> np.ndarray:
     return colored & (saturation > 80) & (value > 60)
 
 
+def _torso_yellow_fraction(hsv) -> float:
+    """Neon yellow shirt. OpenCV hue stops at 179, and this band is the kit."""
+    if hsv.size == 0:
+        return 0.0
+    hue = hsv[:, :, 0]
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    yellow = (
+        (hue >= YELLOW_HUE_MIN)
+        & (hue <= YELLOW_HUE_MAX)
+        & (saturation >= YELLOW_SATURATION_MIN)
+        & (value >= YELLOW_VALUE_MIN)
+    )
+    return float(yellow.mean())
+
+
 def _bottom_is_pole(hsv) -> bool:
     """A corner flag is cloth over a thin pole. A torso fills the box width."""
     height, width = hsv.shape[:2]
@@ -273,6 +299,7 @@ def appearance_profile(frame, box) -> Dict[str, float]:
         "torso_flag": 0.0,
         "low_chroma": 0.0,
         "bottom_pole": 0.0,
+        "torso_yellow": 0.0,
     }
     crop = _clip_crop(frame, box)
     if crop is None:
@@ -296,6 +323,7 @@ def appearance_profile(frame, box) -> Dict[str, float]:
         "torso_flag": float(_flag_hue_mask(torso).mean()),
         "low_chroma": float(dark_neutral.mean()),
         "bottom_pole": 1.0 if _bottom_is_pole(hsv) else 0.0,
+        "torso_yellow": _torso_yellow_fraction(torso),
     }
 
 
@@ -359,6 +387,7 @@ class TrackAppearanceGate:
         self.dropped_static_sideline = 0
         self.routed_referee_vote = 0
         self.routed_linesman = 0
+        self.routed_yellow_kit = 0
 
     def begin_frame(self) -> None:
         self._pending = []
@@ -407,6 +436,7 @@ class TrackAppearanceGate:
             "dropped_static_sideline": self.dropped_static_sideline,
             "routed_referee_vote": self.routed_referee_vote,
             "routed_linesman": self.routed_linesman,
+            "routed_yellow_kit": self.routed_yellow_kit,
             "tracks_seen": len(self._tracks),
         }
 
@@ -423,6 +453,9 @@ class TrackAppearanceGate:
                 "referee_latched": False,
                 "referee_clear": 0,
                 "linesman_streak": 0,
+                "yellow_streak": 0,
+                "yellow_clear": 0,
+                "yellow_latched": False,
             }
             self._tracks[int(track_id)] = state
         return state
@@ -461,8 +494,18 @@ class TrackAppearanceGate:
             state["static_latched"] = True
         return bool(state["static_latched"])
 
-    def _update_referee(self, state: dict, raw_class_id: int) -> bool:
-        vote = 1 if int(raw_class_id) == GATE_REFEREE_CLASS_ID else 0
+    def _update_referee(self, state: dict, raw_class_id: int, profile: Dict[str, float]) -> bool:
+        """Count a referee label only when the torso is yellow or a dark kit.
+
+        The detector often calls a coloured outfield player a referee. A
+        neon shirt and a black kit are the two official uniforms; a blue,
+        garnet or white shirt is not.
+        """
+        referee_kit = (
+            float(profile.get("torso_yellow", 0.0)) >= YELLOW_TORSO_MIN
+            or float(profile.get("low_chroma", 0.0)) > LOW_CHROMA_MIN
+        )
+        vote = 1 if int(raw_class_id) == GATE_REFEREE_CLASS_ID and referee_kit else 0
         state["referee_votes"].append(vote)
         if sum(state["referee_votes"]) >= REFEREE_VOTE_MIN:
             state["referee_latched"] = True
@@ -475,6 +518,23 @@ class TrackAppearanceGate:
             state["referee_latched"] = False
             state["referee_clear"] = 0
         return bool(state["referee_latched"])
+
+    def _update_yellow_referee(self, state: dict, profile: Dict[str, float]) -> bool:
+        yellow = float(profile.get("torso_yellow", 0.0)) >= YELLOW_TORSO_MIN
+        if yellow:
+            state["yellow_streak"] += 1
+            state["yellow_clear"] = 0
+            if state["yellow_streak"] >= YELLOW_CONFIRM_FRAMES:
+                state["yellow_latched"] = True
+            return bool(state["yellow_latched"])
+        state["yellow_streak"] = 0
+        if not state["yellow_latched"]:
+            return False
+        state["yellow_clear"] += 1
+        if state["yellow_clear"] >= YELLOW_CLEAR_FRAMES:
+            state["yellow_latched"] = False
+            state["yellow_clear"] = 0
+        return bool(state["yellow_latched"])
 
     def _linesman_now(self, item: dict, anchors: List[dict]) -> bool:
         profile = item["profile"]
@@ -510,12 +570,19 @@ class TrackAppearanceGate:
         if self._update_static(state, item):
             self.dropped_static_sideline += 1
             return {"action": "drop", "reason": "static_sideline"}
-        if int(item["locked_class_id"]) == GATE_GOALKEEPER_CLASS_ID:
+        goalkeeper = (
+            int(item["locked_class_id"]) == GATE_GOALKEEPER_CLASS_ID
+            or int(item["raw_class_id"]) == GATE_GOALKEEPER_CLASS_ID
+        )
+        if goalkeeper:
             state["linesman_streak"] = 0
+            state["yellow_streak"] = 0
+            state["yellow_clear"] = 0
+            state["yellow_latched"] = False
             return {"action": "keep", "reason": None}
         if int(item["locked_class_id"]) == GATE_REFEREE_CLASS_ID:
             return {"action": "keep", "reason": None}
-        if self._update_referee(state, item["raw_class_id"]):
+        if self._update_referee(state, item["raw_class_id"], item["profile"]):
             self.routed_referee_vote += 1
             return {"action": "referee", "reason": "referee_vote"}
         if self._linesman_now(item, anchors):
@@ -525,4 +592,7 @@ class TrackAppearanceGate:
         if state["linesman_streak"] >= LINESMAN_CONFIRM_FRAMES:
             self.routed_linesman += 1
             return {"action": "referee", "reason": "linesman_near_flag"}
+        if self._update_yellow_referee(state, item["profile"]):
+            self.routed_yellow_kit += 1
+            return {"action": "referee", "reason": "yellow_kit"}
         return {"action": "keep", "reason": None}

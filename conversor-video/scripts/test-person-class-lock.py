@@ -176,14 +176,24 @@ def test_wide_corner_flag_is_dropped_after_two_frames_and_jersey_stays():
     jersey = yellow_jersey_image()
     jersey_box = [0, 0, jersey.shape[1], jersey.shape[0]]
     jersey_gate = TrackAppearanceGate()
-    actions = []
+    verdicts = []
     for _ in range(6):
         verdict = observe(
             jersey_gate,
             [{"track_id": 11, "box": jersey_box, "frame": jersey, "foot_field": (3000, 40)}],
-        )
-        actions.append(verdict[0]["action"])
-    assert_equal(actions, ["keep"] * 6, "yellow jersey on the sideline stays a player")
+        )[0]
+        verdicts.append(verdict)
+    assert_equal(
+        [item["action"] for item in verdicts[:2]],
+        ["keep", "keep"],
+        "yellow shirt is not dropped as a corner flag",
+    )
+    assert_equal(
+        [item["action"] for item in verdicts[2:]],
+        ["referee"] * 4,
+        "neon yellow shirt becomes the referee",
+    )
+    assert_equal(verdicts[2]["reason"], "yellow_kit", "reason is the yellow kit")
 
 
 def test_flag_returns_only_after_the_color_is_gone():
@@ -418,6 +428,30 @@ def test_referee_vote_needs_three_labels_and_does_not_rewrite_goalkeeper():
         keeper_actions.append(verdict["action"])
     assert_equal(keeper_actions, ["keep"] * 4, "goalkeeper is not rewritten by referee votes")
 
+    colored = solid_bgr(120, saturation=180, value=90, width=80, height=160)
+    colored_gate = TrackAppearanceGate()
+    colored_actions = []
+    for _ in range(6):
+        verdict = observe(
+            colored_gate,
+            [
+                {
+                    "track_id": 30,
+                    "box": [0, 0, 80, 160],
+                    "frame": colored,
+                    "raw_class_id": REFEREE,
+                    "locked_class_id": PLAYER,
+                    "foot_field": (6000.0, 3500.0),
+                }
+            ],
+        )[0]
+        colored_actions.append(verdict["action"])
+    assert_equal(
+        colored_actions,
+        ["keep"] * 6,
+        "a blue shirt the detector calls referee stays a player",
+    )
+
 
 def test_linesman_beside_flag_becomes_referee_and_players_do_not():
     flag_box = [40, 20, 80, 140]
@@ -572,6 +606,128 @@ def test_linesman_beside_flag_becomes_referee_and_players_do_not():
     assert_equal(keeper_actions, ["keep"] * 6, "goalkeeper beside the flag is not sent to referees")
 
 
+def test_yellow_kit_referee_spares_goalkeeper_and_outfield_kits():
+    jersey = yellow_jersey_image()
+    box = [0, 0, jersey.shape[1], jersey.shape[0]]
+    midfield = (6000.0, 3500.0)
+
+    gate = TrackAppearanceGate()
+    early = []
+    for _ in range(2):
+        early.append(
+            observe(
+                gate,
+                [
+                    {
+                        "track_id": 16,
+                        "box": box,
+                        "frame": jersey,
+                        "raw_class_id": PLAYER,
+                        "locked_class_id": PLAYER,
+                        "foot_field": midfield,
+                    }
+                ],
+            )[0]["action"]
+        )
+    latched = observe(
+        gate,
+        [
+            {
+                "track_id": 16,
+                "box": box,
+                "frame": jersey,
+                "raw_class_id": PLAYER,
+                "locked_class_id": PLAYER,
+                "foot_field": midfield,
+            }
+        ],
+    )[0]
+    assert_equal(early, ["keep", "keep"], "two yellow frames stay a player")
+    assert_equal(latched["action"], "referee", "third yellow frame is the referee")
+    assert_equal(latched["reason"], "yellow_kit", "reason is the yellow kit")
+
+    white = fill(jersey.shape[1], jersey.shape[0], (240, 240, 240))
+    held = [
+        observe(
+            gate,
+            [
+                {
+                    "track_id": 16,
+                    "box": box,
+                    "frame": white,
+                    "raw_class_id": PLAYER,
+                    "locked_class_id": PLAYER,
+                    "foot_field": midfield,
+                }
+            ],
+        )[0]["action"]
+        for _ in range(5)
+    ]
+    released = observe(
+        gate,
+        [
+            {
+                "track_id": 16,
+                "box": box,
+                "frame": white,
+                "raw_class_id": PLAYER,
+                "locked_class_id": PLAYER,
+                "foot_field": midfield,
+            }
+        ],
+    )[0]
+    assert_equal(held, ["referee"] * 5, "a short dip keeps the referee")
+    assert_equal(released["action"], "keep", "six ordinary frames release the yellow latch")
+
+    blue = solid_bgr(100, saturation=180, value=160, width=jersey.shape[1], height=jersey.shape[0])
+    garnet = solid_bgr(175, saturation=180, value=120, width=jersey.shape[1], height=jersey.shape[0])
+    for patch, label in ((white, "white"), (blue, "blue"), (garnet, "garnet")):
+        kit_gate = TrackAppearanceGate()
+        actions = [
+            observe(
+                kit_gate,
+                [
+                    {
+                        "track_id": 8,
+                        "box": box,
+                        "frame": patch,
+                        "raw_class_id": PLAYER,
+                        "locked_class_id": PLAYER,
+                        "foot_field": midfield,
+                    }
+                ],
+            )[0]["action"]
+            for _ in range(6)
+        ]
+        assert_equal(actions, ["keep"] * 6, f"{label} kit stays a player")
+
+    keeper = TrackAppearanceGate()
+    keeper_actions = []
+    for raw_label, locked_label in (
+        (GOALKEEPER, GOALKEEPER),
+        (GOALKEEPER, PLAYER),
+        (PLAYER, GOALKEEPER),
+    ):
+        for _ in range(4):
+            verdict = observe(
+                keeper,
+                [
+                    {
+                        "track_id": 1,
+                        "box": box,
+                        "frame": jersey,
+                        "raw_class_id": raw_label,
+                        "locked_class_id": locked_label,
+                        "foot_field": midfield,
+                    }
+                ],
+            )[0]
+            keeper_actions.append(verdict["action"])
+    assert_equal(keeper_actions, ["keep"] * 12, "yellow goalkeeper stays a goalkeeper")
+    assert_equal(keeper.metrics()["routed_yellow_kit"], 0, "goalkeeper never counts as yellow referee")
+    assert_equal(gate.metrics()["routed_yellow_kit"] > 0, True, "the center referee was counted")
+
+
 if __name__ == "__main__":
     test_rejects_pole_flag_and_wide_box()
     test_player_does_not_become_referee_on_flicker()
@@ -585,4 +741,5 @@ if __name__ == "__main__":
     test_static_without_field_only_rejects_a_very_thin_stand()
     test_referee_vote_needs_three_labels_and_does_not_rewrite_goalkeeper()
     test_linesman_beside_flag_becomes_referee_and_players_do_not()
+    test_yellow_kit_referee_spares_goalkeeper_and_outfield_kits()
     print("person class lock tests passed")
