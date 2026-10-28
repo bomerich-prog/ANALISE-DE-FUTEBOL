@@ -3688,11 +3688,11 @@ def analyze(args):
             prediction_crops = get_player_crops_from_payload(frame, detections_to_predict)
             predicted_team_ids = team_classifier.predict(prediction_crops) if prediction_crops else np.array([])
             for prediction_idx, (detection_idx, verifying) in enumerate(detections_needing_prediction):
-                predicted_team_id = (
-                    int(predicted_team_ids[prediction_idx])
-                    if prediction_idx < len(predicted_team_ids)
-                    else 0
-                )
+                predicted_team_id = None
+                if prediction_idx < len(predicted_team_ids):
+                    raw_team_id = int(predicted_team_ids[prediction_idx])
+                    if raw_team_id in (0, 1):
+                        predicted_team_id = raw_team_id
                 detection = accepted_player_detections[detection_idx]
                 track_id = int(detection.get("track_id", -1))
                 if track_id >= 0:
@@ -3705,14 +3705,20 @@ def analyze(args):
                 else:
                     detection["team_id"] = predicted_team_id
 
-        players_team_id_list = []
+        known_players = []
+        known_team_ids = []
         for detection in accepted_player_detections:
-            team_id = int(detection["team_id"]) if detection.get("team_id") is not None else 0
-            detection["team_id"] = team_id
-            players_team_id_list.append(team_id)
-            if team_id in team_prediction_counts:
-                team_prediction_counts[team_id] += 1
-        players_team_id = np.array(players_team_id_list, dtype=np.int32)
+            team_id = detection.get("team_id")
+            if team_id in (0, 1):
+                team_id = int(team_id)
+                detection["team_id"] = team_id
+                known_players.append(detection)
+                known_team_ids.append(team_id)
+                if team_id in team_prediction_counts:
+                    team_prediction_counts[team_id] += 1
+            else:
+                detection["team_id"] = None
+        players_team_id = np.array(known_team_ids, dtype=np.int32)
         record_profile_stage(
             profile_state,
             "team_classifier_predict",
@@ -3725,7 +3731,11 @@ def analyze(args):
                     "players": [
                         {
                             "track_id": int(detection.get("track_id", -1)),
-                            "team_id": int(detection.get("team_id", 0)),
+                            "team_id": (
+                                int(detection["team_id"])
+                                if detection.get("team_id") in (0, 1)
+                                else None
+                            ),
                         }
                         for detection in accepted_player_detections[:5]
                     ],
@@ -3733,10 +3743,11 @@ def analyze(args):
             )
         goalkeeper_assignment_stage_start = time.perf_counter()
         player_team_ids_before_goalkeeper_assignment = [
-            int(detection.get("team_id", 0)) for detection in accepted_player_detections
+            int(detection["team_id"]) if detection.get("team_id") in (0, 1) else None
+            for detection in accepted_player_detections
         ]
         goalkeepers_team_id = resolve_goalkeepers_team_id(
-            accepted_player_detections,
+            known_players,
             players_team_id,
             accepted_goalkeeper_detections,
         )
@@ -3763,7 +3774,8 @@ def analyze(args):
                 }
             )
         player_team_ids_after_goalkeeper_assignment = [
-            int(detection.get("team_id", 0)) for detection in accepted_player_detections
+            int(detection["team_id"]) if detection.get("team_id") in (0, 1) else None
+            for detection in accepted_player_detections
         ]
         if player_team_ids_before_goalkeeper_assignment != player_team_ids_after_goalkeeper_assignment:
             player_team_mutation_violations += 1
@@ -4005,7 +4017,11 @@ def analyze(args):
                 "playerDetections": [
                     {
                         "track_id": int(detection.get("track_id", -1)),
-                        "team_id": int(detection.get("team_id", 0)),
+                        "team_id": (
+                            int(detection["team_id"])
+                            if detection.get("team_id") in (0, 1)
+                            else None
+                        ),
                         "confidence": float(detection["confidence"]),
                         "bounding_box": detection["bounding_box"],
                         "field_x": detection.get("field_x"),
@@ -4157,7 +4173,7 @@ def analyze(args):
         "architecture": {
             "yolo": "implemented",
             "tracking": "implemented (sv.ByteTrack)",
-            "feature_extraction": "implemented (TeamClassifier/SigLIP)",
+            "feature_extraction": "implemented (torso color)",
             "machine_learning": "pending",
         },
         "metrics": {
@@ -4199,7 +4215,7 @@ def analyze(args):
                 "frame_rate": float(fps),
             },
             "id_storage": "track_id is stored per detection dict for player/goalkeeper/referee and rendered in labels",
-            "team_classifier": "TeamClassifier predicts team_id (0/1) for players based on crops",
+            "team_classifier": "torso brightness and saturation decide team_id; a weak crop does not vote",
             "stability": {
                 "recovered_track_gap_events": recovered_track_gap_events,
                 "recovered_track_ids_count": len(recovered_track_ids),
@@ -4216,7 +4232,7 @@ def analyze(args):
         },
         "team_classifier": {
             "training": {
-                "architecture": "SigLIP + UMAP + KMeans",
+                "architecture": "torso color",
                 "stride": team_training_stats["stride"],
                 "frames_scanned": team_training_stats["frames_scanned"],
                 "player_detections_seen": team_training_stats["player_detections_seen"],

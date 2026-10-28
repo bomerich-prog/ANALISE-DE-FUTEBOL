@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server/services/an
 from roboflow_team import (  # noqa: E402
     TEAM_LOCK_CONFIRM_STREAK,
     TEAM_LOCK_UNLOCK_STREAK,
+    TeamClassifier,
     TeamTrackLock,
     anchor_cluster_labels,
     jersey_blueness,
@@ -113,6 +114,103 @@ def test_refresh_agreement_resets_contradiction_streak():
     assert_equal(lock.metrics()["team_changes_after_lock"], 0, "no unlock")
 
 
+def fit_light_and_dark():
+    light = [solid_bgr(0, saturation=12, value=210) for _ in range(6)]
+    dark = [solid_bgr(170, saturation=150, value=90) for _ in range(6)]
+    classifier = TeamClassifier()
+    classifier.fit(light + dark)
+    return classifier
+
+
+def test_light_shirt_and_dark_shirt_get_stable_teams():
+    classifier = fit_light_and_dark()
+    assert_equal(classifier.color_anchor["mode"], "value", "brightness separates this match")
+    assert_equal(classifier.color_anchor["team_0"], "dark", "team 0 is the dark shirt")
+    assert_equal(classifier.color_anchor["team_1"], "light", "team 1 is the light shirt")
+    swapped = TeamClassifier()
+    swapped.fit(
+        [solid_bgr(170, saturation=140, value=80) for _ in range(6)]
+        + [solid_bgr(40, saturation=8, value=220) for _ in range(6)]
+    )
+    white = solid_bgr(90, saturation=10, value=205)
+    garnet = solid_bgr(172, saturation=160, value=95)
+    assert_equal(int(classifier.predict([white])[0]), 1, "white shirt")
+    assert_equal(int(classifier.predict([garnet])[0]), 0, "dark shirt")
+    assert_equal(int(swapped.predict([white])[0]), 1, "white stays team 1 after a swapped fit")
+    assert_equal(int(swapped.predict([garnet])[0]), 0, "dark stays team 0 after a swapped fit")
+
+
+def test_gradual_broadcast_shirts_still_split():
+    dark = []
+    light = []
+    for value, saturation in ((90, 140), (110, 110), (125, 95), (140, 80)):
+        dark.extend(solid_bgr(160, saturation=saturation, value=value) for _ in range(2))
+    for value, saturation in ((175, 28), (200, 18), (230, 12), (245, 10)):
+        light.extend(solid_bgr(110, saturation=saturation, value=value) for _ in range(2))
+    classifier = TeamClassifier()
+    classifier.fit(dark + light)
+    assert_equal(classifier.color_anchor["mode"], "value", "gradual kits still use brightness")
+    assert_equal(int(classifier.predict([solid_bgr(164, saturation=100, value=115)])[0]), 0, "mid dark shirt")
+    assert_equal(int(classifier.predict([solid_bgr(112, saturation=16, value=225)])[0]), 1, "bright shirt")
+
+
+def test_shadowed_white_stays_light_and_sunlit_dark_stays_dark():
+    classifier = fit_light_and_dark()
+    shadow = solid_bgr(0, saturation=18, value=150)
+    sunlit = solid_bgr(168, saturation=130, value=145)
+    assert_equal(int(classifier.predict([shadow])[0]), 1, "dim white shirt")
+    assert_equal(int(classifier.predict([sunlit])[0]), 0, "lit dark shirt")
+
+
+def test_weak_crops_do_not_vote():
+    classifier = fit_light_and_dark()
+    tiny = solid_bgr(0, saturation=10, value=210, width=8, height=20)
+    readable_small = solid_bgr(0, saturation=12, value=214, width=16, height=48)
+    yellow = solid_bgr(30, saturation=210, value=220)
+    grass = solid_bgr(60, saturation=160, value=140)
+    ambiguous = solid_bgr(20, saturation=80, value=155)
+    predicted = classifier.predict([tiny, yellow, grass, ambiguous])
+    assert_equal([int(team) for team in predicted], [-1, -1, -1, -1], "weak crops abstain")
+    assert_equal(int(classifier.predict([readable_small])[0]), 1, "small but clear white shirt still votes")
+
+
+def test_two_saturated_kits_split_by_hue():
+    blue = [solid_bgr(112, saturation=180, value=100) for _ in range(6)]
+    red = [solid_bgr(4, saturation=180, value=100) for _ in range(6)]
+    classifier = TeamClassifier()
+    classifier.fit(blue + red)
+    assert_equal(classifier.color_anchor["mode"], "hue", "similar brightness uses hue")
+    assert_equal(int(classifier.predict([solid_bgr(115, saturation=170, value=105)])[0]), 0, "blue kit")
+    assert_equal(int(classifier.predict([solid_bgr(2, saturation=170, value=105)])[0]), 1, "red kit")
+    white = solid_bgr(0, saturation=8, value=220)
+    assert_equal(int(classifier.predict([white])[0]), -1, "white has no saturated hue")
+
+
+def test_mixed_torso_abstains():
+    crop = np.zeros((80, 40, 3), dtype=np.uint8)
+    left = solid_bgr(0, saturation=10, value=220, width=20, height=80)
+    right = solid_bgr(170, saturation=160, value=80, width=20, height=80)
+    crop[:, :20] = left
+    crop[:, 20:] = right
+    classifier = fit_light_and_dark()
+    assert_equal(int(classifier.predict([crop])[0]), -1, "two shirts in one box")
+
+
+def test_weak_vote_does_not_create_or_unlock_a_team():
+    lock = TeamTrackLock()
+    assert_equal(lock.assign(3, None, 1, verifying=False), None, "no team yet")
+    assert_equal(lock.is_locked(3), False, "weak vote does not open a track")
+    for frame in range(1, TEAM_LOCK_CONFIRM_STREAK + 1):
+        lock.assign(3, 1, frame, verifying=False)
+    assert_equal(lock.is_locked(3), True, "three clear votes lock")
+    for frame in range(10, 10 + TEAM_LOCK_UNLOCK_STREAK):
+        team = lock.assign(3, None, frame, verifying=True)
+        assert_equal(team, 1, "weak refresh keeps the team")
+        assert_equal(lock.is_locked(3), True, "weak refresh stays locked")
+    assert_equal(lock.metrics()["refresh_contradictions"], 0, "weak votes are not disagreements")
+    assert_equal(lock.metrics()["ignored_weak_votes"] > 0, True, "weak votes were counted")
+
+
 def test_cached_interval_skips_locked_tracks():
     lock = TeamTrackLock()
     lock.assign(9, 0, 1, verifying=False)
@@ -130,5 +228,12 @@ if __name__ == "__main__":
     test_rejects_flag_post_and_grass_but_keeps_colored_shirt()
     test_lock_survives_single_refresh_and_flips_only_after_streak()
     test_refresh_agreement_resets_contradiction_streak()
+    test_light_shirt_and_dark_shirt_get_stable_teams()
+    test_gradual_broadcast_shirts_still_split()
+    test_shadowed_white_stays_light_and_sunlit_dark_stays_dark()
+    test_weak_crops_do_not_vote()
+    test_two_saturated_kits_split_by_hue()
+    test_mixed_torso_abstains()
+    test_weak_vote_does_not_create_or_unlock_a_team()
     test_cached_interval_skips_locked_tracks()
     print("team classifier stability tests passed")
