@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server/services/an
 
 from player_track_stitch import (  # noqa: E402
     LOST_TRACK_MEMORY_FRAMES,
+    STABLE_TRACK_MEMORY_FRAMES,
     PlayerTrackStitch,
 )
 
@@ -190,6 +191,106 @@ def test_goalkeeper_does_not_absorb_a_nearby_player():
     assert_equal(returned, [19], "an outfield player does not take the goalkeeper id")
 
 
+def hold_stable(stitch, track_id=28, frames=8, foot=200, team=0, class_id=2):
+    for frame in range(1, frames + 1):
+        see(stitch, frame, [{"id": track_id, "box": box_at(foot), "team": team, "hue": 110}])
+    stitch.note_class_lock(track_id, True, class_id)
+
+
+def test_stable_identity_survives_ids_36_and_54():
+    stitch = PlayerTrackStitch()
+    hold_stable(stitch)
+    first_return = see(stitch, 38, [{"id": 36, "box": box_at(208), "team": 0, "hue": 110}])
+    still_same = see(stitch, 39, [{"id": 36, "box": box_at(212), "team": 0, "hue": 110}])
+    second_return = see(stitch, 55, [{"id": 54, "box": box_at(216), "team": 0, "hue": 110}])
+    assert_equal(first_return, [28], "36 is the same player as 28")
+    assert_equal(still_same, [28], "the new ByteTrack id keeps being rewritten")
+    assert_equal(second_return, [28], "54 is still the same player")
+    assert_equal(stitch.metrics()["stitch_events"][0]["memory"], "long", "the long memory did the work")
+    assert_equal(stitch.metrics()["stitch_events"][0]["gap_frames"], 30, "thirty frames between sightings")
+
+
+def test_stable_identity_expires_after_sixty_frames():
+    stitch = PlayerTrackStitch()
+    hold_stable(stitch)
+    returned = see(
+        stitch,
+        8 + STABLE_TRACK_MEMORY_FRAMES + 1,
+        [{"id": 54, "box": box_at(208), "team": 0, "hue": 110}],
+    )
+    assert_equal(returned, [54], "beyond the long window this is a new identity")
+    assert_equal(stitch.metrics()["expired"] >= 1, True, "the stable memory dropped the track")
+
+
+def test_unlocked_track_does_not_keep_the_long_memory():
+    stitch = PlayerTrackStitch()
+    for frame in range(1, 9):
+        see(stitch, frame, [{"id": 28, "box": box_at(200), "team": 0, "hue": 110}])
+    returned = see(
+        stitch,
+        8 + LOST_TRACK_MEMORY_FRAMES + 1,
+        [{"id": 36, "box": box_at(204), "team": 0, "hue": 110}],
+    )
+    assert_equal(returned, [36], "without a locked class the short window still expires")
+
+
+def test_long_gap_rejects_the_other_team_and_a_close_neighbour():
+    team_clash = PlayerTrackStitch()
+    hold_stable(team_clash, team=0)
+    returned = see(team_clash, 30, [{"id": 36, "box": box_at(208), "team": 1, "hue": 110}])
+    assert_equal(returned, [36], "a different team does not inherit the stable id")
+
+    crowded = PlayerTrackStitch()
+    for frame in range(1, 9):
+        see(
+            crowded,
+            frame,
+            [
+                {"id": 28, "box": box_at(200), "team": 0, "hue": 110},
+                {"id": 8, "box": box_at(230), "team": 1, "hue": 20},
+            ],
+        )
+    crowded.note_class_lock(28, True, 2)
+    crowded.note_class_lock(8, True, 2)
+    returned = see(
+        crowded,
+        30,
+        [
+            {"id": 8, "box": box_at(230), "team": 1, "hue": 20},
+            {"id": 36, "box": box_at(214), "team": 0, "hue": 110},
+        ],
+    )
+    assert_equal(returned, [8, 36], "the player who stayed blocks the reuse")
+
+
+def test_two_stable_players_leave_an_ambiguous_box_new():
+    stitch = PlayerTrackStitch()
+    for frame in range(1, 9):
+        see(
+            stitch,
+            frame,
+            [
+                {"id": 28, "box": box_at(100), "team": 0, "hue": 110},
+                {"id": 29, "box": box_at(140), "team": 0, "hue": 110},
+            ],
+        )
+    stitch.note_class_lock(28, True, 2)
+    stitch.note_class_lock(29, True, 2)
+    returned = see(stitch, 30, [{"id": 36, "box": box_at(120), "team": 0, "hue": 110}])
+    assert_equal(returned, [36], "a box between two stable players stays a new id")
+
+
+def test_goalkeeper_role_survives_into_the_long_memory():
+    stitch = PlayerTrackStitch()
+    for frame in range(1, 9):
+        stitch.apply(frame, [7], [box_at(100)], hues=[30], teams=[0], classes=[1])
+    stitch.note_class_lock(7, True, 1)
+    returned = list(
+        stitch.apply(30, [36], [box_at(108)], hues=[30], teams=[0], classes=[2])
+    )
+    assert_equal(returned, [36], "an outfield player does not inherit the goalkeeper")
+
+
 def test_note_team_is_remembered_for_the_next_gap():
     stitch = PlayerTrackStitch()
     see(stitch, 1, [{"id": 4, "box": box_at(100), "team": None, "hue": None}])
@@ -212,5 +313,11 @@ if __name__ == "__main__":
     test_two_lost_players_one_box_between_them_stays_new()
     test_still_player_returns_beside_the_last_foot()
     test_goalkeeper_does_not_absorb_a_nearby_player()
+    test_stable_identity_survives_ids_36_and_54()
+    test_stable_identity_expires_after_sixty_frames()
+    test_unlocked_track_does_not_keep_the_long_memory()
+    test_long_gap_rejects_the_other_team_and_a_close_neighbour()
+    test_two_stable_players_leave_an_ambiguous_box_new()
+    test_goalkeeper_role_survives_into_the_long_memory()
     test_note_team_is_remembered_for_the_next_gap()
     print("player track stitch tests passed")

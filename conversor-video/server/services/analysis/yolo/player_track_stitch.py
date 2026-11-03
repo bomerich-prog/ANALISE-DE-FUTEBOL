@@ -1,10 +1,11 @@
-"""Reuse a player track id after a short ByteTrack break.
+"""Reuse a player track id after a ByteTrack break.
 
 ByteTrack sometimes retires an id and mints a new one when the same player
-returns a few frames later, still next to the last box. This memory keeps the
-retired id for a short window and gives it back only when position, size,
-motion, shirt and the surrounding players all agree. Distance by itself never
-accepts a match.
+returns a few frames later. This memory gives the old id back before possession,
+passes and stats ever see the new number. A short window covers any track. A
+longer window is only for a track that was already stable. Position, size,
+motion, shirt, team, role and the surrounding players must agree. Distance by
+itself never accepts a match, and an ambiguous pair stays split.
 """
 
 from __future__ import annotations
@@ -16,6 +17,8 @@ import numpy as np
 
 
 LOST_TRACK_MEMORY_FRAMES = 12
+STABLE_TRACK_MEMORY_FRAMES = 60
+STABLE_MIN_FRAMES = 8
 GOALKEEPER_CLASS_ID = 1
 SEARCH_RADIUS_CAP_PX = 64.0
 SEARCH_RADIUS_FLOOR_PX = 24.0
@@ -89,8 +92,15 @@ def torso_hue(frame, box) -> Optional[float]:
 class PlayerTrackStitch:
     """Give a brand-new ByteTrack id back to the player who just went missing."""
 
-    def __init__(self, memory_frames: int = LOST_TRACK_MEMORY_FRAMES):
+    def __init__(
+        self,
+        memory_frames: int = LOST_TRACK_MEMORY_FRAMES,
+        stable_memory_frames: int = STABLE_TRACK_MEMORY_FRAMES,
+        stable_min_frames: int = STABLE_MIN_FRAMES,
+    ):
         self.memory_frames = max(1, int(memory_frames))
+        self.stable_memory_frames = max(self.memory_frames, int(stable_memory_frames))
+        self.stable_min_frames = max(1, int(stable_min_frames))
         self._tracks: Dict[int, dict] = {}
         self.stitches = 0
         self.rejected_ambiguous = 0
@@ -116,6 +126,24 @@ class PlayerTrackStitch:
         if state is None:
             return
         state["team_id"] = team_value
+
+    def note_class_lock(self, track_id, locked, class_id=None) -> None:
+        """Remember whether this identity already has a locked role."""
+        if track_id is None:
+            return
+        try:
+            track_key = int(track_id)
+        except (TypeError, ValueError):
+            return
+        state = self._tracks.get(track_key)
+        if state is None:
+            return
+        state["class_locked"] = bool(locked)
+        if locked and class_id is not None:
+            try:
+                state["class_id"] = int(class_id)
+            except (TypeError, ValueError):
+                return
 
     def apply(
         self,
@@ -152,7 +180,7 @@ class PlayerTrackStitch:
             if track_id in present_ids:
                 continue
             gap = frame_number - int(state["last_frame"])
-            if gap > self.memory_frames:
+            if gap > self._memory_limit(state):
                 expired_ids.append(track_id)
                 continue
             if gap >= 1:
@@ -187,6 +215,8 @@ class PlayerTrackStitch:
     def metrics(self) -> Dict[str, object]:
         return {
             "memory_frames": self.memory_frames,
+            "stable_memory_frames": self.stable_memory_frames,
+            "stable_min_frames": self.stable_min_frames,
             "stitches": self.stitches,
             "rejected_ambiguous": self.rejected_ambiguous,
             "rejected_nearby": self.rejected_nearby,
@@ -267,7 +297,7 @@ class PlayerTrackStitch:
 
     def _score(self, candidate, state, frame_number, active_feet):
         gap = int(frame_number) - int(state["last_frame"])
-        if gap < 1 or gap > self.memory_frames:
+        if gap < 1 or gap > self._memory_limit(state):
             return False, None, "expired"
         last = state["foot"]
         foot = candidate["foot"]
@@ -335,6 +365,7 @@ class PlayerTrackStitch:
                 "track_id": int(state["track_id"]),
                 "replaced_track_id": int(replaced_track_id),
                 "gap_frames": int(frame_number) - int(state["last_frame"]),
+                "memory": "long" if self._is_stable(state) else "short",
             }
         )
 
@@ -352,7 +383,22 @@ class PlayerTrackStitch:
             "hue": observation["hue"],
             "team_id": observation["team"],
             "class_id": observation.get("class_id"),
+            "class_locked": False,
+            "frames_seen": 1,
         }
+
+    def _is_stable(self, state) -> bool:
+        """A long memory is only for someone already seen, locked and identified."""
+        if int(state.get("frames_seen", 0)) < self.stable_min_frames:
+            return False
+        if not state.get("class_locked"):
+            return False
+        return state.get("team_id") is not None or state.get("class_id") is not None
+
+    def _memory_limit(self, state) -> int:
+        if self._is_stable(state):
+            return self.stable_memory_frames
+        return self.memory_frames
 
     def _update_state(self, state, observation, frame_number) -> None:
         gap = max(1, int(frame_number) - int(state["last_frame"]))
@@ -366,6 +412,7 @@ class PlayerTrackStitch:
         state["height"] = observation["height"]
         state["area"] = observation["area"]
         state["aspect"] = observation["aspect"]
+        state["frames_seen"] = int(state.get("frames_seen", 0)) + 1
         if observation["hue"] is not None:
             state["hue"] = observation["hue"]
         if observation["team"] is not None:

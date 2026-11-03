@@ -3146,6 +3146,11 @@ def analyze(args):
                     current_frame_number,
                     verifying=person_class_lock.is_locked(track_id),
                 )
+                player_track_stitch.note_class_lock(
+                    track_id,
+                    person_class_lock.is_locked(track_id),
+                    class_id,
+                )
 
             foot_field = None
             if view_transformer is not None:
@@ -4214,7 +4219,7 @@ def analyze(args):
                 "minimum_matching_threshold": BYTE_TRACK_MINIMUM_MATCHING_THRESHOLD,
                 "frame_rate": float(fps),
             },
-            "id_storage": "track_id is stored per detection dict for player/goalkeeper/referee and rendered in labels",
+            "id_storage": "PlayerTrackStitch rewrites a new ByteTrack id back to the stable track_id before class, team, possession, passes and stats",
             "team_classifier": "torso brightness and saturation decide team_id; a weak crop does not vote",
             "stability": {
                 "recovered_track_gap_events": recovered_track_gap_events,
