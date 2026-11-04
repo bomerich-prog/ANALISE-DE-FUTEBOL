@@ -66,6 +66,9 @@ PREDICTIVE_BALL_CONFIDENCE_FAR_MIN = 0.20
 HYBRID_BALL_CONFIDENCE_NEAR_MIN = 0.05
 HYBRID_BALL_CONFIDENCE_FAR_MIN = 0.1
 FIELD_PREDICTION_MAX_DELTA_PX = 180.0
+# The pitch homography stays measured, but a bad projection was handing
+# possession and passes to the wrong player. Decisions use image pixels.
+HOMOGRAPHY_FEEDS_DECISIONS = False
 HYBRID_CONFIDENCE_BONUS_DISTANCE_PX = 40.0
 HYBRID_CONFIDENCE_BONUS_DELTA = 0.03
 PHYSICAL_BALL_VALIDATION_DEFAULT = os.getenv("PHYSICAL_BALL_VALIDATION", "on").strip().lower()
@@ -2916,7 +2919,8 @@ def analyze(args):
         ball_tracking_metrics["prediction_mode_selected"] = ball_prediction_mode_selected
         predicted_center_for_search = predicted_ball_center
         if (
-            view_transformer is not None
+            HOMOGRAPHY_FEEDS_DECISIONS
+            and view_transformer is not None
             and predicted_field_center_in_pixels is not None
             and len(ball_field_position_history) >= 2
         ):
@@ -3153,7 +3157,7 @@ def analyze(args):
                 )
 
             foot_field = None
-            if view_transformer is not None:
+            if HOMOGRAPHY_FEEDS_DECISIONS and view_transformer is not None:
                 field_point = transform_image_point_to_field(
                     view_transformer,
                     detection_foot_point(box),
@@ -3793,24 +3797,25 @@ def analyze(args):
         )
 
         homography_stage_start = time.perf_counter()
+        decision_transformer = view_transformer if HOMOGRAPHY_FEEDS_DECISIONS else None
         assign_field_coordinates_to_detections(
             accepted_player_detections,
-            view_transformer,
+            decision_transformer,
             detection_foot_point,
         )
         assign_field_coordinates_to_detections(
             accepted_goalkeeper_detections,
-            view_transformer,
+            decision_transformer,
             detection_foot_point,
         )
         assign_field_coordinates_to_detections(
             accepted_referee_detections,
-            view_transformer,
+            decision_transformer,
             detection_foot_point,
         )
         assign_field_coordinates_to_detections(
             ball_detections,
-            view_transformer,
+            decision_transformer,
             detection_center,
         )
 
@@ -3847,7 +3852,10 @@ def analyze(args):
         remembered_ball = None
         if ball_last_valid_detection is not None:
             remembered_ball = dict(ball_last_valid_detection)
-            if remembered_ball.get("field_x") is None or remembered_ball.get("field_y") is None:
+            if not HOMOGRAPHY_FEEDS_DECISIONS:
+                remembered_ball["field_x"] = None
+                remembered_ball["field_y"] = None
+            elif remembered_ball.get("field_x") is None or remembered_ball.get("field_y") is None:
                 remembered_center = detection_center_np(remembered_ball["box"])
                 remembered_field = transform_image_point_to_field(view_transformer, remembered_center)
                 if remembered_field is not None:
@@ -3860,7 +3868,7 @@ def analyze(args):
         possession_ball = build_ball_state(
             observed_ball=ball_detections[0] if ball_detections else None,
             remembered_ball=remembered_ball,
-            predicted_field=predicted_field_center,
+            predicted_field=predicted_field_center if HOMOGRAPHY_FEEDS_DECISIONS else None,
             predicted_pixel=predicted_center_for_search,
             internal_alive=internal_ball_track_alive,
         )
@@ -4208,7 +4216,7 @@ def analyze(args):
             "player_duplicate_iou_threshold": PERSON_DUPLICATE_IOU_THRESHOLD,
             "field_filter": "player/goalkeeper/referee bbox bottom-center foot point must be inside white-line-guided playable-field polygon",
             "labels": "class name and confidence are burned into the annotated video",
-            "field_coordinates": "field_x and field_y are homography-transformed pitch coordinates for player/goalkeeper/referee/ball",
+            "field_coordinates": "possession, passes and the ball heatmap use image pixels; homography coordinates are not fed to those decisions",
         },
         "tracking": {
             "status": "implemented",
@@ -4277,7 +4285,8 @@ def analyze(args):
             "frame_examples": goalkeeper_assignment_frame_examples,
         },
         "homography": {
-            "status": "gated ViewTransformer (RANSAC + white-line support)",
+            "status": "measured only; coordinates are not used for possession, passes or the ball heatmap",
+            "feeds_decisions": HOMOGRAPHY_FEEDS_DECISIONS,
             "valid_frames": homography_valid_frames,
             "total_frames": frames_processed,
             "avg_keypoints_detected": avg_pitch_keypoints_detected,
