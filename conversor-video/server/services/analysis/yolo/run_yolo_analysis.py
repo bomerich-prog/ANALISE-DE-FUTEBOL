@@ -93,6 +93,20 @@ BALL_REACQUIRE_PX = 400.0
 # in open grass is not the ball in flight.
 BALL_ANCHOR_STEP_PX = 36.0
 BALL_NEARBY_STRONG_DISTANCE_PX = PHYSICAL_ACCEPT_DISTANCE
+# observed: a ball was accepted, or the five-frame memory still holds it.
+# lost: that memory has expired and the old pixel velocity is discarded.
+# recovering: a candidate away from the last touch is waiting for one more frame.
+# recovered: this frame accepted a ball while the track was lost.
+BALL_TRACK_OBSERVED = "observed"
+BALL_TRACK_LOST = "lost"
+BALL_TRACK_RECOVERING = "recovering"
+BALL_TRACK_RECOVERED = "recovered"
+BALL_RECOVERY_WINDOW_FRAMES = 45
+BALL_REJECTED_CENTER_FRAMES = 15
+BALL_REJECTED_CENTER_PX = 40.0
+BALL_RECOVERY_CONFIRM_CONFIDENCE = 0.50
+BALL_RECOVERY_AIRBORNE_MATCH_PX = 120.0
+BALL_AREA_RATIO_MAX = 2.5
 BALL_DIAGNOSTIC_MIN_CONFIDENCE = 0.05
 PREDICTIVE_BALL_TRACKING_DEFAULT = os.getenv("PREDICTIVE_BALL_TRACKING", "on").strip().lower()
 if PREDICTIVE_BALL_TRACKING_DEFAULT not in {"on", "off"}:
@@ -1526,6 +1540,194 @@ def nearest_supported_ball(
     return best
 
 
+def prune_rejected_ball_centers(rejected, frame_number, window=BALL_REJECTED_CENTER_FRAMES):
+    keep_after = int(frame_number) - int(window)
+    return [item for item in rejected or [] if int(item[0]) >= keep_after]
+
+
+def ball_near_rejected_center(rejected, center, radius=BALL_REJECTED_CENTER_PX):
+    point = np.asarray(center, dtype=np.float32)
+    limit = float(radius)
+    for item in rejected or []:
+        previous = np.asarray([float(item[1]), float(item[2])], dtype=np.float32)
+        if float(np.linalg.norm(point - previous)) <= limit:
+            return True
+    return False
+
+
+def note_rejected_ball_center(rejected, frame_number, center):
+    """Remember a box refused for lack of a player, for the next 15 frames."""
+    pruned = prune_rejected_ball_centers(rejected, frame_number)
+    point = np.asarray(center, dtype=np.float32)
+    if ball_near_rejected_center(pruned, point):
+        return pruned
+    pruned.append((int(frame_number), float(point[0]), float(point[1])))
+    return pruned
+
+
+def ball_area_is_plausible(detection, last_touch_area, max_ratio=BALL_AREA_RATIO_MAX):
+    area = float(detection_box_area(detection["box"]))
+    if area <= 0.0:
+        return False
+    if last_touch_area is None or float(last_touch_area) <= 0.0:
+        return True
+    ratio = area / float(last_touch_area)
+    limit = float(max_ratio)
+    return (1.0 / limit) <= ratio <= limit
+
+
+def ball_track_state_for_gap(missing_frames, pending, has_touch):
+    """State at the start of a frame, before this frame's box is applied."""
+    if not has_touch or int(missing_frames) > BALL_MEMORY_MAX_MISSING_FRAMES:
+        if pending is not None and has_touch:
+            return BALL_TRACK_RECOVERING
+        return BALL_TRACK_LOST
+    return BALL_TRACK_OBSERVED
+
+
+def select_ball_reacquisition(
+    candidates,
+    person_detections,
+    last_touch_center,
+    last_touch_area,
+    rejected_centers,
+    frame_number,
+    missing_frames,
+    pending,
+    predicted_center=None,
+):
+    """Recover a ball from the last touch a player had.
+
+    The old pixel prediction is not an accept region. A box that only
+    continues that prediction, with no player beside it, is recorded and
+    refused. A strong box back at the last touch is accepted in one frame,
+    including the ball that reappears far from the grass-track prediction.
+    Once the five-frame memory has expired, a box at a player's feet within
+    one pass is accepted too. An airborne box inside that pass is published
+    only when the next frame shows it in the same place.
+    """
+    rejected = prune_rejected_ball_centers(rejected_centers, frame_number)
+    result = {
+        "detection": None,
+        "pending": None,
+        "rejected": rejected,
+        "restart_history": False,
+        "used": False,
+    }
+    if last_touch_center is None:
+        return result
+
+    touch = np.asarray(last_touch_center, dtype=np.float32)
+    predicted = None if predicted_center is None else np.asarray(predicted_center, dtype=np.float32)
+    lost = int(missing_frames) > BALL_MEMORY_MAX_MISSING_FRAMES
+    lost_age = int(missing_frames) - BALL_MEMORY_MAX_MISSING_FRAMES
+    wide_window = lost_age <= BALL_RECOVERY_WINDOW_FRAMES
+
+    def remember(center):
+        result["rejected"] = note_rejected_ball_center(result["rejected"], frame_number, center)
+
+    def prediction_distance(center):
+        if predicted is None:
+            return None
+        return float(np.linalg.norm(center - predicted))
+
+    def accept(candidate, center):
+        distance_prediction = prediction_distance(center)
+        result["detection"] = candidate
+        result["pending"] = None
+        result["used"] = True
+        result["restart_history"] = lost or (
+            distance_prediction is not None and distance_prediction > PHYSICAL_MAX_DISTANCE
+        )
+        return result
+
+    ranked = []
+    for candidate in candidates or []:
+        confidence = float(candidate.get("confidence", 0.0))
+        if confidence < BALL_STRONG_CONFIDENCE:
+            continue
+        center = detection_center_np(candidate["box"])
+        if not ball_area_is_plausible(candidate, last_touch_area):
+            remember(center)
+            continue
+        if ball_near_rejected_center(result["rejected"], center):
+            remember(center)
+            continue
+        distance_touch = float(np.linalg.norm(center - touch))
+        supported = ball_supported_by_player(candidate, person_detections)
+        distance_prediction = prediction_distance(center)
+        continues_old_prediction = (
+            (not supported)
+            and distance_touch > BALL_ANCHOR_STEP_PX
+            and distance_prediction is not None
+            and distance_prediction <= BALL_PREDICTION_NEAR_DISTANCE_PX
+        )
+        if continues_old_prediction or distance_touch > BALL_REACQUIRE_PX:
+            remember(center)
+            continue
+        ranked.append(
+            {
+                "distance": distance_touch,
+                "confidence": confidence,
+                "candidate": candidate,
+                "center": center,
+                "supported": supported,
+            }
+        )
+
+    ranked.sort(key=lambda item: (item["distance"], -item["confidence"]))
+    for item in ranked:
+        near_touch = item["distance"] <= BALL_PREDICTION_NEAR_DISTANCE_PX
+        short_step = item["distance"] <= BALL_ANCHOR_STEP_PX
+        if (
+            near_touch
+            and item["confidence"] >= BALL_RECOVERY_CONFIRM_CONFIDENCE
+            and (item["supported"] or short_step)
+        ):
+            return accept(item["candidate"], item["center"])
+
+    if lost:
+        footed = [item for item in ranked if item["supported"]]
+        if footed:
+            item = footed[0]
+            if wide_window:
+                return accept(item["candidate"], item["center"])
+            if pending is not None and _pending_matches(pending, item["center"], frame_number):
+                return accept(item["candidate"], item["center"])
+            result["pending"] = {"center": item["center"].astype(np.float32), "frame": int(frame_number)}
+            return result
+
+        if wide_window:
+            airborne = [
+                item
+                for item in ranked
+                if (not item["supported"])
+                and item["distance"] > BALL_ANCHOR_STEP_PX
+                and item["confidence"] >= BALL_RECOVERY_CONFIRM_CONFIDENCE
+            ]
+            if airborne:
+                item = airborne[0]
+                if pending is not None and _pending_matches(pending, item["center"], frame_number):
+                    return accept(item["candidate"], item["center"])
+                result["pending"] = {
+                    "center": item["center"].astype(np.float32),
+                    "frame": int(frame_number),
+                }
+                return result
+
+    for item in ranked:
+        if not item["supported"] and item["distance"] > BALL_ANCHOR_STEP_PX:
+            remember(item["center"])
+    return result
+
+
+def _pending_matches(pending, center, frame_number):
+    if pending is None or int(frame_number) - int(pending.get("frame", -999)) != 1:
+        return False
+    previous = np.asarray(pending["center"], dtype=np.float32)
+    return float(np.linalg.norm(center - previous)) <= BALL_RECOVERY_AIRBORNE_MATCH_PX
+
+
 def select_player_ball_fallback(
     ball_candidates,
     predicted_center,
@@ -2314,6 +2516,11 @@ def build_performance_profile_report(
         },
         "ball_tracking_enhancements": {
             "memory_max_missing_frames": BALL_MEMORY_MAX_MISSING_FRAMES,
+            "recovery_window_frames": BALL_RECOVERY_WINDOW_FRAMES,
+            "ball_track_state": str(ball_tracking_metrics.get("ball_track_state", BALL_TRACK_LOST)),
+            "ball_reacquisitions": int(ball_tracking_metrics.get("ball_reacquisitions", 0)),
+            "ball_rejected_open_boxes": int(ball_tracking_metrics.get("ball_rejected_open_boxes", 0)),
+            "ball_recovery_examples": list(ball_tracking_metrics.get("ball_recovery_examples", [])),
             "ball_memory_hits": int(ball_tracking_metrics["ball_memory_hits"]),
             "ball_memory_misses": int(ball_tracking_metrics["ball_memory_misses"]),
             "ball_roi_searches": int(ball_tracking_metrics["ball_roi_searches"]),
@@ -2776,6 +2983,10 @@ def analyze(args):
     physical_pending_candidate_state = None
     ball_last_valid_detection = None
     last_supported_ball_center = None
+    last_supported_ball_area = None
+    rejected_ball_centers = []
+    reacquisition_pending = None
+    ball_track_state = BALL_TRACK_LOST
     ball_frames_without_detection = 0
     ball_prediction_mode_selected = "pixel"
     ball_previous_raw_present = False
@@ -2785,6 +2996,10 @@ def analyze(args):
     ball_tracking_metrics = {
         "ball_memory_hits": 0,
         "ball_memory_misses": 0,
+        "ball_reacquisitions": 0,
+        "ball_rejected_open_boxes": 0,
+        "ball_track_state": BALL_TRACK_LOST,
+        "ball_recovery_examples": [],
         "ball_roi_searches": 0,
         "ball_roi_success": 0,
         "ball_prediction_error_sum": 0.0,
@@ -3400,6 +3615,16 @@ def analyze(args):
             support_people,
             last_supported_ball_center,
         ):
+            if selected_ball_detection is not None and not ball_supported_by_player(
+                selected_ball_detection,
+                support_people,
+            ):
+                rejected_ball_centers = note_rejected_ball_center(
+                    rejected_ball_centers,
+                    current_frame_number,
+                    detection_center_np(selected_ball_detection["box"]),
+                )
+                ball_tracking_metrics["ball_rejected_open_boxes"] += 1
             selected_ball_detection = None
         if physical_ball_validation_enabled:
             selected_ball_detection, physical_pending_candidate_state, physical_validation_stats = (
@@ -3508,7 +3733,38 @@ def analyze(args):
         else:
             selected_ball_detection = None
 
-        raw_ball_present = bool(tracker_ball_detections)
+        was_lost = ball_frames_without_detection > BALL_MEMORY_MAX_MISSING_FRAMES
+        restart_ball_history = False
+        if selected_ball_detection is None:
+            reacquisition = select_ball_reacquisition(
+                ball_detections_after_nms_dicts,
+                support_people,
+                last_supported_ball_center,
+                last_supported_ball_area,
+                rejected_ball_centers,
+                current_frame_number,
+                ball_frames_without_detection,
+                reacquisition_pending,
+                predicted_center=predicted_ball_center,
+            )
+            rejected_ball_centers = reacquisition["rejected"]
+            reacquisition_pending = reacquisition["pending"]
+            if reacquisition["used"]:
+                selected_ball_detection = reacquisition["detection"]
+                selected_ball_detection["source"] = "ball-reacquisition"
+                restart_ball_history = bool(reacquisition["restart_history"])
+                physical_pending_candidate_state = None
+                ball_tracking_metrics["ball_reacquisitions"] += 1
+        else:
+            reacquisition_pending = None
+        if was_lost and selected_ball_detection is not None:
+            restart_ball_history = True
+        if restart_ball_history:
+            ball_position_history.clear()
+            ball_field_position_history.clear()
+            ball_motion_history.clear()
+
+        raw_ball_present = bool(tracker_ball_detections) or selected_ball_detection is not None
         if raw_ball_present:
             ball_current_raw_gap = 0
         else:
@@ -3555,6 +3811,7 @@ def analyze(args):
                 # The next pass is measured from this player. A grass box never
                 # reaches this line: it was dropped before it could move the anchor.
                 last_supported_ball_center = detection_center_np(selected_ball_detection["box"])
+                last_supported_ball_area = float(detection_box_area(selected_ball_detection["box"]))
             if hybrid_ball_search_enabled:
                 if detection_source_mode in {"semi_global", "full_global"}:
                     ball_consecutive_detections_for_crop += 1
@@ -3587,16 +3844,12 @@ def analyze(args):
                 if ball_prediction_mode_selected == "field" and field_motion_state is not None
                 else pixel_motion_state
             )
-            velocity = (
-                chosen_motion_state["velocity"]
-                if chosen_motion_state is not None
-                else np.zeros(2, dtype=np.float32)
-            )
-            direction = (
-                chosen_motion_state["direction"]
-                if chosen_motion_state is not None
-                else np.zeros(2, dtype=np.float32)
-            )
+            if restart_ball_history or chosen_motion_state is None:
+                velocity = np.zeros(2, dtype=np.float32)
+                direction = np.zeros(2, dtype=np.float32)
+            else:
+                velocity = chosen_motion_state["velocity"]
+                direction = chosen_motion_state["direction"]
             ball_motion_history.append(
                 {
                     "frame": int(current_frame_number),
@@ -3662,6 +3915,32 @@ def analyze(args):
             ):
                 ball_search_mode = "global_search"
                 ball_consecutive_detections_for_crop = 0
+        if selected_ball_detection is not None and not weak_yolo_continuation:
+            if previous_missing_frames > BALL_MEMORY_MAX_MISSING_FRAMES or restart_ball_history:
+                ball_track_state = BALL_TRACK_RECOVERED
+            else:
+                ball_track_state = BALL_TRACK_OBSERVED
+        elif ball_frames_without_detection > BALL_MEMORY_MAX_MISSING_FRAMES:
+            ball_track_state = (
+                BALL_TRACK_RECOVERING if reacquisition_pending is not None else BALL_TRACK_LOST
+            )
+        else:
+            ball_track_state = BALL_TRACK_OBSERVED
+        ball_tracking_metrics["ball_track_state"] = ball_track_state
+        if (
+            ball_track_state == BALL_TRACK_RECOVERED
+            and selected_ball_detection is not None
+            and len(ball_tracking_metrics["ball_recovery_examples"]) < 8
+        ):
+            recovered_center = detection_center_np(selected_ball_detection["box"])
+            ball_tracking_metrics["ball_recovery_examples"].append(
+                {
+                    "frame": int(current_frame_number),
+                    "x": round(float(recovered_center[0]), 1),
+                    "y": round(float(recovered_center[1]), 1),
+                    "confidence": round(float(selected_ball_detection["confidence"]), 3),
+                }
+            )
         visual_ball_present = bool(ball_detections)
         if visual_ball_present:
             ball_current_final_gap = 0
@@ -4011,12 +4290,13 @@ def analyze(args):
         possession_players = build_possession_players(
             list(accepted_player_detections) + list(accepted_goalkeeper_detections)
         )
+        ball_feeds_possession = ball_track_state in {BALL_TRACK_OBSERVED, BALL_TRACK_RECOVERED}
         possession_ball = build_ball_state(
             observed_ball=ball_detections[0] if ball_detections else None,
-            remembered_ball=remembered_ball,
+            remembered_ball=remembered_ball if ball_feeds_possession else None,
             predicted_field=predicted_field_center if HOMOGRAPHY_FEEDS_DECISIONS else None,
-            predicted_pixel=predicted_center_for_search,
-            internal_alive=internal_ball_track_alive,
+            predicted_pixel=predicted_center_for_search if ball_feeds_possession else None,
+            internal_alive=internal_ball_track_alive and ball_feeds_possession,
         )
         possession_snapshot = possession_engine.update(possession_players, possession_ball)
         possession_events = possession_snapshot.as_dict()
@@ -4164,6 +4444,18 @@ def analyze(args):
                 "framesProcessed": frames_processed,
                 "playersDetected": max_players_detected,
                 "ballDetected": ball_detected or frame_ball,
+                "ballTrack": {
+                    "state": ball_track_state,
+                    "lastTouch": (
+                        None
+                        if last_supported_ball_center is None
+                        else [
+                            round(float(last_supported_ball_center[0]), 1),
+                            round(float(last_supported_ball_center[1]), 1),
+                        ]
+                    ),
+                    "recoveries": list(ball_tracking_metrics["ball_recovery_examples"]),
+                },
                 "events": possession_events,
                 "passes": {
                     "total_passes": int(pass_metrics_live["total_passes"]),
