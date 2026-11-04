@@ -83,6 +83,15 @@ PHYSICAL_HIGH_SPEED_THRESHOLD = 120.0
 BALL_DETECTOR_DEFAULT_CONFIDENCE = 0.25
 BALL_YOLO_RECALL_CONFIDENCE = 0.02
 BALL_STRONG_CONFIDENCE = 0.25
+# A box this close to a player's feet can be the ball. The grass box that
+# walked away from the opening play was farther than this from every player.
+BALL_PLAYER_SUPPORT_PX = 45.0
+# A ball may reappear this far from the last ball a player actually had.
+# That covers a pass. The grass box beside the far defender is farther.
+BALL_REACQUIRE_PX = 400.0
+# An unsupported box may continue only for this short step. A longer jump
+# in open grass is not the ball in flight.
+BALL_ANCHOR_STEP_PX = 36.0
 BALL_NEARBY_STRONG_DISTANCE_PX = PHYSICAL_ACCEPT_DISTANCE
 BALL_DIAGNOSTIC_MIN_CONFIDENCE = 0.05
 PREDICTIVE_BALL_TRACKING_DEFAULT = os.getenv("PREDICTIVE_BALL_TRACKING", "on").strip().lower()
@@ -1423,12 +1432,109 @@ def keep_recoverable_ball_candidates(
     return distant_strong
 
 
+def ball_supported_by_player(detection, person_detections, max_distance_px=BALL_PLAYER_SUPPORT_PX):
+    """True when a player's foot is close enough to take this ball."""
+    if detection is None or not person_detections:
+        return False
+    center = detection_center_np(detection["box"])
+    limit = float(max_distance_px)
+    for person in person_detections:
+        box = person.get("box") or person.get("bounding_box")
+        if not box:
+            continue
+        foot_x, foot_y = detection_foot_point(box)
+        foot = np.asarray([foot_x, foot_y], dtype=np.float32)
+        if float(np.linalg.norm(center - foot)) <= limit:
+            return True
+    return False
+
+
+def ball_selection_keeps_player_support(
+    detection,
+    predicted_center,
+    person_detections,
+    last_supported_center=None,
+    support_px=BALL_PLAYER_SUPPORT_PX,
+    flight_px=BALL_ANCHOR_STEP_PX,
+):
+    """A ball in open grass cannot keep its own track alive.
+
+    While a track is alive, the ball may stay with the player who has it or
+    take one short step away from that player. It may not walk across the
+    grass and arrive at someone else. Once the track has died, a strong box
+    at a player's feet can be a pass, if it is still within one pass of the
+    last ball a player had.
+    """
+    if detection is None:
+        return False
+    supported = ball_supported_by_player(detection, person_detections, support_px)
+    center = detection_center_np(detection["box"])
+    strong = float(detection["confidence"]) >= BALL_STRONG_CONFIDENCE
+
+    def within(anchor, limit):
+        if anchor is None:
+            return False
+        point = np.asarray(anchor, dtype=np.float32)
+        return float(np.linalg.norm(center - point)) <= float(limit)
+
+    if last_supported_center is None:
+        return supported and strong
+    if predicted_center is None:
+        return supported and strong and within(last_supported_center, BALL_REACQUIRE_PX)
+    if not strong:
+        return (
+            supported
+            and within(predicted_center, flight_px)
+            and within(last_supported_center, BALL_PREDICTION_NEAR_DISTANCE_PX)
+        )
+    if supported and within(last_supported_center, BALL_PREDICTION_NEAR_DISTANCE_PX):
+        return True
+    return within(last_supported_center, flight_px)
+
+
+def nearest_supported_ball(
+    candidates,
+    person_detections,
+    last_supported_center,
+    predicted_center=None,
+    support_px=BALL_PLAYER_SUPPORT_PX,
+    reacquire_px=BALL_REACQUIRE_PX,
+):
+    """Pick a strong ball at a player's feet.
+
+    While a prediction is alive, only a box still with that player qualifies.
+    A grass track must not be replaced by the defender it has walked up to.
+    After the track dies, a box within one pass of the last touch qualifies.
+    """
+    best = None
+    best_key = None
+    anchor = None if last_supported_center is None else np.asarray(last_supported_center, dtype=np.float32)
+    limit = float(BALL_PREDICTION_NEAR_DISTANCE_PX if predicted_center is not None else reacquire_px)
+    for candidate in candidates or []:
+        if float(candidate.get("confidence", 0.0)) < BALL_STRONG_CONFIDENCE:
+            continue
+        if not ball_supported_by_player(candidate, person_detections, support_px):
+            continue
+        center = detection_center_np(candidate["box"])
+        distance = 0.0 if anchor is None else float(np.linalg.norm(center - anchor))
+        if anchor is not None and distance > limit:
+            continue
+        key = (distance, -float(candidate["confidence"]))
+        if best_key is None or key < best_key:
+            best = candidate
+            best_key = key
+    return best
+
+
 def select_player_ball_fallback(
     ball_candidates,
     predicted_center,
     last_valid_detection,
     max_distance_px=BALL_PREDICTION_NEAR_DISTANCE_PX,
     min_confidence=BALL_STRONG_CONFIDENCE,
+    person_detections=None,
+    player_support_px=BALL_PLAYER_SUPPORT_PX,
+    last_supported_center=None,
 ):
     """Continue an open ball track with the player detector's ball class.
 
@@ -1475,9 +1581,21 @@ def select_player_ball_fallback(
     if eligible:
         eligible.sort(key=lambda item: (item[0], item[1]))
         chosen = eligible[0][2]
-        decision["used"] = True
         decision["confidence"] = float(chosen["confidence"])
         decision["distance"] = float(eligible[0][0])
+        if person_detections is not None and not ball_supported_by_player(
+            chosen, person_detections, player_support_px
+        ):
+            decision["rejected_distance"] = True
+            return None, decision
+        if last_supported_center is not None:
+            anchor = np.asarray(last_supported_center, dtype=np.float32)
+            anchor_distance = float(np.linalg.norm(detection_center_np(chosen["box"]) - anchor))
+            if anchor_distance > BALL_PREDICTION_NEAR_DISTANCE_PX:
+                decision["rejected_distance"] = True
+                decision["distance"] = anchor_distance
+                return None, decision
+        decision["used"] = True
         return chosen, decision
 
     if saw_near_weak:
@@ -2657,6 +2775,7 @@ def analyze(args):
     semi_global_recovery_cooldown_remaining = 0
     physical_pending_candidate_state = None
     ball_last_valid_detection = None
+    last_supported_ball_center = None
     ball_frames_without_detection = 0
     ball_prediction_mode_selected = "pixel"
     ball_previous_raw_present = False
@@ -3274,6 +3393,14 @@ def analyze(args):
             if pixel_motion_state is not None
             else 0.0
         )
+        support_people = list(player_detections) + list(goalkeeper_detections)
+        if not ball_selection_keeps_player_support(
+            selected_ball_detection,
+            predicted_ball_center,
+            support_people,
+            last_supported_ball_center,
+        ):
+            selected_ball_detection = None
         if physical_ball_validation_enabled:
             selected_ball_detection, physical_pending_candidate_state, physical_validation_stats = (
                 apply_physical_ball_validation(
@@ -3322,6 +3449,8 @@ def analyze(args):
                 player_ball_candidates,
                 predicted_ball_center,
                 ball_last_valid_detection,
+                person_detections=support_people,
+                last_supported_center=last_supported_ball_center,
             )
             if fallback_decision["used"]:
                 selected_ball_detection = fallback_detection
@@ -3343,6 +3472,19 @@ def analyze(args):
                     ball_tracking_metrics["fallback_frames_rejected_confidence"] += 1
                 ball_tracking_metrics["neither_detector_frames"] += 1
 
+        if selected_ball_detection is None:
+            # The box that continues the current prediction can be the grass
+            # track. Look at every strong detection and take the one that is
+            # actually at a player's feet, within one pass of the last touch.
+            recovered_ball = nearest_supported_ball(
+                ball_detections_after_nms_dicts,
+                support_people,
+                last_supported_ball_center,
+                predicted_center=predicted_ball_center,
+            )
+            if recovered_ball is not None:
+                selected_ball_detection = recovered_ball
+                physical_pending_candidate_state = None
         dedicated_ball_detections = ball_dicts_to_detections(
             [selected_ball_detection] if selected_ball_detection is not None else []
         )
@@ -3409,6 +3551,10 @@ def analyze(args):
             else:
                 ball_frames_without_detection = 0
             ball_last_valid_detection = selected_ball_detection
+            if ball_supported_by_player(selected_ball_detection, support_people):
+                # The next pass is measured from this player. A grass box never
+                # reaches this line: it was dropped before it could move the anchor.
+                last_supported_ball_center = detection_center_np(selected_ball_detection["box"])
             if hybrid_ball_search_enabled:
                 if detection_source_mode in {"semi_global", "full_global"}:
                     ball_consecutive_detections_for_crop += 1
