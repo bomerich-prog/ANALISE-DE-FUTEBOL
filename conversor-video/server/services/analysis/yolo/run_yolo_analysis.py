@@ -21,6 +21,7 @@ import supervision as sv
 from ultralytics import YOLO
 
 from ball_heatmap import BallHeatmapAccumulator
+from event_replay import record_event_frame, write_event_record
 from pass_detector import PassDetector
 from player_stats import PlayerStatsAccumulator
 from person_class import PersonClassLock, TrackAppearanceGate, reject_non_person_detections
@@ -2719,6 +2720,8 @@ def analyze(args):
         if args.ball_diagnostics_output
         else None
     )
+    event_record_path = Path(args.event_record).resolve() if args.event_record else None
+    event_frames = [] if event_record_path is not None else None
     ball_diagnostics_enabled = ball_diagnostics_output_path is not None
     ball_detector_confidence_for_run = (
         max(0.0, float(args.ball_diagnostics_min_confidence))
@@ -4299,6 +4302,19 @@ def analyze(args):
             internal_alive=internal_ball_track_alive and ball_feeds_possession,
         )
         possession_snapshot = possession_engine.update(possession_players, possession_ball)
+        if event_frames is not None:
+            event_frames.append(
+                record_event_frame(
+                    frame_number=current_frame_number,
+                    ball_state=ball_track_state,
+                    published_detection=ball_detections[0] if ball_detections else None,
+                    players=possession_players,
+                    ball=possession_ball,
+                    possessor_id=possession_snapshot.current_possessor_track_id,
+                    possessor_team=possession_snapshot.current_possession_team,
+                    refused_centers=rejected_ball_centers,
+                )
+            )
         possession_events = possession_snapshot.as_dict()
         possession_changed = possession_events != last_possession_events
         last_possession_events = possession_events
@@ -4541,6 +4557,16 @@ def analyze(args):
     capture.release()
     writer.release()
     pass_metrics = pass_detector.finalize()
+    if event_record_path is not None:
+        write_event_record(
+            event_record_path,
+            clip_name=input_path.name,
+            fps=fps,
+            frames=event_frames or [],
+            possession_by_team=possession_team_stats.as_dict(),
+            passes=pass_metrics,
+            homography_feeds_decisions=HOMOGRAPHY_FEEDS_DECISIONS,
+        )
     finalize_browser_video(raw_output_path, output_path)
     analysis_total_seconds = time.perf_counter() - analysis_start_time
     profile_report = build_performance_profile_report(
@@ -4922,6 +4948,11 @@ def parse_args():
         "--ball-diagnostics-output",
         default=None,
         help="Optional JSON path to write frame-level ball detector diagnostics",
+    )
+    parser.add_argument(
+        "--event-record",
+        default=None,
+        help="Optional JSON path for the possession and pass replay log. Recording does not change detection.",
     )
     parser.add_argument(
         "--ball-diagnostics-min-confidence",
