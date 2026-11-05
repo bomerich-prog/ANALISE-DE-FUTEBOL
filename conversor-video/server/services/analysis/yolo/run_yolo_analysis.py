@@ -22,10 +22,11 @@ from ultralytics import YOLO
 
 from ball_heatmap import BallHeatmapAccumulator
 from event_replay import record_event_frame, write_event_record
+from player_identity_record import record_player, write_player_record
 from pass_detector import PassDetector
 from player_stats import PlayerStatsAccumulator
 from person_class import PersonClassLock, TrackAppearanceGate, reject_non_person_detections
-from player_track_stitch import PlayerTrackStitch
+from player_track_stitch import PlayerTrackStitch, torso_hue
 from possession import PossessionEngine, build_ball_state, build_possession_players
 from possession_stats import PossessionTeamAccumulator
 from roboflow_ball import BallTracker
@@ -2722,6 +2723,8 @@ def analyze(args):
     )
     event_record_path = Path(args.event_record).resolve() if args.event_record else None
     event_frames = [] if event_record_path is not None else None
+    player_record_path = Path(args.player_record).resolve() if args.player_record else None
+    player_record_frames = [] if player_record_path is not None else None
     ball_diagnostics_enabled = ball_diagnostics_output_path is not None
     ball_detector_confidence_for_run = (
         max(0.0, float(args.ball_diagnostics_min_confidence))
@@ -3171,9 +3174,11 @@ def analyze(args):
 
         bytetrack_stage_start = time.perf_counter()
         tracked_human_detections = player_tracker.update_with_detections(tracked_human_detections)
+        raw_tracker_ids = []
         if tracked_human_detections.tracker_id is None:
             player_track_stitch.apply(current_frame_number, [], [])
         else:
+            raw_tracker_ids = [int(value) for value in tracked_human_detections.tracker_id]
             tracked_human_detections.tracker_id = player_track_stitch.apply(
                 current_frame_number,
                 tracked_human_detections.tracker_id,
@@ -3465,6 +3470,7 @@ def analyze(args):
 
         appearance_gate.begin_frame()
         pending_humans = []
+        player_record_slots = []
         for detection_index in range(len(tracked_human_detections)):
             raw_class_id = int(tracked_human_detections.class_id[detection_index])
             confidence = float(tracked_human_detections.confidence[detection_index])
@@ -3509,19 +3515,22 @@ def analyze(args):
                 locked_class_id=class_id,
                 foot_field=foot_field,
             )
-            pending_humans.append(
-                (
-                    {
-                        "box": box,
-                        "bounding_box": box,
-                        "confidence": confidence,
-                        "track_id": track_id,
-                        "field_x": None,
-                        "field_y": None,
-                    },
-                    class_id,
+            detection_payload = {
+                "box": box,
+                "bounding_box": box,
+                "confidence": confidence,
+                "track_id": track_id,
+                "field_x": None,
+                "field_y": None,
+            }
+            pending_humans.append((detection_payload, class_id))
+            if player_record_frames is not None:
+                raw_track_id = (
+                    raw_tracker_ids[detection_index]
+                    if detection_index < len(raw_tracker_ids)
+                    else track_id
                 )
-            )
+                player_record_slots.append((detection_payload, class_id, raw_class_id, raw_track_id))
 
         for (detection_payload, class_id), verdict in zip(pending_humans, appearance_gate.finish_frame()):
             if verdict["action"] == "drop":
@@ -4102,6 +4111,7 @@ def analyze(args):
             team_classifier_cache_metrics["predict_calls_before_cache"] += 1
 
         detections_needing_prediction = []
+        team_vote_by_detection = {}
         for idx, detection in enumerate(accepted_player_detections):
             track_id = int(detection.get("track_id", -1))
             if track_id >= 0 and not team_track_lock.needs_observation(
@@ -4110,6 +4120,7 @@ def analyze(args):
                 TEAM_CLASSIFIER_REFRESH_INTERVAL,
             ):
                 detection["team_id"] = int(team_track_lock.current_team(track_id))
+                team_vote_by_detection[id(detection)] = None
                 team_classifier_cache_metrics["cache_hits"] += 1
                 continue
             verifying = track_id >= 0 and team_track_lock.is_locked(track_id)
@@ -4132,6 +4143,7 @@ def analyze(args):
                         predicted_team_id = raw_team_id
                 detection = accepted_player_detections[detection_idx]
                 track_id = int(detection.get("track_id", -1))
+                team_vote_by_detection[id(detection)] = predicted_team_id
                 if track_id >= 0:
                     detection["team_id"] = team_track_lock.assign(
                         track_id,
@@ -4196,7 +4208,17 @@ def analyze(args):
                     goalkeeper_team_id = predicted_team_id
                     goalkeeper_team_prediction_counts[goalkeeper_team_id] += 1
                     goalkeepers_with_team_id += 1
-            detection["team_id"] = goalkeeper_team_id
+            track_id = int(detection.get("track_id", -1))
+            if track_id >= 0:
+                detection["team_id"] = team_track_lock.assign(
+                    track_id,
+                    goalkeeper_team_id,
+                    current_frame_number,
+                    team_track_lock.is_locked(track_id),
+                )
+            else:
+                detection["team_id"] = goalkeeper_team_id
+            team_vote_by_detection[id(detection)] = goalkeeper_team_id
         if accepted_goalkeeper_detections and len(goalkeeper_assignment_frame_examples) < 3:
             goalkeeper_assignment_frame_examples.append(
                 {
@@ -4218,6 +4240,31 @@ def analyze(args):
             player_team_mutation_violations += 1
         for detection in list(accepted_player_detections) + list(accepted_goalkeeper_detections):
             player_track_stitch.note_team(detection.get("track_id"), detection.get("team_id"))
+        if player_record_frames is not None:
+            accepted_ids = {
+                id(detection)
+                for detection in list(accepted_player_detections) + list(accepted_goalkeeper_detections)
+            }
+            player_record_frames.append(
+                {
+                    "frame": int(current_frame_number),
+                    "players": [
+                        record_player(
+                            raw_track_id,
+                            detection,
+                            class_id,
+                            team_vote_by_detection.get(id(detection)),
+                            team_track_lock.is_locked(int(detection.get("track_id", -1)))
+                            if int(detection.get("track_id", -1)) >= 0
+                            else False,
+                            raw_class_id=raw_class_id,
+                            hue=torso_hue(frame, detection.get("box")),
+                            accepted=id(detection) in accepted_ids,
+                        )
+                        for detection, class_id, raw_class_id, raw_track_id in player_record_slots
+                    ],
+                }
+            )
         record_profile_stage(
             profile_state,
             "goalkeeper_assignment",
@@ -4557,6 +4604,13 @@ def analyze(args):
     capture.release()
     writer.release()
     pass_metrics = pass_detector.finalize()
+    if player_record_path is not None:
+        write_player_record(
+            player_record_path,
+            clip_name=input_path.name,
+            fps=fps,
+            frames=player_record_frames or [],
+        )
     if event_record_path is not None:
         write_event_record(
             event_record_path,
@@ -4953,6 +5007,11 @@ def parse_args():
         "--event-record",
         default=None,
         help="Optional JSON path for the possession and pass replay log. Recording does not change detection.",
+    )
+    parser.add_argument(
+        "--player-record",
+        default=None,
+        help="Optional JSON path for raw track ids, stitched ids and team votes. Recording does not change detection.",
     )
     parser.add_argument(
         "--ball-diagnostics-min-confidence",

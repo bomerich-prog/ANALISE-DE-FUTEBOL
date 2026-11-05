@@ -288,12 +288,18 @@ class TeamTrackLock:
 
         state["last_checked_frame"] = frame_number
         if not state["locked"]:
-            if predicted_team != int(state["team_id"]):
-                self.prelock_team_switches += 1
-                state["team_id"] = predicted_team
-                state["confirm_streak"] = 1
-            else:
+            if predicted_team == int(state["team_id"]):
                 state["confirm_streak"] += 1
+                state["contradiction_streak"] = 0
+            else:
+                # One opposite vote used to replace the team immediately, so a
+                # flickering edge crop never reached the lock.
+                state["contradiction_streak"] += 1
+                if state["contradiction_streak"] >= self.confirm_streak:
+                    self.prelock_team_switches += 1
+                    state["team_id"] = predicted_team
+                    state["confirm_streak"] = state["contradiction_streak"]
+                    state["contradiction_streak"] = 0
             if state["confirm_streak"] >= self.confirm_streak:
                 state["locked"] = True
                 state["contradiction_streak"] = 0
@@ -308,27 +314,9 @@ class TeamTrackLock:
             state["contradiction_streak"] = 0
             return int(state["team_id"])
 
+        # A locked shirt stays. Later shadow or a partial crop must not rename the team.
         self.refresh_contradictions += 1
         state["contradiction_streak"] += 1
-        if state["contradiction_streak"] < self.unlock_streak:
-            return int(state["team_id"])
-
-        previous_team = int(state["team_id"])
-        self.unlocks += 1
-        self.team_changes_after_lock.append(
-            {
-                "track_id": track_id,
-                "from_team": previous_team,
-                "to_team": predicted_team,
-                "frame": frame_number,
-            }
-        )
-        state["locked"] = False
-        state["team_id"] = predicted_team
-        state["confirm_streak"] = 1
-        state["contradiction_streak"] = 0
-        if state["confirm_streak"] >= self.confirm_streak:
-            state["locked"] = True
         return int(state["team_id"])
 
     def metrics(self) -> Dict[str, object]:

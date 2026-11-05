@@ -83,22 +83,45 @@ def test_rejects_flag_post_and_grass_but_keeps_colored_shirt():
     assert_equal(reject_training_crop(official), "low_chroma_official", "dark official")
 
 
-def test_lock_survives_single_refresh_and_flips_only_after_streak():
+def test_lock_survives_a_run_of_opposite_votes():
     lock = TeamTrackLock()
     for frame in range(1, TEAM_LOCK_CONFIRM_STREAK + 1):
         team = lock.assign(7, 0, frame, verifying=False)
-    assert_equal(team, 0, "confirmed blue")
+    assert_equal(team, 0, "confirmed dark shirt")
     assert_equal(lock.is_locked(7), True, "locked")
 
-    for frame in range(10, 10 + TEAM_LOCK_UNLOCK_STREAK - 1):
+    for frame in range(10, 10 + TEAM_LOCK_UNLOCK_STREAK + 4):
         team = lock.assign(7, 1, frame, verifying=True)
-        assert_equal(team, 0, "one or two disagreements do not overwrite")
+        assert_equal(team, 0, "a locked shirt does not change")
         assert_equal(lock.is_locked(7), True, "still locked")
+    assert_equal(lock.metrics()["team_changes_after_lock"], 0, "no post-lock change")
+    assert_equal(lock.metrics()["unlocks"], 0, "the lock does not open")
+    assert_equal(
+        lock.metrics()["refresh_contradictions"],
+        TEAM_LOCK_UNLOCK_STREAK + 4,
+        "contradictions are still counted",
+    )
 
-    team = lock.assign(7, 1, 40, verifying=True)
-    assert_equal(team, 1, "third consecutive disagreement unlocks")
-    assert_equal(lock.metrics()["team_changes_after_lock"], 1, "one post-lock change")
-    assert_equal(lock.metrics()["refresh_contradictions"], TEAM_LOCK_UNLOCK_STREAK, "contradiction count")
+
+def test_flicker_before_lock_keeps_the_first_clear_team():
+    lock = TeamTrackLock()
+    votes = [0, 1, 0, 1, 0, 1, 0]
+    published = []
+    for frame, vote in enumerate(votes, start=1):
+        published.append(lock.assign(49, vote, frame, verifying=False))
+    assert_equal(published, [0, 0, 0, 0, 0, 0, 0], "alternating votes do not rename the track")
+    assert_equal(lock.is_locked(49), True, "the repeated first team locks")
+    assert_equal(lock.metrics()["prelock_team_switches"], 0, "the team never moved")
+
+
+def test_three_opposite_votes_before_lock_can_correct_the_first_guess():
+    lock = TeamTrackLock()
+    assert_equal(lock.assign(31, 1, 1, verifying=False), 1, "first clear vote")
+    assert_equal(lock.assign(31, 0, 2, verifying=False), 1, "one opposite vote waits")
+    assert_equal(lock.assign(31, 0, 3, verifying=False), 1, "two opposite votes wait")
+    assert_equal(lock.assign(31, 0, 4, verifying=False), 0, "three opposite votes correct the guess")
+    assert_equal(lock.is_locked(31), True, "the corrected team locks")
+    assert_equal(lock.assign(31, 1, 5, verifying=True), 0, "the correction stays")
 
 
 def test_refresh_agreement_resets_contradiction_streak():
@@ -226,7 +249,9 @@ if __name__ == "__main__":
     test_anchor_swaps_raw_kmeans_ids_to_shirt_color()
     test_two_runs_with_swapped_labels_share_semantic_ids()
     test_rejects_flag_post_and_grass_but_keeps_colored_shirt()
-    test_lock_survives_single_refresh_and_flips_only_after_streak()
+    test_lock_survives_a_run_of_opposite_votes()
+    test_flicker_before_lock_keeps_the_first_clear_team()
+    test_three_opposite_votes_before_lock_can_correct_the_first_guess()
     test_refresh_agreement_resets_contradiction_streak()
     test_light_shirt_and_dark_shirt_get_stable_teams()
     test_gradual_broadcast_shirts_still_split()

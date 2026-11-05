@@ -291,6 +291,80 @@ def test_goalkeeper_role_survives_into_the_long_memory():
     assert_equal(returned, [36], "an outfield player does not inherit the goalkeeper")
 
 
+def test_crossed_known_ids_are_given_back():
+    stitch = PlayerTrackStitch()
+    paths = (
+        (100, 300),
+        (130, 270),
+        (160, 240),
+    )
+    for frame, (left, right) in enumerate(paths, start=1):
+        see(
+            stitch,
+            frame,
+            [
+                {"id": 4, "box": box_at(left), "hue": 110, "team": 0},
+                {"id": 8, "box": box_at(right), "hue": 110, "team": 0},
+            ],
+        )
+    returned = see(
+        stitch,
+        4,
+        [
+            {"id": 4, "box": box_at(215), "hue": 110, "team": 0},
+            {"id": 8, "box": box_at(185), "hue": 110, "team": 0},
+        ],
+    )
+    assert_equal(returned, [8, 4], "each player keeps the id that matches his run")
+    assert_equal(stitch.metrics()["identity_swaps"], 1, "one crossing was undone")
+
+
+def test_close_players_who_do_not_cross_keep_their_ids():
+    stitch = PlayerTrackStitch()
+    for frame, step in enumerate((0, 6, 12), start=1):
+        see(
+            stitch,
+            frame,
+            [
+                {"id": 4, "box": box_at(100 + step), "hue": 110, "team": 0},
+                {"id": 8, "box": box_at(148 + step), "hue": 20, "team": 1},
+            ],
+        )
+    returned = see(
+        stitch,
+        4,
+        [
+            {"id": 4, "box": box_at(118), "hue": 110, "team": 0},
+            {"id": 8, "box": box_at(166), "hue": 20, "team": 1},
+        ],
+    )
+    assert_equal(returned, [4, 8], "neighbours who stay in order are not swapped")
+    assert_equal(stitch.metrics()["identity_swaps"], 0, "no crossing")
+
+
+def test_different_shirts_block_a_geometric_swap():
+    stitch = PlayerTrackStitch()
+    for frame, (left, right) in enumerate(((100, 300), (130, 270), (160, 240)), start=1):
+        see(
+            stitch,
+            frame,
+            [
+                {"id": 4, "box": box_at(left), "hue": 110, "team": 0},
+                {"id": 8, "box": box_at(right), "hue": 10, "team": 1},
+            ],
+        )
+    returned = see(
+        stitch,
+        4,
+        [
+            {"id": 4, "box": box_at(215), "hue": 110, "team": 0},
+            {"id": 8, "box": box_at(185), "hue": 10, "team": 1},
+        ],
+    )
+    assert_equal(returned, [4, 8], "a dark shirt does not take the light shirt's id")
+    assert_equal(stitch.metrics()["identity_swaps"], 0, "appearance blocked the swap")
+
+
 def test_note_team_is_remembered_for_the_next_gap():
     stitch = PlayerTrackStitch()
     see(stitch, 1, [{"id": 4, "box": box_at(100), "team": None, "hue": None}])
@@ -319,5 +393,8 @@ if __name__ == "__main__":
     test_long_gap_rejects_the_other_team_and_a_close_neighbour()
     test_two_stable_players_leave_an_ambiguous_box_new()
     test_goalkeeper_role_survives_into_the_long_memory()
+    test_crossed_known_ids_are_given_back()
+    test_close_players_who_do_not_cross_keep_their_ids()
+    test_different_shirts_block_a_geometric_swap()
     test_note_team_is_remembered_for_the_next_gap()
     print("player track stitch tests passed")

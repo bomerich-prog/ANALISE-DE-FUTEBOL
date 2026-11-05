@@ -20,6 +20,8 @@ LOST_TRACK_MEMORY_FRAMES = 12
 STABLE_TRACK_MEMORY_FRAMES = 60
 STABLE_MIN_FRAMES = 8
 GOALKEEPER_CLASS_ID = 1
+SWAP_OWN_MIN_PX = 20.0
+SWAP_GAIN_MIN_PX = 30.0
 SEARCH_RADIUS_CAP_PX = 64.0
 SEARCH_RADIUS_FLOOR_PX = 24.0
 SEARCH_RADIUS_GAP_PX = 5.0
@@ -103,6 +105,7 @@ class PlayerTrackStitch:
         self.stable_min_frames = max(1, int(stable_min_frames))
         self._tracks: Dict[int, dict] = {}
         self.stitches = 0
+        self.identity_swaps = 0
         self.rejected_ambiguous = 0
         self.rejected_nearby = 0
         self.rejected_size = 0
@@ -173,6 +176,7 @@ class PlayerTrackStitch:
             else:
                 candidates.append(observation)
 
+        self._untangle_crossings(present_known, frame_number)
         present_ids = {observation["track_id"] for observation in present_known}
         lost_states = []
         expired_ids = []
@@ -192,6 +196,8 @@ class PlayerTrackStitch:
         active_feet = [observation["foot"] for observation in present_known]
         claims = self._claims(candidates, lost_states, active_feet, frame_number)
         rewritten = list(ids)
+        for observation in present_known:
+            rewritten[observation["index"]] = int(observation["track_id"])
         stitched_observations = []
         claimed_candidates = set()
         for candidate, lost_state, _distance in claims:
@@ -218,6 +224,7 @@ class PlayerTrackStitch:
             "stable_memory_frames": self.stable_memory_frames,
             "stable_min_frames": self.stable_min_frames,
             "stitches": self.stitches,
+            "identity_swaps": self.identity_swaps,
             "rejected_ambiguous": self.rejected_ambiguous,
             "rejected_nearby": self.rejected_nearby,
             "rejected_size": self.rejected_size,
@@ -257,6 +264,66 @@ class PlayerTrackStitch:
             "team": team,
             "class_id": class_id,
         }
+
+    def _predicted_foot(self, state, frame_number):
+        gap = max(1, int(frame_number) - int(state["last_frame"]))
+        return (
+            float(state["foot"][0]) + float(state["vx"]) * gap,
+            float(state["foot"][1]) + float(state["vy"]) * gap,
+        )
+
+    def _appearance_conflict(self, observation, state) -> bool:
+        if observation["hue"] is not None and state.get("hue") is not None:
+            if _hue_distance(observation["hue"], state["hue"]) > HUE_MAX_DISTANCE:
+                return True
+        if observation["team"] is not None and state.get("team_id") is not None:
+            if int(observation["team"]) != int(state["team_id"]):
+                return True
+        return _role_conflict(observation.get("class_id"), state.get("class_id"))
+
+    def _untangle_crossings(self, present_known, frame_number) -> None:
+        """Give two known ids back when ByteTrack swaps them at a crossing.
+
+        Both current labels have to sit far from their own prediction and much
+        closer to each other's. A close or ambiguous pair is left untouched.
+        """
+        if len(present_known) < 2:
+            return
+        predictions = {
+            int(observation["track_id"]): self._predicted_foot(self._tracks[observation["track_id"]], frame_number)
+            for observation in present_known
+        }
+        pairs = []
+        for left_index in range(len(present_known)):
+            for right_index in range(left_index + 1, len(present_known)):
+                left = present_known[left_index]
+                right = present_known[right_index]
+                left_id = int(left["track_id"])
+                right_id = int(right["track_id"])
+                own = _hypot(left["foot"], predictions[left_id]) + _hypot(right["foot"], predictions[right_id])
+                crossed = _hypot(left["foot"], predictions[right_id]) + _hypot(right["foot"], predictions[left_id])
+                left_own = _hypot(left["foot"], predictions[left_id])
+                right_own = _hypot(right["foot"], predictions[right_id])
+                if left_own < SWAP_OWN_MIN_PX or right_own < SWAP_OWN_MIN_PX:
+                    continue
+                if crossed + SWAP_GAIN_MIN_PX > own:
+                    continue
+                if self._appearance_conflict(left, self._tracks[right_id]):
+                    continue
+                if self._appearance_conflict(right, self._tracks[left_id]):
+                    continue
+                pairs.append((own - crossed, left_index, right_index))
+        pairs.sort(key=lambda item: item[0], reverse=True)
+        used = set()
+        for _gain, left_index, right_index in pairs:
+            if left_index in used or right_index in used:
+                continue
+            left = present_known[left_index]
+            right = present_known[right_index]
+            left["track_id"], right["track_id"] = right["track_id"], left["track_id"]
+            used.add(left_index)
+            used.add(right_index)
+            self.identity_swaps += 1
 
     def _claims(self, candidates, lost_states, active_feet, frame_number):
         candidate_options = []
