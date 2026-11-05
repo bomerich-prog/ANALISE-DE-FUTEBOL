@@ -73,6 +73,47 @@ def test_does_not_flicker_between_nearby_players():
         assert_equal(snapshot.current_possessor_track_id, 1, "close contest should keep A")
 
 
+def test_short_hole_does_not_erase_a_pending_confirmation():
+    engine = PossessionEngine()
+    players = [player(11, 0, 100, 100, x=100, y=100)]
+    observed = ball("observed", x=100, y=110)
+    for _ in range(3):
+        snapshot = engine.update(players, observed)
+        assert_equal(snapshot.current_possessor_track_id, None, "three observations stay pending")
+    for _ in range(2):
+        snapshot = engine.update(players, ball("predicted", x=100, y=110))
+        assert_equal(snapshot.current_possessor_track_id, None, "a predicted hole does not confirm")
+    snapshot = engine.update(players, observed)
+    assert_equal(snapshot.current_possessor_track_id, None, "the fourth observation is still short")
+    snapshot = engine.update(players, observed)
+    assert_equal(snapshot.current_possessor_track_id, 11, "the fifth observation confirms")
+    assert_equal(snapshot.current_possession_team, "Team 0", "team stays with the track")
+
+
+def test_a_long_hole_drops_the_pending_player():
+    engine = PossessionEngine()
+    players = [player(11, 0, 100, 100, x=100, y=100)]
+    observed = ball("observed", x=100, y=110)
+    for _ in range(4):
+        engine.update(players, observed)
+    for _ in range(POSSESSION_LOSE_FRAMES):
+        snapshot = engine.update(players, None)
+        assert_equal(snapshot.current_possessor_track_id, None, "a hole cannot confirm")
+    snapshot = engine.update(players, observed)
+    assert_equal(snapshot.current_possessor_track_id, None, "the old streak was dropped")
+    assert_equal(engine.pending_count, 1, "the next observation starts again")
+
+
+def test_an_observed_ball_away_from_everyone_drops_the_streak():
+    engine = PossessionEngine()
+    players = [player(11, 0, 100, 100, x=100, y=100)]
+    for _ in range(4):
+        engine.update(players, ball("observed", x=100, y=110))
+    snapshot = engine.update(players, ball("observed", field_x=900, field_y=900, x=900, y=900))
+    assert_equal(snapshot.current_possessor_track_id, None, "a far observation is not control")
+    assert_equal(engine.pending_count, 0, "the streak was contradicted")
+
+
 def test_loses_possession_after_enough_lost_frames():
     engine = PossessionEngine()
     players = [player(4, 0, 100, 100)]
@@ -107,6 +148,9 @@ def test_switch_requires_consecutive_clear_leader():
 
 if __name__ == "__main__":
     test_confirms_after_consecutive_observed_frames()
+    test_short_hole_does_not_erase_a_pending_confirmation()
+    test_a_long_hole_drops_the_pending_player()
+    test_an_observed_ball_away_from_everyone_drops_the_streak()
     test_memory_holds_but_does_not_open_possession()
     test_does_not_flicker_between_nearby_players()
     test_loses_possession_after_enough_lost_frames()

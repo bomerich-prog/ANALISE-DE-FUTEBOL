@@ -605,6 +605,52 @@ def test_one_frame_wall_touch_is_still_two_passes():
     assert_equal(metrics["events"][0]["in_flight_samples"] >= 1, True, "the ball was seen between the players")
 
 
+def test_a_clear_receiver_is_not_a_dispute():
+    detector = PassDetector()
+    donor = {
+        "track_id": 32,
+        "team_id": 0,
+        "field_x": None,
+        "field_y": None,
+        "x": 0.0,
+        "y": 0.0,
+    }
+    receiver = {
+        "track_id": 44,
+        "team_id": 0,
+        "field_x": None,
+        "field_y": None,
+        "x": 200.0,
+        "y": 0.0,
+    }
+    opponent = {
+        "track_id": 45,
+        "team_id": 1,
+        "field_x": None,
+        "field_y": None,
+        "x": 240.0,
+        "y": 0.0,
+    }
+    players = [donor, receiver, opponent]
+
+    def pixel_ball(x):
+        return {"source": "observed", "field_x": None, "field_y": None, "x": x, "y": 0.0}
+
+    frames = []
+    frame = 1
+    for _ in range(6):
+        frames.append((frame, 32, "Team 0", players, pixel_ball(0.0)))
+        frame += 1
+    frames.append((frame, None, None, players, pixel_ball(100.0)))
+    frame += 1
+    frames.append((frame, 44, "Team 0", players, pixel_ball(200.0)))
+    metrics = run_frames(detector, frames)
+    assert_equal(metrics["disputes"], 0, "an opponent a margin behind is not a dispute")
+    assert_equal(metrics["total_passes"], 1, "the clear reception is a pass")
+    assert_equal(metrics["events"][0]["from_track_id"], 32, "donor")
+    assert_equal(metrics["events"][0]["to_track_id"], 44, "receiver")
+
+
 def test_both_teams_on_the_ball_is_a_dispute():
     detector = PassDetector()
     donor = player(1, 0, 0.0, 0.0)
@@ -657,5 +703,6 @@ if __name__ == "__main__":
     test_teammate_outside_contest_radius_is_not_a_wall()
     test_wall_leg_below_the_score_is_not_created()
     test_one_frame_wall_touch_is_still_two_passes()
+    test_a_clear_receiver_is_not_a_dispute()
     test_both_teams_on_the_ball_is_a_dispute()
     print("pass detector tests passed")

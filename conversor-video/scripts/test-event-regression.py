@@ -219,6 +219,43 @@ def test_fixture_replays_the_recorded_clip():
     return record, replay, identity
 
 
+def test_clip_events_follow_the_recorded_ball(replay):
+    """Events are the reading of the frozen log. They are not an older pass count."""
+    passes = replay["passes"]
+    assert_equal(passes["total_passes"], 1, "one completed pass")
+    completed = passes["events"][0]
+    assert_equal(
+        (completed["from_track_id"], completed["to_track_id"], completed["frame"]),
+        (32, 44, 326),
+        "32 keeps the ball and 44 receives it inside one second",
+    )
+    assert_equal(completed["trajectory"], "compatible", "the ball moves toward 44")
+    rejected = [
+        (event["from_track_id"], event["to_track_id"], event["reason"])
+        for event in passes["rejected_events"]
+    ]
+    assert_equal(
+        rejected,
+        [(15, 11, "timeout"), (11, 30, "timeout")],
+        "same-team gaps without field distance stay rejected",
+    )
+    turnovers = [
+        (event["from_track_id"], event["to_track_id"], event["frame"])
+        for event in passes["turnover_events"]
+    ]
+    assert_equal(turnovers, [(11, 4, 120), (4, 11, 155)], "team changes")
+    disputes = [
+        (event["from_track_id"], event["to_track_id"], event["frame"])
+        for event in passes["dispute_events"]
+    ]
+    assert_equal(disputes, [(30, 32, 299)], "the close challenge stays a dispute")
+    frame_155 = next(item for item in replay["timeline"] if item["frame"] == 155)
+    assert_equal(frame_155["possessor"], 11, "player 11 is confirmed on the fifth observation")
+    assert_equal(frame_155["team"], "Team 0", "player 11 team")
+    frame_50 = next(item for item in replay["timeline"] if item["frame"] == 50)
+    assert_equal(frame_50["possessor"], None, "four observations still do not confirm")
+
+
 def test_grass_interval_publishes_no_ball(record):
     for frame_number in range(32, 47):
         frame = frame_by_number(record, frame_number)
@@ -263,6 +300,7 @@ def main():
             f"missing fixture {FIXTURE}. Record it with run_yolo_analysis.py --event-record."
         )
     record, replay, identity = test_fixture_replays_the_recorded_clip()
+    test_clip_events_follow_the_recorded_ball(replay)
     test_grass_interval_publishes_no_ball(record)
     test_frame_47_published_ball(record)
     frame_103 = test_frame_103_is_reported_from_the_log(record)

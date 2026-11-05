@@ -189,6 +189,14 @@ class PossessionEngine:
         previous_id = self.possessor_id
         self._remember_teams(players)
 
+        if self.possessor_id is None and (not ball or ball.get("source") != "observed"):
+            # A predicted or missing ball must not open possession. It also must
+            # not wipe a confirmation that already has observed frames: the ball
+            # layer publishes short holes, and the same lose window that keeps
+            # a confirmed possessor keeps this streak alive.
+            self._pause_pending()
+            return self._finish_update(previous_id)
+
         if not ball or ball.get("source") == "lost":
             self._lose_if_unsupported()
             return self._finish_update(previous_id)
@@ -288,6 +296,12 @@ class PossessionEngine:
             self.switches += 1
             self._clear_switch()
             self._reset_pending()
+
+    def _pause_pending(self):
+        self.no_evidence_count += 1
+        if self.no_evidence_count >= self.lose_frames:
+            self._reset_pending()
+            self.no_evidence_count = 0
 
     def _lose_if_unsupported(self):
         self.no_evidence_count += 1

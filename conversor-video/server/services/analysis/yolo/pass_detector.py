@@ -26,7 +26,13 @@ from __future__ import annotations
 import math
 from collections import deque
 
-from possession import CONTROL_RADIUS_CM, CONTROL_RADIUS_PX, TEAM_NAME_BY_ID
+from possession import (
+    CONTEST_MARGIN_CM,
+    CONTEST_MARGIN_PX,
+    CONTROL_RADIUS_CM,
+    CONTROL_RADIUS_PX,
+    TEAM_NAME_BY_ID,
+)
 
 
 PASS_MAX_GAP_SECONDS = 1.0
@@ -287,7 +293,7 @@ class PassDetector:
         if self.pending is not None:
             if observed_ball is None:
                 self.pending["ball_missing_frames"] += 1
-            elif _both_teams_on_ball(players, observed_ball):
+            elif _teams_contesting(players, observed_ball):
                 self.pending["contested"] = True
 
         if possessor_id is None:
@@ -300,7 +306,7 @@ class PassDetector:
             return self.metrics()
 
         if self.pending is None and possessor_id == self.last_possessor_id:
-            self.recent_contest = bool(observed_ball is not None and _both_teams_on_ball(players, observed_ball))
+            self.recent_contest = bool(observed_ball is not None and _teams_contesting(players, observed_ball))
             self._remember(possessor_id, possessor_team, possessor_pos, frame_number)
             return self.metrics()
 
@@ -369,7 +375,7 @@ class PassDetector:
             "lost_frame": int(frame_number),
             "ball_missing_frames": 0 if observed_ball is not None else 1,
             "contested": bool(self.recent_contest)
-            or bool(observed_ball is not None and _both_teams_on_ball(players, observed_ball)),
+            or bool(observed_ball is not None and _teams_contesting(players, observed_ball)),
         }
         self.recent_contest = False
 
@@ -902,20 +908,35 @@ def _nearest_within_contest(entry):
     return best[1], best[2]
 
 
-def _both_teams_on_ball(players, ball_point):
+def _contest_margin(space):
+    return CONTEST_MARGIN_CM if space == "field" else CONTEST_MARGIN_PX
+
+
+def _teams_contesting(players, ball_point):
+    """Both teams are on the ball and the leader is not clear of the other team.
+
+    An opponent inside the wide contest radius but a full margin behind the
+    player who has the ball is not a dispute. Equal distances are.
+    """
     if ball_point is None:
         return False
     radius = _contest_radius(ball_point["space"])
-    teams = set()
+    nearest = {}
     for player in players or []:
         point = _point_from_entity(player)
         distance, space = _distance(point, ball_point)
         if distance is None or space != ball_point["space"] or distance > radius:
             continue
         team = _team_name_from_player(player)
-        if team in {"Team 0", "Team 1"}:
-            teams.add(team)
-    return "Team 0" in teams and "Team 1" in teams
+        if team not in {"Team 0", "Team 1"}:
+            continue
+        if team not in nearest or distance < nearest[team]:
+            nearest[team] = distance
+    if "Team 0" not in nearest or "Team 1" not in nearest:
+        return False
+    leader = min(nearest.values())
+    second = max(nearest.values())
+    return leader + _contest_margin(ball_point["space"]) >= second
 
 
 def _pass_score_components(short_interval, distance_plausible, trajectory, flight_verified=False):
