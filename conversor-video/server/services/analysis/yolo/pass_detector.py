@@ -32,11 +32,16 @@ from possession import (
     CONTROL_RADIUS_CM,
     CONTROL_RADIUS_PX,
     TEAM_NAME_BY_ID,
+    pixel_ground_distance,
 )
 
 
 PASS_MAX_GAP_SECONDS = 1.0
 PASS_MAX_FLIGHT_SECONDS = 4.0
+# A pass measured in image pixels has no field length, so the one-second gap
+# is the normal budget. A flight the detector actually followed, moving toward
+# the receiver, can run longer than that gap without being a loose ball.
+PASS_VERIFIED_PIXEL_FLIGHT_SECONDS = 2.0
 PASS_MIN_BALL_SPEED_CM_S = 800.0
 PASS_MAX_BALL_SPEED_CM_S = 4000.0
 PASS_RECEPTION_ALLOWANCE_SECONDS = 0.5
@@ -118,8 +123,14 @@ def _inframe_distance(points_a, points_b):
         a = points_a.get(space)
         b = points_b.get(space)
         if a is not None and b is not None:
-            return math.hypot(a[0] - b[0], a[1] - b[1]), space
+            return _space_distance(a[0], a[1], b[0], b[1], space), space
     return None, None
+
+
+def _space_distance(x1, y1, x2, y2, space):
+    if space == "pixel":
+        return pixel_ground_distance(x1, y1, x2, y2)
+    return math.hypot(x1 - x2, y1 - y2)
 
 
 def _find_player(players, track_id):
@@ -137,7 +148,8 @@ def _find_player(players, track_id):
 def _distance(point_a, point_b):
     if not point_a or not point_b or point_a.get("space") != point_b.get("space"):
         return None, None
-    return math.hypot(point_a["x"] - point_b["x"], point_a["y"] - point_b["y"]), point_a["space"]
+    space = point_a["space"]
+    return _space_distance(point_a["x"], point_a["y"], point_b["x"], point_b["y"], space), space
 
 
 def _team_name_from_player(player):
@@ -199,13 +211,17 @@ def _median(values):
     return 0.5 * (ordered[middle - 1] + ordered[middle])
 
 
-def max_flight_seconds(distance_cm):
+def max_flight_seconds(distance_cm, verified_pixel_flight=False):
     """Longest plausible release-to-arrival time for a pass of this length.
 
     A pass slower than PASS_MIN_BALL_SPEED_CM_S on average, plus the time the
     receiver needs to settle the ball, is a loose ball rather than a pass.
+    Without a field length, a flight is that one-second gap unless the ball
+    was seen moving toward the receiver the whole way.
     """
     if distance_cm is None:
+        if verified_pixel_flight:
+            return PASS_VERIFIED_PIXEL_FLIGHT_SECONDS
         return PASS_MAX_GAP_SECONDS
     budget = distance_cm / PASS_MIN_BALL_SPEED_CM_S + PASS_RECEPTION_ALLOWANCE_SECONDS
     return min(PASS_MAX_FLIGHT_SECONDS, max(PASS_MAX_GAP_SECONDS, budget))
@@ -625,7 +641,13 @@ class PassDetector:
         timing_seconds = gap_seconds
         if flight["arrival_observed"] and flight["reception_lag_seconds"] <= PASS_MAX_RECEPTION_LAG_SECONDS:
             timing_seconds = min(gap_seconds, flight["flight_seconds"])
-        max_timing = max_flight_seconds(distance_cm)
+        verified_pixel_flight = (
+            distance_cm is None
+            and trajectory == "compatible"
+            and flight["arrival_observed"]
+            and flight["in_flight_samples"] >= PASS_EXTENDED_MIN_FLIGHT_SAMPLES
+        )
+        max_timing = max_flight_seconds(distance_cm, verified_pixel_flight=verified_pixel_flight)
         tier = TIMING_BASE if timing_seconds <= self.max_gap_seconds else TIMING_EXTENDED
         implied_speed = self._implied_speed(flight, distance_cm, int(gained_frame), fps)
         event = {
@@ -819,7 +841,9 @@ class PassDetector:
                 receiver_point = receiver["points"].get(space)
                 if ball_point is not None and receiver_point is not None:
                     series[space].append(
-                        math.hypot(ball_point[0] - receiver_point[0], ball_point[1] - receiver_point[1])
+                        _space_distance(
+                            ball_point[0], ball_point[1], receiver_point[0], receiver_point[1], space
+                        )
                     )
         for space in ("field", "pixel"):
             samples = series[space]

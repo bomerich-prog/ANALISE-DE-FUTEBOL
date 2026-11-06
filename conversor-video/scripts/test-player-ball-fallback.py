@@ -7,6 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server/services/analysis/yolo"))
 
 from run_yolo_analysis import (  # noqa: E402
+    BALL_FLIGHT_MAX_UNSUPPORTED_FRAMES,
     ball_selection_keeps_player_support,
     nearest_supported_ball,
     select_player_ball_fallback,
@@ -78,14 +79,30 @@ def person(x, y):
     return {"box": [x - 10.0, y - 40.0, x + 10.0, y]}
 
 
-def test_fallback_in_open_grass_is_rejected():
+def ball_at(confidence, x, y):
+    return {"confidence": confidence, "box": [x - 6.0, y - 6.0, x + 6.0, y + 6.0]}
+
+
+def test_fallback_continues_the_flight():
+    # Frames 31 and 32 of the reference clip: the pass from 15 toward 11.
     chosen, decision = select_player_ball_fallback(
-        [box(0.44, 480.0, 272.0)],
+        [ball_at(0.44, 480.0, 272.0)],
         predicted_center=(497.0, 265.0),
-        last_valid_detection=box(0.47, 515.0, 262.0),
+        last_valid_detection=ball_at(0.47, 515.0, 262.0),
         person_detections=[person(700.0, 250.0)],
     )
-    assert_true(chosen is None, "grass box is not a continuation")
+    assert_true(decision["used"], "the next step of the pass is the ball")
+    assert_true(chosen is not None, "box kept")
+
+
+def test_fallback_jump_off_the_flight_is_rejected():
+    chosen, decision = select_player_ball_fallback(
+        [ball_at(0.44, 440.0, 272.0)],
+        predicted_center=(497.0, 265.0),
+        last_valid_detection=ball_at(0.47, 515.0, 262.0),
+        person_detections=[person(700.0, 250.0)],
+    )
+    assert_true(chosen is None, "a 75 px jump is not one frame of flight")
     assert_true(decision["rejected_distance"], "no player near the box")
     assert_true(not decision["used"], "not used")
 
@@ -124,8 +141,8 @@ def test_strong_flight_stays_near_the_last_player_ball():
     )
 
 
-def test_grass_walk_is_dropped():
-    grass = box(0.50, 333.0, 294.0)
+def test_box_far_from_the_touch_with_no_ball_before_it_is_dropped():
+    grass = ball_at(0.50, 333.0, 294.0)
     assert_true(
         not ball_selection_keeps_player_support(
             grass,
@@ -133,7 +150,77 @@ def test_grass_walk_is_dropped():
             person_detections=[person(712.0, 248.0)],
             last_supported_center=(712.0, 248.0),
         ),
-        "stable grass box is not the ball",
+        "with no published ball before it, a box in open grass is not the flight",
+    )
+
+
+def test_pass_flight_continues_frame_by_frame():
+    # Frames 46 and 47 of the reference clip, 380 px from the passer.
+    flying = ball_at(0.24, 333.0, 293.0)
+    assert_true(
+        ball_selection_keeps_player_support(
+            flying,
+            predicted_center=(340.0, 291.0),
+            person_detections=[person(712.0, 248.0)],
+            last_supported_center=(712.0, 248.0),
+            last_ball_center=(353.0, 289.0),
+        ),
+        "a weak box on the predicted path continues the flight",
+    )
+    strong = ball_at(0.82, 325.0, 292.0)
+    assert_true(
+        ball_selection_keeps_player_support(
+            strong,
+            predicted_center=(326.0, 293.0),
+            person_detections=[person(712.0, 248.0)],
+            last_supported_center=(712.0, 248.0),
+            last_ball_center=(333.0, 293.0),
+        ),
+        "a strong box one step on continues the flight",
+    )
+
+
+def test_flight_off_the_prediction_is_dropped():
+    sideways = ball_at(0.82, 345.0, 365.0)
+    assert_true(
+        not ball_selection_keeps_player_support(
+            sideways,
+            predicted_center=(326.0, 293.0),
+            person_detections=[person(712.0, 248.0)],
+            last_supported_center=(712.0, 248.0),
+            last_ball_center=(333.0, 293.0),
+            frames_since_ball=1,
+        ),
+        "a box that leaves the predicted path is not the next step",
+    )
+
+
+def test_flight_cannot_outlast_a_pass():
+    flying = ball_at(0.82, 325.0, 292.0)
+    assert_true(
+        not ball_selection_keeps_player_support(
+            flying,
+            predicted_center=(326.0, 293.0),
+            person_detections=[person(712.0, 248.0)],
+            last_supported_center=(712.0, 248.0),
+            last_ball_center=(333.0, 293.0),
+            unsupported_frames=BALL_FLIGHT_MAX_UNSUPPORTED_FRAMES,
+        ),
+        "four seconds away from every player is not a pass",
+    )
+
+
+def test_flight_reaches_the_receiver():
+    arrived = ball_at(0.55, 263.0, 295.0)
+    assert_true(
+        ball_selection_keeps_player_support(
+            arrived,
+            predicted_center=(262.0, 296.0),
+            person_detections=[person(255.0, 305.0)],
+            last_supported_center=(712.0, 248.0),
+            last_ball_center=(270.0, 295.0),
+        ),
+        "the flight ends at the receiver's feet",
     )
 
 
@@ -184,7 +271,7 @@ def test_pass_to_a_nearby_player_is_kept():
     )
 
 
-def test_live_grass_track_cannot_reach_another_player():
+def test_box_cannot_jump_to_another_player():
     arrived = box(0.55, 270.0, 295.0)
     assert_true(
         not ball_selection_keeps_player_support(
@@ -193,7 +280,7 @@ def test_live_grass_track_cannot_reach_another_player():
             person_detections=[person(270.0, 310.0)],
             last_supported_center=(712.0, 248.0),
         ),
-        "a live grass track does not arrive at another player",
+        "without a flight before it, a box does not arrive at another player",
     )
 
 
@@ -227,15 +314,20 @@ if __name__ == "__main__":
     test_fallback_cannot_open_a_track()
     test_weak_nearby_ball_is_rejected()
     test_near_ball_wins_over_a_sideline_ball()
-    test_fallback_in_open_grass_is_rejected()
+    test_fallback_continues_the_flight()
+    test_fallback_jump_off_the_flight_is_rejected()
     test_fallback_next_to_a_player_continues()
     test_strong_flight_stays_near_the_last_player_ball()
-    test_grass_walk_is_dropped()
+    test_box_far_from_the_touch_with_no_ball_before_it_is_dropped()
+    test_pass_flight_continues_frame_by_frame()
+    test_flight_off_the_prediction_is_dropped()
+    test_flight_cannot_outlast_a_pass()
+    test_flight_reaches_the_receiver()
     test_new_track_requires_a_player()
     test_supported_ball_beats_the_grass_continuation()
     test_far_supported_ball_is_not_the_play()
     test_pass_to_a_nearby_player_is_kept()
-    test_live_grass_track_cannot_reach_another_player()
+    test_box_cannot_jump_to_another_player()
     test_far_player_does_not_reopen_the_track()
     test_no_candidate_is_not_a_rejection_reason()
     print("player ball fallback tests passed")

@@ -651,6 +651,82 @@ def test_a_clear_receiver_is_not_a_dispute():
     assert_equal(metrics["events"][0]["to_track_id"], 44, "receiver")
 
 
+def image_player(track_id, team_id, x, y):
+    return {
+        "track_id": track_id,
+        "team_id": team_id,
+        "field_x": None,
+        "field_y": None,
+        "x": x,
+        "y": y,
+    }
+
+
+def image_ball(x, y):
+    return {"source": "observed", "field_x": None, "field_y": None, "x": x, "y": y}
+
+
+def _seen_pixel_flight(cruise_frames):
+    """The ball leaves 11, travels in the open, then reaches 30."""
+    donor = image_player(11, 0, 0.0, 300.0)
+    receiver = image_player(30, 0, 400.0, 300.0)
+    players = [donor, receiver]
+    frames = []
+    frame = 1
+    for _ in range(8):
+        frames.append((frame, 11, "Team 0", players, image_ball(0.0, 300.0)))
+        frame += 1
+    for x in [100.0] * cruise_frames + [220.0, 270.0, 320.0, 400.0]:
+        frames.append((frame, None, None, players, image_ball(x, 300.0)))
+        frame += 1
+    for _ in range(5):
+        frames.append((frame, 30, "Team 0", players, image_ball(400.0, 300.0)))
+        frame += 1
+    return frames
+
+
+def test_verified_pixel_flight_can_run_past_one_second():
+    detector = PassDetector()
+    metrics = run_frames(detector, _seen_pixel_flight(cruise_frames=8))
+    assert_equal(metrics["total_passes"], 1, "a seen flight of 1.1 s is a pass")
+    event = metrics["events"][0]
+    assert_equal(event["from_track_id"], 11, "donor")
+    assert_equal(event["to_track_id"], 30, "receiver")
+    assert_equal(event["timing_tier"], "extended", "past the one second gap")
+    assert_equal(event["max_timing_seconds"], 2.0, "verified pixel budget")
+    assert_equal(event["trajectory"], "compatible", "the ball approaches the receiver")
+
+
+def test_hidden_pixel_flight_past_one_second_is_rejected():
+    detector = PassDetector()
+    donor = image_player(11, 0, 0.0, 300.0)
+    receiver = image_player(30, 0, 400.0, 300.0)
+    players = [donor, receiver]
+    frames = []
+    frame = 1
+    for _ in range(8):
+        frames.append((frame, 11, "Team 0", players, image_ball(0.0, 300.0)))
+        frame += 1
+    for _ in range(12):
+        frames.append((frame, None, None, players, None))
+        frame += 1
+    for _ in range(5):
+        frames.append((frame, 30, "Team 0", players, image_ball(400.0, 300.0)))
+        frame += 1
+    metrics = run_frames(detector, frames)
+    assert_equal(metrics["total_passes"], 0, "an unseen 1.2 s gap is not a pass")
+    assert_equal(metrics["rejected_events"][0]["reason"], "timeout", "the one second window holds")
+    assert_equal(metrics["rejected_events"][0]["max_timing_seconds"], 1.0, "no verified flight")
+
+
+def test_verified_pixel_flight_beyond_two_seconds_is_rejected():
+    detector = PassDetector()
+    metrics = run_frames(detector, _seen_pixel_flight(cruise_frames=21))
+    assert_equal(metrics["total_passes"], 0, "2.5 s is a loose ball even when the ball is seen")
+    assert_equal(metrics["rejected_events"][0]["reason"], "timeout", "the verified budget is two seconds")
+    assert_equal(metrics["rejected_events"][0]["max_timing_seconds"], 2.0, "verified pixel budget")
+
+
 def test_both_teams_on_the_ball_is_a_dispute():
     detector = PassDetector()
     donor = player(1, 0, 0.0, 0.0)
@@ -705,4 +781,7 @@ if __name__ == "__main__":
     test_one_frame_wall_touch_is_still_two_passes()
     test_a_clear_receiver_is_not_a_dispute()
     test_both_teams_on_the_ball_is_a_dispute()
+    test_verified_pixel_flight_can_run_past_one_second()
+    test_hidden_pixel_flight_past_one_second_is_rejected()
+    test_verified_pixel_flight_beyond_two_seconds_is_rejected()
     print("pass detector tests passed")

@@ -130,6 +130,30 @@ def test_loses_possession_after_enough_lost_frames():
             assert_equal(snapshot.current_possession_team, None, "team cleared")
 
 
+def test_a_fast_ball_is_taken_only_by_the_player_it_reaches():
+    engine = PossessionEngine()
+    receiver = player(10, 0, None, None, x=500, y=300)
+    defender = player(4, 1, None, None, x=500, y=270)
+    for ball_x in (445, 460, 475, 490, 505):
+        snapshot = engine.update(
+            [receiver, defender],
+            ball("observed", field_x=None, field_y=None, x=ball_x, y=300),
+        )
+    assert_equal(snapshot.current_possessor_track_id, 10, "the ball arrived at 10")
+    assert_equal(snapshot.current_possession_team, "Team 0", "10 keeps his team")
+
+
+def test_a_fast_ball_sixty_pixels_away_opens_no_possession():
+    engine = PossessionEngine()
+    defender = player(4, 1, None, None, x=0, y=100)
+    for ball_x in (70, 90, 110, 130, 150, 170):
+        snapshot = engine.update(
+            [defender],
+            ball("observed", field_x=None, field_y=None, x=ball_x, y=100),
+        )
+    assert_equal(snapshot.current_possessor_track_id, None, "the ball never reached him")
+
+
 def test_switch_requires_consecutive_clear_leader():
     engine = PossessionEngine()
     a = player(11, 0, 100, 100)
@@ -155,4 +179,6 @@ if __name__ == "__main__":
     test_does_not_flicker_between_nearby_players()
     test_loses_possession_after_enough_lost_frames()
     test_switch_requires_consecutive_clear_leader()
+    test_a_fast_ball_is_taken_only_by_the_player_it_reaches()
+    test_a_fast_ball_sixty_pixels_away_opens_no_possession()
     print("possession engine tests passed")

@@ -2,7 +2,8 @@
 """Replay possession and passes from a recorded clip, without YOLO.
 
 The fixture is the input the analysis loop already gave to the possession
-and pass engines. October's pass count is not the expected value.
+and pass engines. The expected reading of this clip is the seven passes in
+the attack.
 """
 
 import json
@@ -24,9 +25,18 @@ from pass_detector import PASS_MAX_GAP_SECONDS  # noqa: E402
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "event-regression-81c0fcfb.json"
 CLIP_NAME = "81c0fcfb-e357-44b5-9678-21bf85c90242.mp4"
-FRAME_47_X = 730.8
-FRAME_47_Y = 232.1
-FRAME_47_CONFIDENCE = 0.603
+FRAME_47_X = 333.1
+FRAME_47_Y = 293.8
+FRAME_47_CONFIDENCE = 0.857
+EXPECTED_PASSES = [
+    (15, 11, 60),
+    (11, 10, 125),
+    (10, 11, 155),
+    (11, 30, 221),
+    (30, 32, 299),
+    (32, 44, 332),
+    (44, 51, 371),
+]
 
 
 def assert_true(condition, message):
@@ -205,12 +215,17 @@ def test_fixture_replays_the_recorded_clip():
         "open possession percent",
     )
     for event in replay_passes["rejected_events"]:
-        if event.get("distance_cm") is None:
-            assert_equal(
-                float(event["max_timing_seconds"]),
-                1.0,
-                f"frame {event.get('frame')} keeps the one second window",
-            )
+        if event.get("distance_cm") is not None:
+            continue
+        verified = (
+            event.get("trajectory") == "compatible"
+            and int(event.get("in_flight_samples") or 0) >= 2
+        )
+        assert_equal(
+            float(event["max_timing_seconds"]),
+            2.0 if verified else 1.0,
+            f"frame {event.get('frame')} keeps its pixel window",
+        )
     identity = possessor_identity_report(record)
     assert_true(
         not identity["team_mismatches"],
@@ -220,50 +235,43 @@ def test_fixture_replays_the_recorded_clip():
 
 
 def test_clip_events_follow_the_recorded_ball(replay):
-    """Events are the reading of the frozen log. They are not an older pass count."""
+    """The attack is seven passes, and the ball rolling past a defender is not his."""
     passes = replay["passes"]
-    assert_equal(passes["total_passes"], 1, "one completed pass")
-    completed = passes["events"][0]
-    assert_equal(
-        (completed["from_track_id"], completed["to_track_id"], completed["frame"]),
-        (32, 44, 326),
-        "32 keeps the ball and 44 receives it inside one second",
-    )
-    assert_equal(completed["trajectory"], "compatible", "the ball moves toward 44")
-    rejected = [
-        (event["from_track_id"], event["to_track_id"], event["reason"])
-        for event in passes["rejected_events"]
-    ]
-    assert_equal(
-        rejected,
-        [(15, 11, "timeout"), (11, 30, "timeout")],
-        "same-team gaps without field distance stay rejected",
-    )
-    turnovers = [
+    assert_equal(passes["total_passes"], 7, "seven completed passes")
+    completed = [
         (event["from_track_id"], event["to_track_id"], event["frame"])
-        for event in passes["turnover_events"]
+        for event in passes["events"]
     ]
-    assert_equal(turnovers, [(11, 4, 120), (4, 11, 155)], "team changes")
-    disputes = [
-        (event["from_track_id"], event["to_track_id"], event["frame"])
-        for event in passes["dispute_events"]
-    ]
-    assert_equal(disputes, [(30, 32, 299)], "the close challenge stays a dispute")
+    assert_equal(completed, EXPECTED_PASSES, "pass order")
+    long_pass = passes["events"][3]
+    assert_equal(long_pass["timing_tier"], "extended", "11 to 30 runs past one second")
+    assert_equal(long_pass["trajectory"], "compatible", "the ball moves toward 30")
+    assert_equal(long_pass["max_timing_seconds"], 2.0, "the seen flight keeps the longer budget")
+    assert_equal(passes["rejected_events"], [], "nothing was rejected")
+    assert_equal(passes["turnover_events"], [], "team 0 keeps the ball")
+    assert_equal(passes["dispute_events"], [], "no dispute")
+    frame_116 = next(item for item in replay["timeline"] if item["frame"] == 116)
+    assert_equal(frame_116["possessor"], None, "the white player does not take the ball in flight")
+    frame_125 = next(item for item in replay["timeline"] if item["frame"] == 125)
+    assert_equal(frame_125["possessor"], 10, "10 receives the return pass")
+    assert_equal(frame_125["team"], "Team 0", "10 is team 0")
     frame_155 = next(item for item in replay["timeline"] if item["frame"] == 155)
-    assert_equal(frame_155["possessor"], 11, "player 11 is confirmed on the fifth observation")
+    assert_equal(frame_155["possessor"], 11, "11 receives the ball back")
     assert_equal(frame_155["team"], "Team 0", "player 11 team")
-    frame_50 = next(item for item in replay["timeline"] if item["frame"] == 50)
-    assert_equal(frame_50["possessor"], None, "four observations still do not confirm")
 
 
-def test_grass_interval_publishes_no_ball(record):
-    for frame_number in range(32, 47):
+def test_the_first_pass_follows_the_ball(record):
+    previous_x = None
+    for frame_number in range(25, 64):
         frame = frame_by_number(record, frame_number)
         assert_true(frame is not None, f"frame {frame_number} is in the log")
-        assert_true(
-            frame.get("published_ball") is None,
-            f"frame {frame_number} published {frame.get('published_ball')}",
-        )
+        published = frame.get("published_ball")
+        assert_true(published is not None, f"frame {frame_number} lost the ball")
+        x = float(published["x"])
+        assert_true(x < 650.0, f"frame {frame_number} published {x}, beside the white player")
+        if previous_x is not None:
+            assert_true(x <= previous_x + 1.0, f"frame {frame_number} jumped from {previous_x} to {x}")
+        previous_x = x
 
 
 def test_frame_47_published_ball(record):
@@ -301,7 +309,7 @@ def main():
         )
     record, replay, identity = test_fixture_replays_the_recorded_clip()
     test_clip_events_follow_the_recorded_ball(replay)
-    test_grass_interval_publishes_no_ball(record)
+    test_the_first_pass_follows_the_ball(record)
     test_frame_47_published_ball(record)
     frame_103 = test_frame_103_is_reported_from_the_log(record)
     gap = explain_ball_after(record, 47)

@@ -20,6 +20,7 @@ import numpy as np
 import supervision as sv
 from ultralytics import YOLO
 
+from ball_flight import BallFlightPath
 from ball_heatmap import BallHeatmapAccumulator
 from event_replay import record_event_frame, write_event_record
 from player_identity_record import record_player, write_player_record
@@ -91,9 +92,15 @@ BALL_PLAYER_SUPPORT_PX = 45.0
 # A ball may reappear this far from the last ball a player actually had.
 # That covers a pass. The grass box beside the far defender is farther.
 BALL_REACQUIRE_PX = 400.0
-# An unsupported box may continue only for this short step. A longer jump
-# in open grass is not the ball in flight.
+# An unsupported box may continue only for this short step from the last
+# touch, unless it is the next step of the ball that was published last.
 BALL_ANCHOR_STEP_PX = 36.0
+# A pass moves the ball about 10 to 40 px per frame here. Each frame of flight
+# may only move this far from the ball that was published before it.
+BALL_FLIGHT_STEP_PX = 60.0
+# Four seconds at 30 fps, the longest pass the detector accepts. A box that
+# stays away from every player longer than this is not a ball in flight.
+BALL_FLIGHT_MAX_UNSUPPORTED_FRAMES = 120
 BALL_NEARBY_STRONG_DISTANCE_PX = PHYSICAL_ACCEPT_DISTANCE
 # observed: a ball was accepted, or the five-frame memory still holds it.
 # lost: that memory has expired and the old pixel velocity is discarded.
@@ -1465,6 +1472,35 @@ def ball_supported_by_player(detection, person_detections, max_distance_px=BALL_
     return False
 
 
+def ball_continues_flight(
+    detection,
+    predicted_center,
+    last_ball_center,
+    frames_since_ball=1,
+    unsupported_frames=0,
+    step_px=BALL_FLIGHT_STEP_PX,
+    max_unsupported_frames=BALL_FLIGHT_MAX_UNSUPPORTED_FRAMES,
+):
+    """The next step of a pass, measured from the ball published before it.
+
+    A pass leaves every player behind, so it cannot be judged from the last
+    touch. Each frame of flight stays within one step of the previous ball and
+    near the prediction. A box that jumps elsewhere, or that stays away from
+    every player for longer than a pass, is not the ball in flight.
+    """
+    if detection is None or last_ball_center is None or predicted_center is None:
+        return False
+    if int(unsupported_frames) >= int(max_unsupported_frames):
+        return False
+    center = detection_center_np(detection["box"])
+    previous = np.asarray(last_ball_center, dtype=np.float32)
+    predicted = np.asarray(predicted_center, dtype=np.float32)
+    step_limit = float(step_px) * float(max(1, int(frames_since_ball)))
+    if float(np.linalg.norm(center - previous)) > step_limit:
+        return False
+    return float(np.linalg.norm(center - predicted)) <= BALL_PREDICTION_NEAR_DISTANCE_PX
+
+
 def ball_selection_keeps_player_support(
     detection,
     predicted_center,
@@ -1472,13 +1508,16 @@ def ball_selection_keeps_player_support(
     last_supported_center=None,
     support_px=BALL_PLAYER_SUPPORT_PX,
     flight_px=BALL_ANCHOR_STEP_PX,
+    last_ball_center=None,
+    frames_since_ball=1,
+    unsupported_frames=0,
 ):
-    """A ball in open grass cannot keep its own track alive.
+    """A ball in open grass cannot open a track or jump to another player.
 
-    While a track is alive, the ball may stay with the player who has it or
-    take one short step away from that player. It may not walk across the
-    grass and arrive at someone else. Once the track has died, a strong box
-    at a player's feet can be a pass, if it is still within one pass of the
+    While a track is alive, the ball may stay with the player who has it, take
+    one short step away from that player, or continue the flight frame by
+    frame from the ball published before it. Once the track has died, a strong
+    box at a player's feet can be a pass, if it is still within one pass of the
     last ball a player had.
     """
     if detection is None:
@@ -1497,7 +1536,16 @@ def ball_selection_keeps_player_support(
         return supported and strong
     if predicted_center is None:
         return supported and strong and within(last_supported_center, BALL_REACQUIRE_PX)
+    flight = ball_continues_flight(
+        detection,
+        predicted_center,
+        last_ball_center,
+        frames_since_ball=frames_since_ball,
+        unsupported_frames=unsupported_frames,
+    )
     if not strong:
+        if flight and within(predicted_center, flight_px):
+            return True
         return (
             supported
             and within(predicted_center, flight_px)
@@ -1505,7 +1553,7 @@ def ball_selection_keeps_player_support(
         )
     if supported and within(last_supported_center, BALL_PREDICTION_NEAR_DISTANCE_PX):
         return True
-    return within(last_supported_center, flight_px)
+    return flight or within(last_supported_center, flight_px)
 
 
 def nearest_supported_ball(
@@ -1739,6 +1787,8 @@ def select_player_ball_fallback(
     person_detections=None,
     player_support_px=BALL_PLAYER_SUPPORT_PX,
     last_supported_center=None,
+    frames_since_ball=1,
+    unsupported_frames=0,
 ):
     """Continue an open ball track with the player detector's ball class.
 
@@ -1746,7 +1796,8 @@ def select_player_ball_fallback(
     ball. This source is consulted only to fill that absence, and only when a
     track and a pixel prediction already exist. A box farther than 80 px, or
     below 0.25, is ignored, including the sideline false balls from the player
-    model. It never opens a track.
+    model. It never opens a track. Away from a player, it is kept only as the
+    next step of the flight.
     """
     decision = {
         "used": False,
@@ -1787,6 +1838,16 @@ def select_player_ball_fallback(
         chosen = eligible[0][2]
         decision["confidence"] = float(chosen["confidence"])
         decision["distance"] = float(eligible[0][0])
+        flight = ball_continues_flight(
+            chosen,
+            predicted_center,
+            detection_center_np(last_valid_detection["box"]),
+            frames_since_ball=frames_since_ball,
+            unsupported_frames=unsupported_frames,
+        )
+        if flight:
+            decision["used"] = True
+            return chosen, decision
         if person_detections is not None and not ball_supported_by_player(
             chosen, person_detections, player_support_px
         ):
@@ -2522,6 +2583,8 @@ def build_performance_profile_report(
             "ball_track_state": str(ball_tracking_metrics.get("ball_track_state", BALL_TRACK_LOST)),
             "ball_reacquisitions": int(ball_tracking_metrics.get("ball_reacquisitions", 0)),
             "ball_rejected_open_boxes": int(ball_tracking_metrics.get("ball_rejected_open_boxes", 0)),
+            "ball_flight_frames": int(ball_tracking_metrics.get("ball_flight_frames", 0)),
+            "ball_flight_unreachable_boxes": int(ball_tracking_metrics.get("ball_flight_unreachable_boxes", 0)),
             "ball_recovery_examples": list(ball_tracking_metrics.get("ball_recovery_examples", [])),
             "ball_memory_hits": int(ball_tracking_metrics["ball_memory_hits"]),
             "ball_memory_misses": int(ball_tracking_metrics["ball_memory_misses"]),
@@ -2990,6 +3053,8 @@ def analyze(args):
     ball_last_valid_detection = None
     last_supported_ball_center = None
     last_supported_ball_area = None
+    ball_unsupported_frames = 0
+    ball_flight_path = BallFlightPath()
     rejected_ball_centers = []
     reacquisition_pending = None
     ball_track_state = BALL_TRACK_LOST
@@ -3004,6 +3069,8 @@ def analyze(args):
         "ball_memory_misses": 0,
         "ball_reacquisitions": 0,
         "ball_rejected_open_boxes": 0,
+        "ball_flight_frames": 0,
+        "ball_flight_unreachable_boxes": 0,
         "ball_track_state": BALL_TRACK_LOST,
         "ball_recovery_examples": [],
         "ball_roi_searches": 0,
@@ -3621,11 +3688,20 @@ def analyze(args):
             else 0.0
         )
         support_people = list(player_detections) + list(goalkeeper_detections)
+        last_ball_center = (
+            detection_center_np(ball_last_valid_detection["box"])
+            if ball_last_valid_detection is not None
+            else None
+        )
+        frames_since_ball = int(ball_frames_without_detection) + 1
         if not ball_selection_keeps_player_support(
             selected_ball_detection,
             predicted_ball_center,
             support_people,
             last_supported_ball_center,
+            last_ball_center=last_ball_center,
+            frames_since_ball=frames_since_ball,
+            unsupported_frames=ball_unsupported_frames,
         ):
             if selected_ball_detection is not None and not ball_supported_by_player(
                 selected_ball_detection,
@@ -3688,6 +3764,8 @@ def analyze(args):
                 ball_last_valid_detection,
                 person_detections=support_people,
                 last_supported_center=last_supported_ball_center,
+                frames_since_ball=frames_since_ball,
+                unsupported_frames=ball_unsupported_frames,
             )
             if fallback_decision["used"]:
                 selected_ball_detection = fallback_detection
@@ -3722,6 +3800,22 @@ def analyze(args):
             if recovered_ball is not None:
                 selected_ball_detection = recovered_ball
                 physical_pending_candidate_state = None
+        if selected_ball_detection is not None and not ball_flight_path.reachable(
+            current_frame_number,
+            selected_ball_detection["box"],
+        ):
+            selected_ball_detection = None
+            ball_tracking_metrics["ball_flight_unreachable_boxes"] += 1
+        if selected_ball_detection is None:
+            flight_ball = ball_flight_path.continue_flight(
+                current_frame_number,
+                ball_detections_after_nms_dicts,
+            )
+            if flight_ball is not None:
+                selected_ball_detection = dict(flight_ball)
+                selected_ball_detection["source"] = "ball-flight"
+                physical_pending_candidate_state = None
+                ball_tracking_metrics["ball_flight_frames"] += 1
         dedicated_ball_detections = ball_dicts_to_detections(
             [selected_ball_detection] if selected_ball_detection is not None else []
         )
@@ -3761,7 +3855,13 @@ def analyze(args):
             )
             rejected_ball_centers = reacquisition["rejected"]
             reacquisition_pending = reacquisition["pending"]
-            if reacquisition["used"]:
+            if reacquisition["used"] and not ball_flight_path.reachable(
+                current_frame_number,
+                reacquisition["detection"]["box"],
+            ):
+                reacquisition_pending = None
+                ball_tracking_metrics["ball_flight_unreachable_boxes"] += 1
+            elif reacquisition["used"]:
                 selected_ball_detection = reacquisition["detection"]
                 selected_ball_detection["source"] = "ball-reacquisition"
                 restart_ball_history = bool(reacquisition["restart_history"])
@@ -3819,11 +3919,21 @@ def analyze(args):
             else:
                 ball_frames_without_detection = 0
             ball_last_valid_detection = selected_ball_detection
-            if ball_supported_by_player(selected_ball_detection, support_people):
+            selected_at_player = ball_supported_by_player(selected_ball_detection, support_people)
+            ball_flight_path.note_published(
+                current_frame_number,
+                selected_ball_detection["box"],
+                selected_at_player,
+                confidence=float(selected_ball_detection["confidence"]),
+            )
+            if selected_at_player:
                 # The next pass is measured from this player. A grass box never
                 # reaches this line: it was dropped before it could move the anchor.
                 last_supported_ball_center = detection_center_np(selected_ball_detection["box"])
                 last_supported_ball_area = float(detection_box_area(selected_ball_detection["box"]))
+                ball_unsupported_frames = 0
+            else:
+                ball_unsupported_frames += 1
             if hybrid_ball_search_enabled:
                 if detection_source_mode in {"semi_global", "full_global"}:
                     ball_consecutive_detections_for_crop += 1
