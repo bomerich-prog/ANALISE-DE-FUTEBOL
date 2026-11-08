@@ -4555,9 +4555,21 @@ def analyze(args):
             if debug_frame is not None:
                 _draw_homography_debug(debug_frame, homography_decision)
         if map_decision.get("matrix") is not None and map_decision.get("positive_x") is not None:
-            draw_visible_penalty(output_frame, map_decision["matrix"], map_decision["positive_x"])
+            draw_visible_penalty(
+                output_frame,
+                map_decision["matrix"],
+                map_decision["positive_x"],
+                toward_goal_cm=map_decision.get("toward_goal_cm"),
+                toward_arc_cm=map_decision.get("toward_arc_cm"),
+            )
             if debug_frame is not None:
-                draw_visible_penalty(debug_frame, map_decision["matrix"], map_decision["positive_x"])
+                draw_visible_penalty(
+                    debug_frame,
+                    map_decision["matrix"],
+                    map_decision["positive_x"],
+                    toward_goal_cm=map_decision.get("toward_goal_cm"),
+                    toward_arc_cm=map_decision.get("toward_arc_cm"),
+                )
 
         render_bounding_boxes_stage_start = time.perf_counter()
         for detection in accepted_player_detections:

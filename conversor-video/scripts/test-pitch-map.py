@@ -14,12 +14,15 @@ from pitch_homography import fit_broadcast_penalty  # noqa: E402
 from pitch_map import (  # noqa: E402
     VisiblePitchMap,
     box_matches_visible_paint,
+    inside_measured,
     inside_visible,
+    paint_patch,
     scale_is_stable,
     visible_bounds,
 )
 from possession import _player_distance  # noqa: E402
 from roboflow_soccer_config import SoccerPitchConfiguration  # noqa: E402
+from roboflow_view import ViewTransformer  # noqa: E402
 from spatial_metrics import SpatialMetrics, hull_area_m2  # noqa: E402
 
 
@@ -91,8 +94,6 @@ def test_heatmap_reads_the_map_channel():
 def test_projection_drops_the_far_half():
     pitch_map = VisiblePitchMap()
     pitch_map.transformer = pitch_map.transformer
-    from roboflow_view import ViewTransformer
-
     pitch_map.transformer = ViewTransformer.from_matrix(np.eye(3))
     pitch_map.positive_x = False
     pitch_map.matrix = np.eye(3)
@@ -148,6 +149,67 @@ def test_a_box_in_the_stands_is_not_published():
     )
 
 
+def _stands_matrix():
+    """16.5 m line on the grass, goal line in the crowd. 4 px per centimetre of depth."""
+    return np.array(
+        [[0.0, -4.0, 12350.0], [20.0 / 3.0, 0.0, 1484.0 - 200.0 / 0.15], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+
+
+def _paint_projected(mask, matrix, field_points, radius=2):
+    inverse = np.linalg.inv(matrix).astype(np.float32)
+    projected = cv2.perspectiveTransform(
+        np.asarray(field_points, dtype=np.float32).reshape(-1, 1, 2), inverse
+    ).reshape(-1, 2)
+    for x, y in projected:
+        if np.isfinite(x) and np.isfinite(y):
+            cv2.circle(mask, (int(round(x)), int(round(y))), radius, 255, -1)
+
+
+def test_goal_line_in_the_stands_keeps_the_grass_patch():
+    grass = np.zeros((750, 1338), dtype=np.uint8)
+    grass[220:, :] = 255
+    white = np.zeros_like(grass)
+    matrix = _stands_matrix()
+    front = 10350.0
+    y0 = (7000.0 - 4032.0) / 2.0
+    y1 = (7000.0 + 4032.0) / 2.0
+    front_line = [(front, y0 + (y1 - y0) * step) for step in np.linspace(0, 1, 40)]
+    spot = 12000.0 - 1100.0
+    arc = []
+    for angle in np.linspace(0, 2 * np.pi, 48):
+        x = spot + 915.0 * np.cos(angle)
+        y = 3500.0 + 915.0 * np.sin(angle)
+        if x < front:
+            arc.append((x, y))
+    _paint_projected(white, matrix, front_line, radius=2)
+    _paint_projected(white, matrix, arc, radius=2)
+    patch = paint_patch(matrix, True, grass, white)
+    assert_true(patch is not None, "the line and the arc keep the frame")
+    assert_true(patch["toward_goal_cm"] >= 400.0, "several metres toward the goal stay on the grass")
+    assert_true(patch["toward_goal_cm"] < 1650.0, "the goal line in the stands is outside the patch")
+    assert_true(
+        inside_measured(front + 400.0, 3500.0, True, patch["toward_goal_cm"], patch["toward_arc_cm"]),
+        "4 m toward the goal is published",
+    )
+    assert_true(
+        not inside_measured(12000.0, 3500.0, True, patch["toward_goal_cm"], patch["toward_arc_cm"]),
+        "the goal line is not published",
+    )
+    pitch_map = VisiblePitchMap()
+    pitch_map.matrix = matrix
+    pitch_map.transformer = ViewTransformer.from_matrix(matrix)
+    pitch_map.positive_x = True
+    pitch_map.toward_goal_cm = patch["toward_goal_cm"]
+    pitch_map.toward_arc_cm = patch["toward_arc_cm"]
+    pitch_map.grass = grass
+    near = pitch_map.project(np.array([[502.0, 400.0]], dtype=np.float32))
+    far = pitch_map.project(np.array([[502.0, 87.0]], dtype=np.float32))
+    assert_true(near[0] is not None, "a grass point inside the patch is published")
+    assert_true(far[0] is None, "the same player in the crowd publishes nothing")
+
+
 def test_blank_paint_publishes_nothing():
     pitch_map = VisiblePitchMap()
     decision = pitch_map.update(np.zeros((750, 1338), dtype=np.uint8))
@@ -190,6 +252,7 @@ def main():
     test_projection_drops_the_far_half()
     test_spatial_metrics_use_only_mapped_players()
     test_a_box_in_the_stands_is_not_published()
+    test_goal_line_in_the_stands_keeps_the_grass_patch()
     test_blank_paint_publishes_nothing()
     test_real_penalty_paint_locks_and_a_blank_frame_drops_it()
     print("pitch map tests passed")
