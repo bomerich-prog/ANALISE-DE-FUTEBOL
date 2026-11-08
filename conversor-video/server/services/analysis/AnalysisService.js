@@ -59,6 +59,9 @@ class AnalysisService {
     if (playerStats) stats.player_stats = playerStats;
     const ballHeatmap = ballHeatmapFromPayload({ ball_heatmap: result?.ball_heatmap });
     if (ballHeatmap) stats.ball_heatmap = ballHeatmap;
+    if (result?.pitch_map && typeof result.pitch_map === 'object') {
+      stats.pitch_map = result.pitch_map;
+    }
     if (result?.artifacts?.debug_live_frame_url) {
       stats.debug_frame_url = result.artifacts.debug_live_frame_url;
     }

@@ -85,8 +85,20 @@ def _penalty_line(paint):
             continue
         if min(y1, y2) < paint.shape[0] * 0.28:
             continue
+        midpoint = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0], np.float64)
         for family in families:
-            if abs(angle - family[0][1]) < 8:
+            if abs(angle - family[0][1]) >= 8:
+                continue
+            # Parallel edges of the box share an angle. Only a collinear run is one line.
+            _, _, ax, ay, bx, by = family[0]
+            family_direction = np.array([bx - ax, by - ay], np.float64)
+            family_norm = float(np.linalg.norm(family_direction))
+            if family_norm < 1e-6:
+                continue
+            family_direction /= family_norm
+            delta = midpoint - np.array([ax, ay], np.float64)
+            offset = abs(float(delta[0] * family_direction[1] - delta[1] * family_direction[0]))
+            if offset < 14:
                 family.append(segment)
                 break
         else:
@@ -213,6 +225,19 @@ def _arc_candidates(paint, origin, direction):
         inliers = int(len(keep))
         if inliers < 100:
             continue
+        # A straight line beside the penalty line fits a large circle. The arc bows off that chord.
+        chord_vx, chord_vy, chord_x, chord_y = cv2.fitLine(
+            keep.astype(np.float32), cv2.DIST_L2, 0, 0.01, 0.01
+        ).reshape(-1)
+        chord = np.array([float(chord_vx), float(chord_vy)], np.float64)
+        chord_norm = float(np.linalg.norm(chord))
+        if chord_norm < 1e-6:
+            continue
+        chord /= chord_norm
+        chord_origin = np.array([float(chord_x), float(chord_y)], np.float64)
+        bow = np.abs((keep - chord_origin)[:, 0] * chord[1] - (keep - chord_origin)[:, 1] * chord[0])
+        if float(np.percentile(bow, 90)) < 0.08 * radius:
+            continue
         # The painted penalty arc is the short cap outside the box, about 106 degrees.
         # A centre-circle fit covers far more of the circle and must not win.
         angles = np.sort(np.arctan2(keep[:, 1] - center[1], keep[:, 0] - center[0]))
@@ -319,10 +344,16 @@ def fit_broadcast_penalty(white_line_mask, pitch, frame=None):
         # The arc has to sit on the paint. Inlier count breaks the remaining ties.
         rank = (distance, -inliers)
         if best is None or rank < best[0]:
-            best = (rank, matrix)
+            best = (rank, matrix, bool(positive_x), float(gap), float(front_x))
     if best is None:
         return None
-    return best[1]
+    _rank, matrix, positive_x, gap, front_x = best
+    return {
+        "matrix": matrix,
+        "positive_x": positive_x,
+        "cm_per_px": _SPOT_FROM_FRONT_CM / gap,
+        "front_x_cm": front_x,
+    }
 
 
 class PitchHomographyGate:
@@ -354,16 +385,17 @@ class PitchHomographyGate:
         if not decision["accepted"]:
             painted = fit_broadcast_penalty(white_line_mask, self.pitch, frame)
             if painted is not None:
+                painted_matrix = painted["matrix"]
                 decision = {
                     "accepted": True,
                     "held": False,
                     "reason": "accepted",
-                    "transformer": ViewTransformer.from_matrix(painted),
-                    "matrix": painted,
-                    "candidate_matrix": painted,
+                    "transformer": ViewTransformer.from_matrix(painted_matrix),
+                    "matrix": painted_matrix,
+                    "candidate_matrix": painted_matrix,
                     "inliers": decision["inliers"],
-                    "support": line_support(painted, white_line_mask, self.pitch),
-                    "candidate_support": line_support(painted, white_line_mask, self.pitch),
+                    "support": line_support(painted_matrix, white_line_mask, self.pitch),
+                    "candidate_support": line_support(painted_matrix, white_line_mask, self.pitch),
                 }
         if decision["accepted"]:
             self.held = decision["transformer"]

@@ -197,3 +197,38 @@ export function drawBallHeatmap(ctx, width, height, heatmap) {
   drawPitchLines(ctx, width, height, map);
   return painted;
 }
+
+export function drawVisibleThird(ctx, width, height, goalEnd) {
+  if (!ctx || (goalEnd !== 'high_x' && goalEnd !== 'low_x')) return;
+  const third = width / 3;
+  const x = goalEnd === 'high_x' ? width - third : 0;
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
+  ctx.setLineDash([7, 5]);
+  ctx.lineWidth = 2;
+  ctx.strokeRect(x + 2, 2, third - 4, height - 4);
+  ctx.restore();
+}
+
+export function drawPlayerHeat(ctx, width, height, heatmap) {
+  if (!ctx || !heatmap?.observed_points) return 0;
+  const cellWidth = width / heatmap.columns;
+  const cellHeight = height / heatmap.rows;
+  let painted = 0;
+  heatmap.cells.forEach((row, rowIndex) => {
+    row.forEach((value, columnIndex) => {
+      const intensity = cellIntensity(value, heatmap.max_cell_count);
+      if (!intensity) return;
+      ctx.strokeStyle = `rgba(120, 190, 255, ${0.35 + 0.55 * intensity})`;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(
+        columnIndex * cellWidth + 2,
+        rowIndex * cellHeight + 2,
+        cellWidth - 4,
+        cellHeight - 4
+      );
+      painted += 1;
+    });
+  });
+  return painted;
+}

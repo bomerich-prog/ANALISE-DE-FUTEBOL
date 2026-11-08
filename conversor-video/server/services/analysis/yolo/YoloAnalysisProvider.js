@@ -149,6 +149,9 @@ class YoloAnalysisProvider extends AnalysisProvider {
           if (playerStats) details.progress_stats.player_stats = playerStats;
           const ballHeatmap = ballHeatmapFromPayload(payload);
           if (ballHeatmap) details.progress_stats.ball_heatmap = ballHeatmap;
+          if (payload.pitch_map && typeof payload.pitch_map === 'object') {
+            details.progress_stats.pitch_map = payload.pitch_map;
+          }
           if (payload.debugFrameUpdated) {
             details.progress_stats.debug_frame_url = `/api/analyses/${analysisId}/debug-frame?t=${Date.now()}`;
             if (payload.debugFrameJpeg) {

@@ -30,6 +30,15 @@ def _finite(value):
     return number
 
 
+def _heatmap_point(detection):
+    """Map coordinates win. Event field coordinates are only a fallback."""
+    map_x = _finite(detection.get("map_x"))
+    map_y = _finite(detection.get("map_y"))
+    if map_x is not None and map_y is not None:
+        return map_x, map_y
+    return _finite(detection.get("field_x")), _finite(detection.get("field_y"))
+
+
 class BallHeatmapAccumulator:
     def __init__(
         self,
@@ -52,26 +61,29 @@ class BallHeatmapAccumulator:
         self.observed_points = 0
         self.max_cell_count = 0
 
+    def count_point(self, field_x, field_y):
+        cell = self._cell_for(field_x, field_y)
+        if cell is None:
+            return False
+        row, column = cell
+        self.cells[row][column] += 1
+        self.observed_points += 1
+        if self.cells[row][column] > self.max_cell_count:
+            self.max_cell_count = self.cells[row][column]
+        return True
+
     def observe(self, ball_detections):
         self.frames_total += 1
         ball = ball_detections[0] if ball_detections else None
         if not ball or ball.get("source") in _NOT_OBSERVED_SOURCES:
             return
         self.frames_observed_ball += 1
-        field_x = _finite(ball.get("field_x"))
-        field_y = _finite(ball.get("field_y"))
+        field_x, field_y = _heatmap_point(ball)
         if field_x is None or field_y is None:
             self.frames_without_field_point += 1
             return
-        cell = self._cell_for(field_x, field_y)
-        if cell is None:
+        if not self.count_point(field_x, field_y):
             self.frames_outside_field += 1
-            return
-        row, column = cell
-        self.cells[row][column] += 1
-        self.observed_points += 1
-        if self.cells[row][column] > self.max_cell_count:
-            self.max_cell_count = self.cells[row][column]
 
     def _cell_for(self, field_x, field_y):
         tolerance = self.edge_tolerance_cm

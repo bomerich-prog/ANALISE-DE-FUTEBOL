@@ -480,7 +480,7 @@
         <div class="analysis-heatmap-body">
           <div class="analysis-heatmap-pitch">
             <canvas id="ballHeatmapCanvas" width="720" height="420" role="img" aria-label="Mapa de calor das posições observadas da bola no campo"></canvas>
-            <p class="analysis-heatmap-empty" id="ballHeatmapEmpty">Aguardando bola observada com coordenada de campo.</p>
+            <p class="analysis-heatmap-empty" id="ballHeatmapEmpty">Aguardando bola no terço visível do campo.</p>
           </div>
           <div class="analysis-heatmap-stats">
             <article>
@@ -495,7 +495,32 @@
             <article>
               <span>Bola fora do mapa</span>
               <strong id="ballHeatmapNoField">0</strong>
-              <small>Sem homografia ou fora do campo</small>
+              <small>Sem mapa do terço visível, ou fora dele</small>
+            </article>
+            <article>
+              <span>Largura</span>
+              <strong id="pitchMapWidth">—</strong>
+              <small id="pitchMapWidthDetail">Team 0 e Team 1</small>
+            </article>
+            <article>
+              <span>Comprimento</span>
+              <strong id="pitchMapLength">—</strong>
+              <small id="pitchMapLengthDetail">No terço visível</small>
+            </article>
+            <article>
+              <span>Compactação</span>
+              <strong id="pitchMapCompactness">—</strong>
+              <small id="pitchMapCompactnessDetail">Área do grupo</small>
+            </article>
+            <article>
+              <span>Linha defensiva</span>
+              <strong id="pitchMapDefense">—</strong>
+              <small id="pitchMapDefenseDetail">Distância da baliza visível</small>
+            </article>
+            <article>
+              <span>Velocidade</span>
+              <strong id="pitchMapSpeed">—</strong>
+              <small id="pitchMapSpeedDetail">Jogadores e bola, com a mesma matriz</small>
             </article>
           </div>
         </div>

@@ -34,7 +34,9 @@ from roboflow_ball import BallTracker
 from roboflow_soccer_config import SoccerPitchConfiguration
 from roboflow_team import TeamClassifier, TeamTrackLock, reject_training_crop
 from pitch_homography import PitchHomographyGate, draw_projected_pitch
+from pitch_map import VisiblePitchMap, draw_visible_penalty
 from roboflow_view import ViewTransformer
+from spatial_metrics import SpatialMetrics
 
 
 BALL_CLASS_ID = 0
@@ -611,6 +613,28 @@ def build_view_transformer_from_pitch_keypoints(keypoints):
         )
     except ValueError:
         return None
+
+
+def assign_map_coordinates(detections, pitch_map, anchor_getter):
+    """Publish the visible-third map beside the event coordinates.
+
+    field_x and field_y stay untouched, so possession and passes keep reading
+    pixels even when a player also has a map point.
+    """
+    if not detections:
+        return
+    for detection in detections:
+        detection["map_x"] = None
+        detection["map_y"] = None
+    if pitch_map is None or pitch_map.transformer is None:
+        return
+    points = np.array([anchor_getter(detection["box"]) for detection in detections], dtype=np.float32)
+    mapped = pitch_map.project(points)
+    for detection, point in zip(detections, mapped):
+        if point is None:
+            continue
+        detection["map_x"] = float(point[0])
+        detection["map_y"] = float(point[1])
 
 
 def assign_field_coordinates_to_detections(detections, view_transformer, anchor_getter):
@@ -3182,6 +3206,8 @@ def analyze(args):
     possession_team_stats = PossessionTeamAccumulator(fps)
     player_stats = PlayerStatsAccumulator(fps, pitch=SOCCER_PITCH_CONFIGURATION)
     ball_heatmap = BallHeatmapAccumulator(pitch=SOCCER_PITCH_CONFIGURATION)
+    visible_pitch_map = VisiblePitchMap(pitch=SOCCER_PITCH_CONFIGURATION)
+    spatial_metrics = SpatialMetrics(fps=fps)
     pitch_homography_gate = PitchHomographyGate(pitch=SOCCER_PITCH_CONFIGURATION)
     pitch_homography_debug = os.getenv("PITCH_HOMOGRAPHY_DEBUG", "").strip().lower() in {"1", "true", "on", "yes"}
     last_possession_events = possession_engine.snapshot().as_dict()
@@ -4403,6 +4429,22 @@ def analyze(args):
             decision_transformer,
             detection_center,
         )
+        map_decision = visible_pitch_map.update(white_line_mask, frame, grass_mask)
+        for mapped_detections, anchor in (
+            (accepted_player_detections, detection_foot_point),
+            (accepted_goalkeeper_detections, detection_foot_point),
+            (accepted_referee_detections, detection_foot_point),
+            (ball_detections, detection_center),
+        ):
+            assign_map_coordinates(mapped_detections, visible_pitch_map, anchor)
+        spatial_metrics_live = spatial_metrics.observe(
+            frame_number=current_frame_number,
+            players=list(accepted_player_detections) + list(accepted_goalkeeper_detections),
+            ball=ball_detections[0] if ball_detections else None,
+            generation=map_decision.get("generation"),
+            goal_at_high_x=visible_pitch_map.positive_x,
+        )
+        spatial_metrics_live["calibration"] = visible_pitch_map.metrics()
 
         if len(homography_examples) < 8:
             for class_name, detections in (
@@ -4512,6 +4554,10 @@ def analyze(args):
             _draw_homography_debug(output_frame, homography_decision)
             if debug_frame is not None:
                 _draw_homography_debug(debug_frame, homography_decision)
+        if map_decision.get("matrix") is not None and map_decision.get("positive_x") is not None:
+            draw_visible_penalty(output_frame, map_decision["matrix"], map_decision["positive_x"])
+            if debug_frame is not None:
+                draw_visible_penalty(debug_frame, map_decision["matrix"], map_decision["positive_x"])
 
         render_bounding_boxes_stage_start = time.perf_counter()
         for detection in accepted_player_detections:
@@ -4638,6 +4684,7 @@ def analyze(args):
                 "possession_by_team": possession_by_team_live,
                 "player_stats": player_stats_live,
                 "ball_heatmap": ball_heatmap.as_dict(),
+                "pitch_map": spatial_metrics_live,
                 "playerDetections": [
                     {
                         "track_id": int(detection.get("track_id", -1)),
@@ -4844,7 +4891,7 @@ def analyze(args):
             "player_duplicate_iou_threshold": PERSON_DUPLICATE_IOU_THRESHOLD,
             "field_filter": "player/goalkeeper/referee bbox bottom-center foot point must be inside white-line-guided playable-field polygon",
             "labels": "class name and confidence are burned into the annotated video",
-            "field_coordinates": "possession, passes and the ball heatmap use image pixels; homography coordinates are not fed to those decisions",
+            "field_coordinates": "possession and passes stay in image pixels; map_x and map_y feed only the visible-third heatmap and spatial metrics",
         },
         "tracking": {
             "status": "implemented",
@@ -4913,7 +4960,7 @@ def analyze(args):
             "frame_examples": goalkeeper_assignment_frame_examples,
         },
         "homography": {
-            "status": "measured only; coordinates are not used for possession, passes or the ball heatmap",
+            "status": "event coordinates stay in pixels; the visible-third map is a separate channel",
             "feeds_decisions": HOMOGRAPHY_FEEDS_DECISIONS,
             "valid_frames": homography_valid_frames,
             "total_frames": frames_processed,
@@ -4928,6 +4975,7 @@ def analyze(args):
         "possession_by_team": possession_team_stats.as_dict(),
         "player_stats": player_stats.as_dict(),
         "ball_heatmap": ball_heatmap.as_dict(),
+        "pitch_map": {**spatial_metrics.as_dict(), "calibration": visible_pitch_map.metrics()},
         "passes": pass_metrics,
         "artifacts": {
             "processed_video_path": str(output_path),
@@ -4955,6 +5003,7 @@ def analyze(args):
             "possession_by_team": possession_team_stats.as_dict(),
             "player_stats": player_stats.as_dict(),
             "ball_heatmap": ball_heatmap.as_dict(),
+            "pitch_map": {**spatial_metrics.as_dict(), "calibration": visible_pitch_map.metrics()},
         }
     )
     emit({"type": "result", "result": result})
