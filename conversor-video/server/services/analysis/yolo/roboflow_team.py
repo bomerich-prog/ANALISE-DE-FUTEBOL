@@ -11,6 +11,10 @@ TEAM_DARK_ID = 0
 TEAM_LIGHT_ID = 1
 TORSO_MIN_HEIGHT = 32
 TORSO_MIN_WIDTH = 12
+TORSO_RELAXED_MIN_HEIGHT = 22
+TORSO_RELAXED_MIN_WIDTH = 10
+TORSO_UNAMBIGUOUS_SATURATION = 90.0
+TORSO_UNAMBIGUOUS_VALUE = 150.0
 TORSO_MIN_PIXELS = 24
 TORSO_GRASS_MAX = 0.55
 TORSO_HUE_SATURATION_MIN = 45
@@ -122,8 +126,9 @@ def measure_torso(crop: np.ndarray) -> Dict[str, object]:
     if crop is None or getattr(crop, "size", 0) == 0:
         return _weak_torso("empty")
     height, width = crop.shape[:2]
-    if height < TORSO_MIN_HEIGHT or width < TORSO_MIN_WIDTH:
+    if height < TORSO_RELAXED_MIN_HEIGHT or width < TORSO_RELAXED_MIN_WIDTH:
         return _weak_torso("small")
+    relaxed = height < TORSO_MIN_HEIGHT or width < TORSO_MIN_WIDTH
     torso = torso_region(crop)
     if torso is None or torso.size == 0:
         return _weak_torso("empty")
@@ -157,14 +162,29 @@ def measure_torso(crop: np.ndarray) -> Dict[str, object]:
     hue_value = None
     if int(saturated.sum()) >= TORSO_HUE_MIN_PIXELS:
         hue_value = float(np.median(hue[saturated]))
+    measured_value = float(np.median(value[usable]))
+    measured_saturation = float(np.median(saturation[usable]))
+    if relaxed and not _color_is_unambiguous(measured_saturation, measured_value, hue_value):
+        return _weak_torso("small")
     return {
         "abstain": False,
         "reason": None,
-        "value": float(np.median(value[usable])),
-        "saturation": float(np.median(saturation[usable])),
+        "value": measured_value,
+        "saturation": measured_saturation,
         "hue": hue_value,
         "pixels": pixel_count,
     }
+
+
+def _color_is_unambiguous(saturation, value, hue) -> bool:
+    """A far player can vote only when the shirt color is already obvious."""
+    if hue is None:
+        return False
+    if float(saturation) < TORSO_UNAMBIGUOUS_SATURATION:
+        return False
+    if float(value) < TORSO_UNAMBIGUOUS_VALUE:
+        return False
+    return True
 
 
 def anchor_cluster_labels(crops: List[np.ndarray], raw_labels: Iterable[int]):

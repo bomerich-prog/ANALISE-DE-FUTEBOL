@@ -727,6 +727,27 @@ def test_verified_pixel_flight_beyond_two_seconds_is_rejected():
     assert_equal(metrics["rejected_events"][0]["max_timing_seconds"], 2.0, "verified pixel budget")
 
 
+def test_a_possessor_without_a_team_is_not_a_pass_or_a_dispute():
+    detector = PassDetector()
+    donor = player(13, None, 0.0, 0.0)
+    receiver = player(7, 1, 1500.0, 0.0)
+    players = [donor, receiver]
+    frames = []
+    frame = 1
+    for _ in range(6):
+        frames.append((frame, 13, None, players, ball(0.0, 0.0)))
+        frame += 1
+    for _ in range(3):
+        frames.append((frame, None, None, players, ball(700.0, 0.0)))
+        frame += 1
+    frames.append((frame, 7, "Team 1", players, ball(1500.0, 0.0)))
+    metrics = run_frames(detector, frames)
+    assert_equal(metrics["total_passes"], 0, "no team does not start a pass")
+    assert_equal(metrics["disputes"], 0, "no team does not start a dispute")
+    assert_equal(metrics["turnovers"], 0, "no team does not start a turnover")
+    assert_equal(metrics["discarded_unstable_possession"], 1, "the link is discarded")
+
+
 def test_both_teams_on_the_ball_is_a_dispute():
     detector = PassDetector()
     donor = player(1, 0, 0.0, 0.0)
@@ -780,6 +801,7 @@ if __name__ == "__main__":
     test_wall_leg_below_the_score_is_not_created()
     test_one_frame_wall_touch_is_still_two_passes()
     test_a_clear_receiver_is_not_a_dispute()
+    test_a_possessor_without_a_team_is_not_a_pass_or_a_dispute()
     test_both_teams_on_the_ball_is_a_dispute()
     test_verified_pixel_flight_can_run_past_one_second()
     test_hidden_pixel_flight_past_one_second_is_rejected()

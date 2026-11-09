@@ -418,6 +418,12 @@ class PassDetector:
             possessor_pos,
         )
         contested = bool(pending.get("contested"))
+        from_team = pending.get("from_team")
+        if from_team not in {"Team 0", "Team 1"}:
+            # A possessor whose shirt never voted is not the origin of a pass
+            # or a dispute. The next player can still take the ball.
+            self.discarded_unstable_possession += 1
+            return
 
         if contested:
             self.disputes += 1
@@ -434,7 +440,6 @@ class PassDetector:
             )
             return
 
-        from_team = pending.get("from_team")
         if from_team in {"Team 0", "Team 1"} and possessor_team in {"Team 0", "Team 1"} and from_team != possessor_team:
             confidence = _turnover_confidence(trajectory)
             self.turnovers += 1

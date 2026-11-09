@@ -18,6 +18,7 @@ from roboflow_team import (  # noqa: E402
     crops_form_two_teams,
     jersey_blueness,
     jersey_color_profile,
+    measure_torso,
     reject_training_crop,
 )
 
@@ -186,6 +187,19 @@ def test_shadowed_white_stays_light_and_sunlit_dark_stays_dark():
     assert_equal(int(classifier.predict([sunlit])[0]), 0, "lit dark shirt")
 
 
+def test_a_small_clear_shirt_votes_and_a_small_gray_shirt_does_not():
+    green = solid_bgr(46, saturation=110, value=215, width=14, height=26)
+    gray = solid_bgr(20, saturation=20, value=140, width=14, height=26)
+    red = solid_bgr(8, saturation=140, value=160, width=40, height=80)
+    neon = solid_bgr(46, saturation=100, value=220, width=40, height=80)
+    classifier = TeamClassifier()
+    classifier.fit([red, red, red, red, neon, neon, neon, neon])
+    assert_equal(int(classifier.predict([green])[0]), 1, "a small bright green shirt is team 1")
+    assert_equal(int(classifier.predict([gray])[0]), -1, "a small dull crop still abstains")
+    assert_equal(measure_torso(green)["abstain"], False, "the green measurement is usable")
+    assert_equal(measure_torso(gray)["reason"], "small", "dull color does not open the small gate")
+
+
 def test_weak_crops_do_not_vote():
     classifier = fit_light_and_dark()
     tiny = solid_bgr(0, saturation=10, value=210, width=8, height=20)
@@ -289,6 +303,7 @@ if __name__ == "__main__":
     test_light_shirt_and_dark_shirt_get_stable_teams()
     test_gradual_broadcast_shirts_still_split()
     test_shadowed_white_stays_light_and_sunlit_dark_stays_dark()
+    test_a_small_clear_shirt_votes_and_a_small_gray_shirt_does_not()
     test_weak_crops_do_not_vote()
     test_red_and_neon_green_shirts_split()
     test_one_shirt_color_does_not_count_as_two_teams()

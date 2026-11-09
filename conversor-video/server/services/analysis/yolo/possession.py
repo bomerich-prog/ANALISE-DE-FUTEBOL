@@ -194,6 +194,9 @@ class PossessionEngine:
         self.passing_ball_refusals = 0
         self.frame_index = 0
         self.ball_history = []
+        # Last observed ball was inside the hold radius. A predicted point must
+        # not create that fact, and it must not erase it during a short hole.
+        self.observed_hold = False
 
     def snapshot(self):
         team = TEAM_NAME_BY_ID.get(self.possessor_team_id) if self.possessor_id is not None else None
@@ -251,7 +254,19 @@ class PossessionEngine:
             self.passing_ball_refusals += 1
 
         if self.possessor_id is not None:
-            if possessor_entry and possessor_entry["distance"] <= hold_radius:
+            measured_inside = (
+                allow_new
+                and possessor_entry is not None
+                and possessor_entry["distance"] <= hold_radius
+            )
+            measured_outside = (
+                allow_new
+                and possessor_entry is not None
+                and possessor_entry["distance"] > hold_radius
+            )
+            if measured_inside:
+                # The observed ball is still with him. Only this renews the hold.
+                self.observed_hold = True
                 self.no_evidence_count = 0
                 contested = (
                     nearest is not None
@@ -262,7 +277,6 @@ class PossessionEngine:
                     nearest is None
                     or nearest["track_id"] == self.possessor_id
                     or contested
-                    or not allow_new
                     or nearest["distance"] > control_radius
                 ):
                     self._clear_switch()
@@ -271,11 +285,45 @@ class PossessionEngine:
                 self._advance_switch(nearest["track_id"])
                 return self._finish_update(previous_id)
 
-            if allow_new and nearest is not None and nearest["distance"] <= control_radius:
-                self.no_evidence_count = 0
-                self._advance_switch(nearest["track_id"])
+            if measured_outside:
+                # He is on screen and far. A neighbour does not put him back,
+                # and the loss keeps running until he returns or is replaced.
+                self.observed_hold = False
+                if self._offer_switch(nearest, control_radius, previous_id):
+                    return self._finish_update(previous_id)
+                self._lose_if_unsupported(clear_switch=False)
                 return self._finish_update(previous_id)
 
+            if not allow_new and self.observed_hold and possessor_entry is not None and possessor_entry["distance"] <= hold_radius:
+                # The prediction is still at his feet. It does not open anything
+                # and it does not cancel a switch.
+                self.no_evidence_count = 0
+                self._refresh_possessor_team()
+                return self._finish_update(previous_id)
+
+            if not allow_new:
+                # The prediction is not at his feet, or he was already outside.
+                # Do not walk the ghost ball back into his hold radius.
+                self.observed_hold = False
+                self._lose_if_unsupported(clear_switch=False)
+                return self._finish_update(previous_id)
+
+            # His box is missing. This is not a measurement that he is far:
+            # a player on the ball may take over, and an empty frame still loses.
+            if self._offer_switch(nearest, control_radius, previous_id):
+                self.no_evidence_count = 0
+                return self._finish_update(previous_id)
+            if (
+                nearest is not None
+                and nearest["track_id"] != self.possessor_id
+                and nearest["distance"] <= control_radius
+            ):
+                self.no_evidence_count = 0
+                self._refresh_possessor_team()
+                return self._finish_update(previous_id)
+            # Nobody is on the ball and his box is gone. This ends the hold,
+            # so a following predicted point cannot freeze him in place.
+            self.observed_hold = False
             self._lose_if_unsupported()
             return self._finish_update(previous_id)
 
@@ -371,20 +419,43 @@ class PossessionEngine:
             self._reset_pending()
             self.no_evidence_count = 0
 
-    def _lose_if_unsupported(self):
+    def _offer_switch(self, nearest, control_radius, previous_id) -> bool:
+        """Let the player on the ball take over. A far holder is not renewed."""
+        if (
+            nearest is None
+            or nearest["track_id"] == self.possessor_id
+            or nearest["distance"] > control_radius
+        ):
+            return False
+        self._advance_switch(nearest["track_id"])
+        if self.possessor_id == previous_id:
+            return False
+        self.observed_hold = True
+        self.no_evidence_count = 0
+        return True
+
+    def _lose_if_unsupported(self, clear_switch=True):
         self.no_evidence_count += 1
         self._reset_pending()
-        self._clear_switch()
+        if clear_switch:
+            self._clear_switch()
         if self.possessor_id is not None and self.no_evidence_count >= self.lose_frames:
-            self.possessor_id = None
-            self.possessor_team_id = None
-            self.losses += 1
-            self.no_evidence_count = 0
+            self._drop_possessor()
+
+    def _drop_possessor(self):
+        self.possessor_id = None
+        self.possessor_team_id = None
+        self.observed_hold = False
+        self.losses += 1
+        self.no_evidence_count = 0
+        self._clear_switch()
+        self._reset_pending()
 
     def _set_possessor(self, track_id):
         self.possessor_id = track_id
         self.possessor_team_id = self.last_team_by_track.get(track_id)
         self.no_evidence_count = 0
+        self.observed_hold = True
 
     def _refresh_possessor_team(self):
         if self.possessor_id is None:
