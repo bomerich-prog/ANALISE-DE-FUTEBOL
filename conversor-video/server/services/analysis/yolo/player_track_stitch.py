@@ -484,5 +484,5 @@ class PlayerTrackStitch:
             state["hue"] = observation["hue"]
         if observation["team"] is not None:
             state["team_id"] = int(observation["team"])
-        if observation.get("class_id") is not None:
+        if observation.get("class_id") is not None and not state.get("class_locked"):
             state["class_id"] = int(observation["class_id"])

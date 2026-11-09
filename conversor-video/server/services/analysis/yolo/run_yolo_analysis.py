@@ -26,7 +26,15 @@ from event_replay import record_event_frame, write_event_record
 from player_identity_record import record_player, write_player_record
 from pass_detector import PassDetector
 from player_stats import PlayerStatsAccumulator
-from person_class import PersonClassLock, TrackAppearanceGate, reject_non_person_detections
+from person_class import (
+    NEON_GREEN_MIN,
+    YELLOW_TORSO_MIN,
+    PersonClassLock,
+    TrackAppearanceGate,
+    appearance_profile,
+    reject_non_person_detections,
+    select_referee_publications,
+)
 from player_track_stitch import PlayerTrackStitch, torso_hue
 from possession import PossessionEngine, build_ball_state, build_possession_players
 from possession_stats import PossessionTeamAccumulator
@@ -3227,6 +3235,13 @@ def analyze(args):
     player_referee_stabilized_swap_events = 0
     person_class_lock = PersonClassLock()
     appearance_gate = TrackAppearanceGate()
+    referee_selection_stats = {
+        "limit": 3,
+        "published": 0,
+        "held": 0,
+        "restored": 0,
+        "max_published_in_frame": 0,
+    }
     rejected_non_person = 0
     rejected_non_person_reasons = {}
     team_classification_frame_examples = []
@@ -3599,6 +3614,16 @@ def analyze(args):
             box = tracked_human_detections.xyxy[detection_index].tolist()
             track_id = int(tracker_ids[detection_index])
             class_id = raw_class_id
+            role_profile = appearance_profile(frame, box)
+            neon_shirt = float(role_profile.get("neon_green", 0.0)) >= NEON_GREEN_MIN
+            official_dark = float(role_profile.get("official_dark", 0.0)) >= 1.0
+            official_yellow = float(role_profile.get("torso_yellow", 0.0)) >= YELLOW_TORSO_MIN
+            person_crop = sv.crop_image(frame, np.asarray(box, dtype=np.float32))
+            team_match = False
+            if person_crop is not None and getattr(person_crop, "size", 0) > 0:
+                team_match = bool(team_classifier.matches_team(person_crop))
+            referee_blocked = (neon_shirt or team_match) and not official_dark
+            prefer_referee = bool(official_yellow) and not referee_blocked
             if track_id >= 0 and raw_class_id in {PLAYER_CLASS_ID, GOALKEEPER_CLASS_ID, REFEREE_CLASS_ID}:
                 previous_raw_class = last_raw_player_referee_class.get(track_id)
                 if (
@@ -3614,6 +3639,8 @@ def analyze(args):
                     raw_class_id,
                     current_frame_number,
                     verifying=person_class_lock.is_locked(track_id),
+                    referee_blocked=referee_blocked,
+                    prefer_referee=prefer_referee,
                 )
                 player_track_stitch.note_class_lock(
                     track_id,
@@ -3636,7 +3663,15 @@ def analyze(args):
                 raw_class_id=raw_class_id,
                 locked_class_id=class_id,
                 foot_field=foot_field,
+                role_locked=track_id >= 0 and person_class_lock.is_locked(track_id),
+                team_colored=referee_blocked,
             )
+            if official_dark:
+                official_score = 1.0
+            elif prefer_referee:
+                official_score = 0.75
+            else:
+                official_score = 0.0
             detection_payload = {
                 "box": box,
                 "bounding_box": box,
@@ -3644,6 +3679,12 @@ def analyze(args):
                 "track_id": track_id,
                 "field_x": None,
                 "field_y": None,
+                "role_locked": track_id >= 0 and person_class_lock.is_locked(track_id),
+                "role_class": class_id,
+                "official_score": official_score,
+                "referee_frames": (
+                    person_class_lock.referee_continuity(track_id) if track_id >= 0 else 0
+                ),
             }
             pending_humans.append((detection_payload, class_id))
             if player_record_frames is not None:
@@ -4268,7 +4309,22 @@ def analyze(args):
 
         accepted_player_detections = list(player_detections)
         accepted_goalkeeper_detections = list(goalkeeper_detections)
-        accepted_referee_detections = list(referee_detections)
+        published_referees, held_referees, restored_roles = select_referee_publications(
+            list(referee_detections)
+        )
+        accepted_referee_detections = list(published_referees)
+        for restored in restored_roles:
+            if int(restored.get("role_class") or PLAYER_CLASS_ID) == GOALKEEPER_CLASS_ID:
+                accepted_goalkeeper_detections.append(restored)
+            else:
+                accepted_player_detections.append(restored)
+        referee_selection_stats["published"] += len(accepted_referee_detections)
+        referee_selection_stats["held"] += len(held_referees)
+        referee_selection_stats["restored"] += len(restored_roles)
+        referee_selection_stats["max_published_in_frame"] = max(
+            int(referee_selection_stats["max_published_in_frame"]),
+            len(accepted_referee_detections),
+        )
         rejected_player_detections = []
 
         team_classifier_predict_stage_start = time.perf_counter()
@@ -4954,6 +5010,7 @@ def analyze(args):
                 "player_referee_history_window": PLAYER_REFEREE_HISTORY_WINDOW,
                 "person_class_lock": person_class_lock.metrics(),
                 "appearance_gate": appearance_gate.metrics(),
+                "referee_selection": dict(referee_selection_stats),
                 "player_track_stitch": player_track_stitch.metrics(),
                 "rejected_non_person": rejected_non_person,
                 "rejected_non_person_reasons": rejected_non_person_reasons,

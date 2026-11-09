@@ -14,7 +14,9 @@ from person_class import (  # noqa: E402
     PERSON_CLASS_UNLOCK_STREAK,
     PersonClassLock,
     TrackAppearanceGate,
+    appearance_profile,
     non_person_rejection_reason,
+    select_referee_publications,
 )
 
 PLAYER = 2
@@ -81,11 +83,12 @@ def test_unlocks_only_after_consecutive_disagreements():
     lock.assign(6, REFEREE, 20, verifying=True)
     lock.assign(6, PLAYER, 21, verifying=True)
     label = lock.assign(6, REFEREE, 22, verifying=True)
-    assert_equal(label, PLAYER, "agreement resets the streak")
+    assert_equal(label, PLAYER, "a referee vote does not replace a player")
     for offset in range(PERSON_CLASS_UNLOCK_STREAK):
         label = lock.assign(6, REFEREE, 30 + offset, verifying=True)
-    assert_equal(label, REFEREE, "streak unlocks")
-    assert_equal(lock.metrics()["class_changes_after_lock"], 1, "one post-lock change")
+    assert_equal(label, PLAYER, "three referee votes still leave the player")
+    assert_equal(lock.metrics()["class_changes_after_lock"], 0, "player and referee do not trade")
+    assert_equal(lock.is_locked(6), True, "the player role stays locked")
 
 
 def observe(gate, entries):
@@ -98,6 +101,8 @@ def observe(gate, entries):
             raw_class_id=entry.get("raw_class_id", PLAYER),
             locked_class_id=entry.get("locked_class_id", PLAYER),
             foot_field=entry.get("foot_field"),
+            role_locked=entry.get("role_locked", False),
+            team_colored=entry.get("team_colored", False),
         )
     return gate.finish_frame()
 
@@ -728,12 +733,205 @@ def test_yellow_kit_referee_spares_goalkeeper_and_outfield_kits():
     assert_equal(gate.metrics()["routed_yellow_kit"] > 0, True, "the center referee was counted")
 
 
+def test_confirmed_roles_do_not_trade_places():
+    player = PersonClassLock()
+    for frame in range(1, PERSON_CLASS_CONFIRM_STREAK + 1):
+        player.assign(4, PLAYER, frame, verifying=False)
+    for frame in range(10, 20):
+        label = player.assign(4, REFEREE, frame, verifying=True)
+        assert_equal(label, PLAYER, "confirmed player stays a player")
+    assert_equal(player.metrics()["class_changes_after_lock"], 0, "no player unlock")
+    assert_equal(player.metrics()["blocked_role_changes"], 10, "referee votes were blocked")
+
+    referee = PersonClassLock()
+    for frame in range(1, PERSON_CLASS_CONFIRM_STREAK + 1):
+        referee.assign(8, REFEREE, frame, verifying=False)
+    for frame in range(10, 20):
+        label = referee.assign(8, PLAYER, frame, verifying=True)
+        assert_equal(label, REFEREE, "confirmed referee stays a referee")
+    assert_equal(referee.is_locked(8), True, "referee stays locked")
+    assert_equal(referee.metrics()["class_changes_after_lock"], 0, "no referee unlock")
+
+
+def test_one_opposite_frame_does_not_flip_the_pending_role():
+    lock = PersonClassLock()
+    assert_equal(lock.assign(3, PLAYER, 1, verifying=False), PLAYER, "first label")
+    assert_equal(lock.assign(3, REFEREE, 2, verifying=False), PLAYER, "one referee frame holds")
+    assert_equal(lock.is_locked(3), False, "still waiting for a streak")
+    assert_equal(lock.assign(3, PLAYER, 3, verifying=False), PLAYER, "player label returns")
+
+
+def test_team_colored_box_confirms_as_player_even_if_the_detector_says_referee():
+    lock = PersonClassLock()
+    labels = [
+        lock.assign(9, REFEREE, frame, verifying=False, referee_blocked=True)
+        for frame in range(1, PERSON_CLASS_CONFIRM_STREAK + 2)
+    ]
+    assert_equal(labels, [PLAYER] * len(labels), "green shirt is a player")
+    assert_equal(lock.is_locked(9), True, "player role locked")
+    assert_equal(lock.current_class(9), PLAYER, "stored role is player")
+    assert_equal(lock.assign(9, REFEREE, 20, verifying=True, referee_blocked=True), PLAYER, "stays player")
+
+
+def test_unlocked_yellow_official_can_confirm_as_referee():
+    lock = PersonClassLock()
+    labels = [
+        lock.assign(8, PLAYER, frame, verifying=False, prefer_referee=True)
+        for frame in range(1, PERSON_CLASS_CONFIRM_STREAK + 1)
+    ]
+    assert_equal(labels, [REFEREE] * len(labels), "yellow official is a referee")
+    assert_equal(lock.is_locked(8), True, "referee role locked")
+    assert_equal(lock.assign(8, PLAYER, 10, verifying=True), REFEREE, "later player votes do not stick")
+
+
+def test_neon_green_shirt_is_not_routed_to_referee():
+    green = solid_bgr(46, saturation=110, value=220, width=48, height=120)
+    green[int(green.shape[0] * 0.62) :] = (20, 20, 20)
+    box = [0, 0, green.shape[1], green.shape[0]]
+    gate = TrackAppearanceGate()
+    actions = []
+    for _ in range(6):
+        verdict = observe(
+            gate,
+            [
+                {
+                    "track_id": 14,
+                    "box": box,
+                    "frame": green,
+                    "raw_class_id": REFEREE,
+                    "locked_class_id": PLAYER,
+                }
+            ],
+        )[0]
+        actions.append(verdict["action"])
+    assert_equal(actions, ["keep"] * 6, "fluorescent green stays out of the referee list")
+    assert_equal(gate.metrics()["routed_yellow_kit"], 0, "green did not take the yellow route")
+
+    locked = TrackAppearanceGate()
+    yellow = yellow_jersey_image()
+    yellow_box = [0, 0, yellow.shape[1], yellow.shape[0]]
+    locked_actions = []
+    for _ in range(4):
+        verdict = observe(
+            locked,
+            [
+                {
+                    "track_id": 16,
+                    "box": yellow_box,
+                    "frame": yellow,
+                    "raw_class_id": PLAYER,
+                    "locked_class_id": PLAYER,
+                    "role_locked": True,
+                }
+            ],
+        )[0]
+        locked_actions.append(verdict["action"])
+    assert_equal(locked_actions, ["keep"] * 4, "a confirmed player is not promoted")
+
+
+def test_black_kit_is_dark_and_neon_green_is_not():
+    black = solid_bgr(30, saturation=40, value=45, width=40, height=90)
+    green = solid_bgr(46, saturation=110, value=220, width=40, height=90)
+    black_profile = appearance_profile(black, [0, 0, black.shape[1], black.shape[0]])
+    green_profile = appearance_profile(green, [0, 0, green.shape[1], green.shape[0]])
+    assert_equal(black_profile["official_dark"], 1.0, "black kit is an official color")
+    assert_equal(green_profile["official_dark"], 0.0, "green kit is not black")
+    assert green_profile["neon_green"] >= 0.22, green_profile
+    assert green_profile["torso_yellow"] < 0.40, green_profile
+
+
+def test_dark_official_is_not_dropped_as_a_corner_flag():
+    image = solid_bgr(55, saturation=140, value=110, width=36, height=110)
+    image[:36] = solid_bgr(8, saturation=180, value=160, width=36, height=36)
+    image[40:78, 12:24] = (30, 30, 30)
+    box = [0, 0, image.shape[1], image.shape[0]]
+    profile = appearance_profile(image, box)
+    assert_equal(profile["official_dark"], 1.0, "the shirt reads as black")
+    gate = TrackAppearanceGate()
+    actions = []
+    for _ in range(4):
+        verdict = observe(
+            gate,
+            [
+                {
+                    "track_id": 20,
+                    "box": box,
+                    "frame": image,
+                    "raw_class_id": REFEREE,
+                    "locked_class_id": REFEREE,
+                    "role_locked": True,
+                }
+            ],
+        )[0]
+        actions.append(verdict["action"])
+    assert_equal(actions, ["keep"] * 4, "a black referee survives the flag check")
+    assert_equal(gate.metrics()["dropped_corner_flag"], 0, "he was not counted as a flag")
+
+
+def test_referee_post_selection_keeps_three_and_holds_the_rest():
+    candidates = [
+        {
+            "track_id": 1,
+            "role_locked": True,
+            "role_class": REFEREE,
+            "referee_frames": 12,
+            "official_score": 1.0,
+            "confidence": 0.50,
+        },
+        {
+            "track_id": 2,
+            "role_locked": True,
+            "role_class": REFEREE,
+            "referee_frames": 9,
+            "official_score": 1.0,
+            "confidence": 0.60,
+        },
+        {
+            "track_id": 3,
+            "role_locked": False,
+            "role_class": REFEREE,
+            "referee_frames": 2,
+            "official_score": 1.0,
+            "confidence": 0.99,
+        },
+        {
+            "track_id": 4,
+            "role_locked": False,
+            "role_class": REFEREE,
+            "referee_frames": 1,
+            "official_score": 0.2,
+            "confidence": 0.95,
+        },
+        {
+            "track_id": 5,
+            "role_locked": True,
+            "role_class": PLAYER,
+            "referee_frames": 0,
+            "official_score": 0.0,
+            "confidence": 0.99,
+        },
+    ]
+    published, held, restored = select_referee_publications(candidates)
+    assert_equal([item["track_id"] for item in published], [1, 2, 3], "three strongest referees")
+    assert_equal([item["track_id"] for item in held], [4], "fourth candidate is held")
+    assert_equal(held[0]["role_class"], REFEREE, "held candidate is not rewritten as a player")
+    assert_equal([item["track_id"] for item in restored], [5], "confirmed player leaves the referee list")
+
+
 if __name__ == "__main__":
     test_rejects_pole_flag_and_wide_box()
     test_player_does_not_become_referee_on_flicker()
     test_referee_does_not_become_player_on_flicker()
     test_goalkeeper_stays_goalkeeper()
     test_unlocks_only_after_consecutive_disagreements()
+    test_confirmed_roles_do_not_trade_places()
+    test_one_opposite_frame_does_not_flip_the_pending_role()
+    test_team_colored_box_confirms_as_player_even_if_the_detector_says_referee()
+    test_unlocked_yellow_official_can_confirm_as_referee()
+    test_neon_green_shirt_is_not_routed_to_referee()
+    test_black_kit_is_dark_and_neon_green_is_not()
+    test_dark_official_is_not_dropped_as_a_corner_flag()
+    test_referee_post_selection_keeps_three_and_holds_the_rest()
     test_wide_corner_flag_is_dropped_after_two_frames_and_jersey_stays()
     test_flag_returns_only_after_the_color_is_gone()
     test_untracked_flag_drops_immediately_and_jersey_does_not()

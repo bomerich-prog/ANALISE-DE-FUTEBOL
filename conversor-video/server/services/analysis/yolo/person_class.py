@@ -1,13 +1,14 @@
 """Lock Player, Referee and Goalkeeper labels per track.
 
 Thin posts, corner flags and incompatible boxes are rejected before a track
-exists. A confirmed class stays until several consecutive frames disagree.
+exists. A confirmed player stays a player, and a confirmed referee stays a
+referee. One opposite frame does not flip the label before that confirmation.
 
 Flags and sideline equipment whose box is wide enough to pass that first
 cut are removed after ByteTrack, once color, motion and pitch position agree.
-A neon yellow torso that holds for a few frames is the center referee,
-even when the detector calls that track a player. A goalkeeper stays a
-goalkeeper. The track id stays alive; only the emitted class changes.
+A neon yellow torso can mark an unconfirmed official. A team-colored shirt,
+including fluorescent green, cannot. At most three referee boxes are published
+after that choice. A goalkeeper stays a goalkeeper. The track id stays alive.
 """
 
 from __future__ import annotations
@@ -83,7 +84,7 @@ def reject_non_person_detections(detections: sv.Detections, frame):
 
 
 class PersonClassLock:
-    """Confirm a class, then keep it until consecutive frames disagree."""
+    """Confirm a role, then keep player and referee from trading places."""
 
     def __init__(
         self,
@@ -98,6 +99,7 @@ class PersonClassLock:
         self.refresh_agreements = 0
         self.refresh_contradictions = 0
         self.unlocks = 0
+        self.blocked_role_changes = 0
         self.class_changes_after_lock = []
 
     def is_locked(self, track_id: int) -> bool:
@@ -110,48 +112,91 @@ class PersonClassLock:
             return None
         return int(state["class_id"])
 
-    def assign(self, track_id: int, raw_class_id: int, frame_number: int, verifying: bool) -> int:
+    def referee_continuity(self, track_id: int) -> int:
+        state = self.tracks.get(int(track_id))
+        if state is None:
+            return 0
+        return int(state.get("referee_frames", 0))
+
+    def assign(
+        self,
+        track_id: int,
+        raw_class_id: int,
+        frame_number: int,
+        verifying: bool,
+        referee_blocked: bool = False,
+        prefer_referee: bool = False,
+    ) -> int:
         track_id = int(track_id)
         raw_class_id = int(raw_class_id)
         frame_number = int(frame_number)
         state = self.tracks.get(track_id)
+        effective = _effective_role(
+            raw_class_id,
+            state,
+            referee_blocked=referee_blocked,
+            prefer_referee=prefer_referee,
+        )
         if state is None:
             state = {
-                "class_id": raw_class_id,
+                "class_id": effective,
                 "locked": self.confirm_streak <= 1,
                 "confirm_streak": 1,
+                "challenger_class": None,
+                "challenger_streak": 0,
                 "contradiction_streak": 0,
+                "referee_frames": 1 if effective == GATE_REFEREE_CLASS_ID else 0,
                 "last_frame": frame_number,
             }
             self.tracks[track_id] = state
             return int(state["class_id"])
 
         state["last_frame"] = frame_number
+        if state["locked"] and _referee_boundary(state["class_id"], effective):
+            self.refresh_checks += 1
+            self.refresh_contradictions += 1
+            self.blocked_role_changes += 1
+            return self._finish(state)
+
         if not state["locked"]:
-            if raw_class_id != int(state["class_id"]):
-                self.prelock_class_switches += 1
-                state["class_id"] = raw_class_id
-                state["confirm_streak"] = 1
-            else:
+            current = int(state["class_id"])
+            if effective == current:
                 state["confirm_streak"] += 1
-            if state["confirm_streak"] >= self.confirm_streak:
+                state["challenger_class"] = None
+                state["challenger_streak"] = 0
+            else:
+                challenger = state.get("challenger_class")
+                if challenger is None or int(challenger) != effective:
+                    state["challenger_class"] = effective
+                    state["challenger_streak"] = 1
+                else:
+                    state["challenger_streak"] = int(state.get("challenger_streak", 0)) + 1
+                if int(state["challenger_streak"]) >= self.confirm_streak:
+                    self.prelock_class_switches += 1
+                    state["class_id"] = effective
+                    state["confirm_streak"] = int(state["challenger_streak"])
+                    state["challenger_class"] = None
+                    state["challenger_streak"] = 0
+                else:
+                    state["confirm_streak"] = 0
+            if int(state["confirm_streak"]) >= self.confirm_streak:
                 state["locked"] = True
                 state["contradiction_streak"] = 0
-            return int(state["class_id"])
+            return self._finish(state)
 
         if not verifying:
-            return int(state["class_id"])
+            return self._finish(state)
 
         self.refresh_checks += 1
-        if raw_class_id == int(state["class_id"]):
+        if effective == int(state["class_id"]):
             self.refresh_agreements += 1
             state["contradiction_streak"] = 0
-            return int(state["class_id"])
+            return self._finish(state)
 
         self.refresh_contradictions += 1
         state["contradiction_streak"] += 1
         if state["contradiction_streak"] < self.unlock_streak:
-            return int(state["class_id"])
+            return self._finish(state)
 
         previous_class = int(state["class_id"])
         self.unlocks += 1
@@ -159,14 +204,21 @@ class PersonClassLock:
             {
                 "track_id": track_id,
                 "from_class": previous_class,
-                "to_class": raw_class_id,
+                "to_class": effective,
                 "frame": frame_number,
             }
         )
         state["locked"] = False
-        state["class_id"] = raw_class_id
+        state["class_id"] = effective
         state["confirm_streak"] = 1
+        state["challenger_class"] = None
+        state["challenger_streak"] = 0
         state["contradiction_streak"] = 0
+        return self._finish(state)
+
+    def _finish(self, state: dict) -> int:
+        if int(state["class_id"]) == GATE_REFEREE_CLASS_ID:
+            state["referee_frames"] = int(state.get("referee_frames", 0)) + 1
         return int(state["class_id"])
 
     def metrics(self) -> Dict[str, object]:
@@ -186,6 +238,7 @@ class PersonClassLock:
             "refresh_agreements": self.refresh_agreements,
             "refresh_contradictions": self.refresh_contradictions,
             "unlocks": self.unlocks,
+            "blocked_role_changes": self.blocked_role_changes,
             "final_class_by_track": final_class_by_track,
         }
 
@@ -223,12 +276,54 @@ REFEREE_VOTE_MIN = 3
 REFEREE_CLEAR_FRAMES = 8
 
 YELLOW_HUE_MIN = 16
-YELLOW_HUE_MAX = 45
+YELLOW_HUE_MAX = 32
 YELLOW_SATURATION_MIN = 120
 YELLOW_VALUE_MIN = 120
 YELLOW_TORSO_MIN = 0.40
 YELLOW_CONFIRM_FRAMES = 3
 YELLOW_CLEAR_FRAMES = 6
+NEON_GREEN_HUE_MIN = 35
+NEON_GREEN_HUE_MAX = 75
+NEON_GREEN_SATURATION_MIN = 70
+NEON_GREEN_VALUE_MIN = 160
+NEON_GREEN_MIN = 0.22
+OFFICIAL_DARK_VALUE_MAX = 70
+OFFICIAL_DARK_SATURATION_MAX = 80
+MAX_REFEREES_PER_FRAME = 3
+
+
+def _protected_official(item: dict) -> bool:
+    """A black official is not a corner flag, even when the boards behind him are red."""
+    profile = item.get("profile") or {}
+    raw_referee = int(item.get("raw_class_id", -1)) == GATE_REFEREE_CLASS_ID
+    locked_referee = int(item.get("locked_class_id", -1)) == GATE_REFEREE_CLASS_ID
+    dark_kit = float(profile.get("official_dark", 0.0)) >= 1.0
+    if locked_referee:
+        return True
+    return raw_referee and dark_kit
+
+
+def _referee_boundary(current, raw) -> bool:
+    """Player and referee do not trade places once either role is confirmed."""
+    current = int(current)
+    raw = int(raw)
+    if current == raw:
+        return False
+    return current == GATE_REFEREE_CLASS_ID or raw == GATE_REFEREE_CLASS_ID
+
+
+def _effective_role(raw_class_id, state, referee_blocked: bool, prefer_referee: bool) -> int:
+    """A team shirt cannot open a referee role. Yellow can, until the role locks."""
+    effective = int(raw_class_id)
+    locked = state is not None and bool(state.get("locked"))
+    locked_class = None if state is None else int(state.get("class_id"))
+    if locked and locked_class == GATE_REFEREE_CLASS_ID:
+        return effective
+    if referee_blocked and effective == GATE_REFEREE_CLASS_ID:
+        return GATE_PLAYER_CLASS_ID
+    if prefer_referee and not locked and effective != GATE_GOALKEEPER_CLASS_ID and not referee_blocked:
+        return GATE_REFEREE_CLASS_ID
+    return effective
 
 PITCH_LENGTH_CM = 12000.0
 PITCH_WIDTH_CM = 7000.0
@@ -300,6 +395,8 @@ def appearance_profile(frame, box) -> Dict[str, float]:
         "low_chroma": 0.0,
         "bottom_pole": 0.0,
         "torso_yellow": 0.0,
+        "neon_green": 0.0,
+        "official_dark": 0.0,
     }
     crop = _clip_crop(frame, box)
     if crop is None:
@@ -317,6 +414,27 @@ def appearance_profile(frame, box) -> Dict[str, float]:
     if torso.size == 0:
         torso = hsv
     dark_neutral = (torso[:, :, 1] < 42) & (torso[:, :, 2] < 85)
+    hue = torso[:, :, 0]
+    saturation = torso[:, :, 1]
+    value = torso[:, :, 2]
+    neon = (
+        (hue >= NEON_GREEN_HUE_MIN)
+        & (hue <= NEON_GREEN_HUE_MAX)
+        & (saturation >= NEON_GREEN_SATURATION_MIN)
+        & (value >= NEON_GREEN_VALUE_MIN)
+    )
+    grass = (hue >= 35) & (hue <= 85) & (saturation >= 40) & (value >= 30) & ~neon
+    usable = ~grass
+    official_dark = 0.0
+    if int(usable.sum()) >= 12 and float(neon.mean()) < NEON_GREEN_MIN:
+        median_value = float(np.median(value[usable]))
+        median_saturation = float(np.median(saturation[usable]))
+        # A black kit is dark even when the hue noise raises saturation.
+        # A red or green shirt stays above this value.
+        if median_value <= OFFICIAL_DARK_VALUE_MAX or (
+            median_value <= 105 and median_saturation <= OFFICIAL_DARK_SATURATION_MAX
+        ):
+            official_dark = 1.0
     return {
         "aspect": float(crop_width) / float(crop_height),
         "top_flag": float(_flag_hue_mask(top).mean()),
@@ -324,6 +442,8 @@ def appearance_profile(frame, box) -> Dict[str, float]:
         "low_chroma": float(dark_neutral.mean()),
         "bottom_pole": 1.0 if _bottom_is_pole(hsv) else 0.0,
         "torso_yellow": _torso_yellow_fraction(torso),
+        "neon_green": float(neon.mean()) if neon.size else 0.0,
+        "official_dark": official_dark,
     }
 
 
@@ -400,6 +520,8 @@ class TrackAppearanceGate:
         raw_class_id: int,
         locked_class_id: int,
         foot_field=None,
+        role_locked: bool = False,
+        team_colored: bool = False,
     ) -> None:
         box_values = [float(value) for value in list(box)[:4]]
         foot = ((box_values[0] + box_values[2]) * 0.5, box_values[3])
@@ -411,6 +533,8 @@ class TrackAppearanceGate:
                 "track_id": int(track_id),
                 "raw_class_id": int(raw_class_id),
                 "locked_class_id": int(locked_class_id),
+                "role_locked": bool(role_locked),
+                "team_colored": bool(team_colored),
                 "foot": foot,
                 "foot_field": field_point,
                 "profile": appearance_profile(frame, box_values),
@@ -425,6 +549,12 @@ class TrackAppearanceGate:
             if item["track_id"] < 0:
                 continue
             state = self._state(item["track_id"])
+            if _protected_official(item):
+                state["flag_latched"] = False
+                state["flag_streak"] = 0
+                state["flag_clear"] = 0
+                state["static_latched"] = False
+                continue
             self._update_flag(state, _is_flag_shape(item["profile"]))
             if state["flag_latched"]:
                 anchors.append(item)
@@ -564,10 +694,11 @@ class TrackAppearanceGate:
             return {"action": "keep", "reason": None}
 
         state = self._state(item["track_id"])
-        if state["flag_latched"]:
+        protected = _protected_official(item)
+        if state["flag_latched"] and not protected:
             self.dropped_corner_flag += 1
             return {"action": "drop", "reason": "corner_flag_track"}
-        if self._update_static(state, item):
+        if not protected and self._update_static(state, item):
             self.dropped_static_sideline += 1
             return {"action": "drop", "reason": "static_sideline"}
         goalkeeper = (
@@ -581,6 +712,19 @@ class TrackAppearanceGate:
             state["yellow_latched"] = False
             return {"action": "keep", "reason": None}
         if int(item["locked_class_id"]) == GATE_REFEREE_CLASS_ID:
+            return {"action": "keep", "reason": None}
+        profile = item["profile"]
+        neon_shirt = float(profile.get("neon_green", 0.0)) >= NEON_GREEN_MIN
+        team_colored = bool(item.get("team_colored")) or neon_shirt
+        locked_player = bool(item.get("role_locked")) and int(item["locked_class_id"]) == GATE_PLAYER_CLASS_ID
+        if team_colored or locked_player:
+            state["yellow_streak"] = 0
+            state["yellow_clear"] = 0
+            state["yellow_latched"] = False
+            state["referee_latched"] = False
+            state["referee_clear"] = 0
+            state["referee_votes"].clear()
+            state["linesman_streak"] = 0
             return {"action": "keep", "reason": None}
         if self._update_referee(state, item["raw_class_id"], item["profile"]):
             self.routed_referee_vote += 1
@@ -596,3 +740,38 @@ class TrackAppearanceGate:
             self.routed_yellow_kit += 1
             return {"action": "referee", "reason": "yellow_kit"}
         return {"action": "keep", "reason": None}
+
+
+def _referee_rank(detection: dict) -> tuple:
+    locked = bool(detection.get("role_locked"))
+    role = detection.get("role_class")
+    confirmed = 1 if locked and int(role or -1) == GATE_REFEREE_CLASS_ID else 0
+    return (
+        confirmed,
+        int(detection.get("referee_frames") or 0),
+        float(detection.get("official_score") or 0.0),
+        float(detection.get("confidence") or 0.0),
+    )
+
+
+def select_referee_publications(candidates: List[dict], limit: int = MAX_REFEREES_PER_FRAME):
+    """Keep the three strongest referee candidates.
+
+    A confirmed player who leaked into the list goes back to players.
+    Everyone else who misses the cut is held: the role is not rewritten.
+    """
+    limit = max(0, int(limit))
+    restored = []
+    eligible = []
+    for detection in candidates or []:
+        locked = bool(detection.get("role_locked"))
+        role = detection.get("role_class")
+        if locked and int(role or -1) == GATE_PLAYER_CLASS_ID:
+            restored.append(detection)
+            continue
+        if locked and int(role or -1) == GATE_GOALKEEPER_CLASS_ID:
+            restored.append(detection)
+            continue
+        eligible.append(detection)
+    ranked = sorted(eligible, key=_referee_rank, reverse=True)
+    return ranked[:limit], ranked[limit:], restored

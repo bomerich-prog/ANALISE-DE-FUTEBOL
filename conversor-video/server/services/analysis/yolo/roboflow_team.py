@@ -472,6 +472,36 @@ class TeamClassifier:
         self.vote_count += 1
         return int(nearest)
 
+    def matches_team(self, crop: np.ndarray) -> bool:
+        """True when the torso is close to one of the two fitted shirts.
+
+        This does not record a vote. A dark official kit stays unmatched.
+        """
+        measured = measure_torso(crop)
+        if measured["abstain"]:
+            return False
+        if self.mode == "hue":
+            if measured["hue"] is None:
+                return False
+            distances = {
+                team_id: _hue_distance(float(measured["hue"]), float(prototype["hue"])) / TORSO_HUE_SCALE
+                for team_id, prototype in self.prototypes.items()
+                if prototype.get("hue") is not None
+            }
+        else:
+            distances = {
+                team_id: _value_distance(measured, prototype)
+                for team_id, prototype in self.prototypes.items()
+            }
+        if len(distances) < 2:
+            return False
+        ranked = sorted(distances, key=lambda team_id: (distances[team_id], team_id))
+        nearest = ranked[0]
+        margin = distances[ranked[1]] - distances[nearest]
+        if distances[nearest] > TORSO_DISTANCE_MAX or margin <= TORSO_DISTANCE_MARGIN:
+            return False
+        return True
+
 
 def _prototype(samples: List[Dict[str, object]]) -> Dict[str, object]:
     values = [float(item["value"]) for item in samples]
