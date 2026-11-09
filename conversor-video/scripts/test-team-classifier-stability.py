@@ -15,6 +15,7 @@ from roboflow_team import (  # noqa: E402
     TeamClassifier,
     TeamTrackLock,
     anchor_cluster_labels,
+    crops_form_two_teams,
     jersey_blueness,
     jersey_color_profile,
     reject_training_crop,
@@ -197,6 +198,38 @@ def test_weak_crops_do_not_vote():
     assert_equal(int(classifier.predict([readable_small])[0]), 1, "small but clear white shirt still votes")
 
 
+def test_red_and_neon_green_shirts_split():
+    red = [solid_bgr(8, saturation=130, value=155) for _ in range(6)]
+    green = [solid_bgr(46, saturation=100, value=215) for _ in range(6)]
+    classifier = TeamClassifier()
+    classifier.fit(red + green)
+    assert_equal(classifier.color_anchor["mode"], "value", "neon green is brighter than red")
+    assert_equal(int(classifier.predict([solid_bgr(8, saturation=130, value=155)])[0]), 0, "red shirt")
+    assert_equal(int(classifier.predict([solid_bgr(46, saturation=100, value=215)])[0]), 1, "neon green shirt")
+    grass = solid_bgr(60, saturation=160, value=140)
+    assert_equal(int(classifier.predict([grass])[0]), -1, "pitch grass still abstains")
+
+
+def test_one_shirt_color_does_not_count_as_two_teams():
+    red = [solid_bgr(8, saturation=140, value=160) for _ in range(15)]
+    green = [solid_bgr(46, saturation=100, value=230, width=20, height=40) for _ in range(8)]
+    assert_equal(crops_form_two_teams(red), False, "fifteen red shirts are one team")
+    assert_equal(crops_form_two_teams(red + green), True, "distant neon shirts complete the pair")
+    classifier = TeamClassifier()
+    classifier.fit(red + green)
+    assert_equal(classifier.color_anchor["mode"], "value", "merged set still splits by brightness")
+
+
+def test_similar_brightness_uses_hue_for_green_and_red():
+    red = [solid_bgr(6, saturation=150, value=200) for _ in range(6)]
+    green = [solid_bgr(48, saturation=140, value=205) for _ in range(6)]
+    classifier = TeamClassifier()
+    classifier.fit(red + green)
+    assert_equal(classifier.color_anchor["mode"], "hue", "close brightness falls through to hue")
+    assert_equal(int(classifier.predict([solid_bgr(4, saturation=150, value=198)])[0]), 1, "red is team 1")
+    assert_equal(int(classifier.predict([solid_bgr(50, saturation=130, value=202)])[0]), 0, "green is team 0")
+
+
 def test_two_saturated_kits_split_by_hue():
     blue = [solid_bgr(112, saturation=180, value=100) for _ in range(6)]
     red = [solid_bgr(4, saturation=180, value=100) for _ in range(6)]
@@ -257,6 +290,9 @@ if __name__ == "__main__":
     test_gradual_broadcast_shirts_still_split()
     test_shadowed_white_stays_light_and_sunlit_dark_stays_dark()
     test_weak_crops_do_not_vote()
+    test_red_and_neon_green_shirts_split()
+    test_one_shirt_color_does_not_count_as_two_teams()
+    test_similar_brightness_uses_hue_for_green_and_red()
     test_two_saturated_kits_split_by_hue()
     test_mixed_torso_abstains()
     test_weak_vote_does_not_create_or_unlock_a_team()

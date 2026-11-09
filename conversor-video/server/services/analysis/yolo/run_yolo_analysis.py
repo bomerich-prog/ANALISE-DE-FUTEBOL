@@ -32,7 +32,7 @@ from possession import PossessionEngine, build_ball_state, build_possession_play
 from possession_stats import PossessionTeamAccumulator
 from roboflow_ball import BallTracker
 from roboflow_soccer_config import SoccerPitchConfiguration
-from roboflow_team import TeamClassifier, TeamTrackLock, reject_training_crop
+from roboflow_team import TeamClassifier, TeamTrackLock, crops_form_two_teams, reject_training_crop
 from pitch_homography import PitchHomographyGate, draw_projected_pitch
 from pitch_map import VisiblePitchMap, draw_visible_penalty
 from roboflow_view import ViewTransformer
@@ -2905,8 +2905,10 @@ def analyze(args):
         "discarded_non_player": {},
         "discarded_low_chroma_official": 0,
         "kept_low_chroma_official": 0,
+        "kept_distant_crops": 0,
     }
     low_chroma_training_crops = []
+    distant_training_crops = []
     training_capture = cv2.VideoCapture(str(input_path))
     if not training_capture.isOpened():
         raise RuntimeError("Não foi possível abrir o vídeo para treinar TeamClassifier.")
@@ -2948,6 +2950,25 @@ def analyze(args):
             if not can_use_crop:
                 if reason == "small":
                     team_training_stats["discarded_small"] += 1
+                    x1, y1, x2, y2 = [float(value) for value in player_box]
+                    crop_width = x2 - x1
+                    crop_height = y2 - y1
+                    on_border = (
+                        x1 <= TEAM_CLASSIFIER_BORDER_MARGIN
+                        or y1 <= TEAM_CLASSIFIER_BORDER_MARGIN
+                        or x2 >= frame_width - TEAM_CLASSIFIER_BORDER_MARGIN
+                        or y2 >= frame_height - TEAM_CLASSIFIER_BORDER_MARGIN
+                    )
+                    if (
+                        crop_height >= 32
+                        and crop_width >= 12
+                        and not on_border
+                        and len(distant_training_crops) < TEAM_CLASSIFIER_TARGET_SAMPLES
+                    ):
+                        distant_crop = sv.crop_image(training_frame, player_box)
+                        if not is_crop_blurry(distant_crop, TEAM_CLASSIFIER_MIN_LAPLACIAN_VARIANCE):
+                            if reject_training_crop(distant_crop, min_height=32, min_width=12) is None:
+                                distant_training_crops.append(distant_crop)
                 elif reason == "border":
                     team_training_stats["discarded_border"] += 1
                 else:
@@ -2983,6 +3004,14 @@ def analyze(args):
         team_training_stats["kept_low_chroma_official"] = len(low_chroma_training_crops)
         team_classifier_crops.extend(low_chroma_training_crops)
         low_chroma_training_crops = []
+    # A wide camera makes the near players one shirt color. The other team is
+    # smaller in the frame, so those crops stay out of the primary set.
+    primary_is_one_color = bool(team_classifier_crops) and not crops_form_two_teams(
+        team_classifier_crops
+    )
+    if (len(team_classifier_crops) < 12 or primary_is_one_color) and distant_training_crops:
+        team_training_stats["kept_distant_crops"] = len(distant_training_crops)
+        team_classifier_crops.extend(distant_training_crops)
     team_training_stats["discarded_low_chroma_official"] = len(low_chroma_training_crops)
 
     if len(team_classifier_crops) == 0:

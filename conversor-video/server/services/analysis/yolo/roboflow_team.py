@@ -29,6 +29,16 @@ TORSO_DISTANCE_MAX = 2.4
 TORSO_HUE_SCALE = 40.0
 
 
+def _neon_shirt(hue, saturation, value):
+    """Bright kit green. Pitch grass is the same hue, but darker."""
+    return (hue >= 35) & (hue <= 75) & (saturation >= 70) & (value >= 175)
+
+
+def _pitch_green(hue, saturation, value, saturation_min=40, value_min=30, hue_max=85):
+    green = (hue >= 35) & (hue <= hue_max) & (saturation >= saturation_min) & (value >= value_min)
+    return green & ~_neon_shirt(hue, saturation, value)
+
+
 def torso_region(crop: np.ndarray) -> np.ndarray:
     """Upper-middle shirt area, excluding most of the head, legs and sidelines."""
     if crop is None or crop.size == 0:
@@ -56,7 +66,7 @@ def jersey_color_profile(crop: np.ndarray) -> Dict[str, float]:
     hue = hsv[:, :, 0].astype(np.int16)
     saturation = hsv[:, :, 1].astype(np.int16)
     value = hsv[:, :, 2].astype(np.int16)
-    grass = (hue >= 35) & (hue <= 85) & (saturation >= 40) & (value >= 30)
+    grass = _pitch_green(hue, saturation, value)
     valid = (saturation >= 35) & (value >= 40) & ~grass
     if int(valid.sum()) < 8:
         valid = value >= 25
@@ -121,7 +131,7 @@ def measure_torso(crop: np.ndarray) -> Dict[str, object]:
     hue = hsv[:, :, 0].astype(np.int16)
     saturation = hsv[:, :, 1].astype(np.int16)
     value = hsv[:, :, 2].astype(np.int16)
-    grass = (hue >= 35) & (hue <= 85) & (saturation >= 40) & (value >= 30)
+    grass = _pitch_green(hue, saturation, value)
     if float(grass.mean()) > TORSO_GRASS_MAX:
         return _weak_torso("grass")
     yellow = (
@@ -190,12 +200,12 @@ def anchor_cluster_labels(crops: List[np.ndarray], raw_labels: Iterable[int]):
     return mapping, report
 
 
-def reject_training_crop(crop: np.ndarray) -> Optional[str]:
+def reject_training_crop(crop: np.ndarray, min_height: int = 40, min_width: int = 18) -> Optional[str]:
     """Drop flags, posts, grass and low-chroma officials before the team fit."""
     if crop is None or getattr(crop, "size", 0) == 0:
         return "empty"
     height, width = crop.shape[:2]
-    if height < 40 or width < 18:
+    if height < int(min_height) or width < int(min_width):
         return "small"
     aspect = width / float(height)
     if aspect < 0.18:
@@ -207,7 +217,7 @@ def reject_training_crop(crop: np.ndarray) -> Optional[str]:
     hue = hsv[:, :, 0]
     saturation = hsv[:, :, 1]
     value = hsv[:, :, 2]
-    grass = (hue >= 35) & (hue <= 90) & (saturation > 35) & (value > 30)
+    grass = _pitch_green(hue, saturation, value, saturation_min=36, value_min=31, hue_max=90)
     if float(grass.mean()) > 0.72:
         return "mostly_grass"
 
@@ -407,35 +417,23 @@ class TeamClassifier:
         self.abstain_count = 0
 
     def fit(self, crops: List[np.ndarray]) -> None:
-        samples = []
-        for crop in crops:
-            measured = measure_torso(crop)
-            if measured["abstain"]:
-                continue
-            samples.append(measured)
-        if len(samples) < TORSO_SIDE_MIN_SAMPLES * 2:
-            raise RuntimeError("TeamClassifier: poucos torsos com cor utilizável.")
-        dark, light = _split_brightness(samples)
-        if len(dark) >= TORSO_SIDE_MIN_SAMPLES and len(light) >= TORSO_SIDE_MIN_SAMPLES:
-            dark_prototype = _prototype(dark)
-            light_prototype = _prototype(light)
-            value_gap = float(light_prototype["value"]) - float(dark_prototype["value"])
-            saturation_gap = float(dark_prototype["saturation"]) - float(light_prototype["saturation"])
-            if value_gap >= 20.0 or saturation_gap >= 25.0:
-                self.mode = "value"
-                self.prototypes = {TEAM_DARK_ID: dark_prototype, TEAM_LIGHT_ID: light_prototype}
-                self.color_anchor = _anchor_report(self.mode, "dark", "light", self.prototypes, dark, light)
-                return
-        blue = [item for item in samples if _hue_is_blue(item.get("hue"))]
-        red = [item for item in samples if _hue_is_red(item.get("hue"))]
-        if len(blue) < TORSO_SIDE_MIN_SAMPLES or len(red) < TORSO_SIDE_MIN_SAMPLES:
+        samples = _usable_torsos(crops)
+        grouped = _two_team_groups(samples)
+        if grouped is None:
+            if len(samples) < TORSO_SIDE_MIN_SAMPLES * 2:
+                raise RuntimeError("TeamClassifier: poucos torsos com cor utilizável.")
             raise RuntimeError("TeamClassifier: os torsos não formam dois times pela cor.")
-        self.mode = "hue"
-        self.prototypes = {
-            TEAM_DARK_ID: _prototype(blue),
-            TEAM_LIGHT_ID: _prototype(red),
-        }
-        self.color_anchor = _anchor_report(self.mode, "blue", "red", self.prototypes, blue, red)
+        mode, team_0_name, team_1_name, prototype_0, prototype_1, group_0, group_1 = grouped
+        self.mode = mode
+        self.prototypes = {TEAM_DARK_ID: prototype_0, TEAM_LIGHT_ID: prototype_1}
+        self.color_anchor = _anchor_report(
+            mode,
+            team_0_name,
+            team_1_name,
+            self.prototypes,
+            group_0,
+            group_1,
+        )
 
     def predict(self, crops: List[np.ndarray]) -> np.ndarray:
         if len(crops) == 0:
@@ -493,6 +491,104 @@ def _value_distance(measured: Dict[str, object], prototype: Dict[str, object]) -
         / TORSO_DISTANCE_SCALE_SATURATION
     )
     return value_gap + saturation_gap
+
+
+def _usable_torsos(crops: List[np.ndarray]) -> List[Dict[str, object]]:
+    samples = []
+    for crop in crops:
+        measured = measure_torso(crop)
+        if measured["abstain"]:
+            continue
+        samples.append(measured)
+    return samples
+
+
+def crops_form_two_teams(crops: List[np.ndarray]) -> bool:
+    """True when the crops already contain two shirt colors."""
+    return _two_team_groups(_usable_torsos(crops)) is not None
+
+
+def _two_team_groups(samples: List[Dict[str, object]]):
+    """Brightness, then blue/red, then any two separated hues. None if one color."""
+    if len(samples) < TORSO_SIDE_MIN_SAMPLES * 2:
+        return None
+    dark, light = _split_brightness(samples)
+    if len(dark) >= TORSO_SIDE_MIN_SAMPLES and len(light) >= TORSO_SIDE_MIN_SAMPLES:
+        dark_prototype = _prototype(dark)
+        light_prototype = _prototype(light)
+        value_gap = float(light_prototype["value"]) - float(dark_prototype["value"])
+        saturation_gap = float(dark_prototype["saturation"]) - float(light_prototype["saturation"])
+        if value_gap >= 20.0 or saturation_gap >= 25.0:
+            return ("value", "dark", "light", dark_prototype, light_prototype, dark, light)
+    blue = [item for item in samples if _hue_is_blue(item.get("hue"))]
+    red = [item for item in samples if _hue_is_red(item.get("hue"))]
+    if len(blue) >= TORSO_SIDE_MIN_SAMPLES and len(red) >= TORSO_SIDE_MIN_SAMPLES:
+        return (
+            "hue",
+            "blue",
+            "red",
+            _prototype(blue),
+            _prototype(red),
+            blue,
+            red,
+        )
+    grouped = _split_distinct_hues(samples)
+    if grouped is None:
+        return None
+    first, second, first_name, second_name = grouped
+    return (
+        "hue",
+        first_name,
+        second_name,
+        _prototype(first),
+        _prototype(second),
+        first,
+        second,
+    )
+
+
+def _split_distinct_hues(samples: List[Dict[str, object]]):
+    """Two shirt colors when brightness and the blue/red pair both fail.
+
+    The group nearer to red is team 1, matching the blue/red fit.
+    """
+    colored = [item for item in samples if item.get("hue") is not None]
+    if len(colored) < TORSO_SIDE_MIN_SAMPLES * 2:
+        return None
+    hues = np.array([float(item["hue"]) for item in colored], dtype=np.float64)
+    angles = np.deg2rad(hues * 2.0)
+    features = np.stack([np.cos(angles), np.sin(angles)], axis=1)
+    spread = np.linalg.norm(features[:, None, :] - features[None, :, :], axis=2)
+    left, right = np.unravel_index(int(np.argmax(spread)), spread.shape)
+    if left == right:
+        return None
+    centers = np.stack([features[left], features[right]])
+    labels = np.zeros(len(colored), dtype=np.int32)
+    for _ in range(12):
+        distances = np.linalg.norm(features[:, None, :] - centers[None, :, :], axis=2)
+        labels = np.argmin(distances, axis=1).astype(np.int32)
+        if len(set(labels.tolist())) < 2:
+            return None
+        for group in (0, 1):
+            chosen = features[labels == group]
+            if len(chosen) == 0:
+                continue
+            centers[group] = chosen.mean(axis=0)
+    groups = [
+        [colored[index] for index, label in enumerate(labels) if int(label) == group]
+        for group in (0, 1)
+    ]
+    if len(groups[0]) < TORSO_SIDE_MIN_SAMPLES or len(groups[1]) < TORSO_SIDE_MIN_SAMPLES:
+        return None
+    means = []
+    for group in groups:
+        group_hues = [float(item["hue"]) for item in group]
+        means.append(_circular_mean_hue(group_hues))
+    if _hue_distance(means[0], means[1]) < 18.0:
+        return None
+    redder = int(np.argmin([_hue_distance(mean, 0.0) for mean in means]))
+    other = 1 - redder
+    return groups[other], groups[redder], "other", "red"
 
 
 def _hue_is_blue(hue) -> bool:
