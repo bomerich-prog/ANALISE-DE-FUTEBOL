@@ -727,6 +727,72 @@ def test_verified_pixel_flight_beyond_two_seconds_is_rejected():
     assert_equal(metrics["rejected_events"][0]["max_timing_seconds"], 2.0, "verified pixel budget")
 
 
+def pixel_player(track_id, team_id, x, y=300.0):
+    return {"track_id": track_id, "team_id": team_id, "x": x, "y": y, "field_x": None, "field_y": None}
+
+
+def pixel_ball(x, y=300.0, source="observed"):
+    return {"source": source, "x": x, "y": y, "field_x": None, "field_y": None}
+
+
+def test_a_one_touch_is_a_pass_without_a_long_possession():
+    detector = PassDetector()
+    holder = pixel_player(11, 0, 0.0)
+    toucher = pixel_player(19, 1, 200.0)
+    passer_by = pixel_player(17, 0, 230.0)
+    receiver = pixel_player(7, 1, 400.0)
+    players = [holder, toucher, passer_by, receiver]
+    frames = []
+    frame = 1
+    for _ in range(6):
+        frames.append((frame, 11, "Team 0", players, pixel_ball(0.0)))
+        frame += 1
+    for _ in range(2):
+        frames.append((frame, 11, "Team 0", players, pixel_ball(200.0)))
+        frame += 1
+    frames.append((frame, 11, "Team 0", players, pixel_ball(200.0, source="predicted")))
+    frame += 1
+    for _ in range(2):
+        frames.append((frame, 11, "Team 0", players, pixel_ball(230.0)))
+        frame += 1
+    for _ in range(4):
+        frames.append((frame, None, None, players, pixel_ball(320.0)))
+        frame += 1
+    for _ in range(5):
+        frames.append((frame, 7, "Team 1", players, pixel_ball(400.0)))
+        frame += 1
+    metrics = run_frames(detector, frames)
+    assert_equal(metrics["total_passes"], 1, "the one-touch is a pass")
+    assert_equal(metrics["short_touch_passes"], 1, "it was opened by the short touch")
+    assert_equal(metrics["events"][0]["from_track_id"], 19, "19 is the origin")
+    assert_equal(metrics["events"][0]["to_track_id"], 7, "7 is the receiver")
+    assert_equal(metrics["events"][0]["team"], "Team 1", "same team")
+    assert_equal(metrics["disputes"], 0, "the passer-by does not make a dispute")
+    assert_equal(metrics["turnovers"], 0, "the passer-by does not make a turnover")
+
+
+def test_a_player_sixty_pixels_away_does_not_open_a_short_touch():
+    detector = PassDetector()
+    holder = pixel_player(11, 0, 0.0)
+    nearby = pixel_player(4, 0, 60.0)
+    receiver = pixel_player(10, 0, 400.0)
+    players = [holder, nearby, receiver]
+    frames = []
+    frame = 1
+    for _ in range(6):
+        frames.append((frame, 11, "Team 0", players, pixel_ball(0.0)))
+        frame += 1
+    for _ in range(4):
+        frames.append((frame, None, None, players, pixel_ball(0.0)))
+        frame += 1
+    for _ in range(5):
+        frames.append((frame, 10, "Team 0", players, pixel_ball(400.0)))
+        frame += 1
+    metrics = run_frames(detector, frames)
+    assert_equal(metrics["short_touch_passes"], 0, "60 px is not a one-touch")
+    assert_equal(metrics["events"][0]["from_track_id"], 11, "the confirmed possessor stays the origin")
+
+
 def test_a_possessor_without_a_team_is_not_a_pass_or_a_dispute():
     detector = PassDetector()
     donor = player(13, None, 0.0, 0.0)
@@ -801,6 +867,8 @@ if __name__ == "__main__":
     test_wall_leg_below_the_score_is_not_created()
     test_one_frame_wall_touch_is_still_two_passes()
     test_a_clear_receiver_is_not_a_dispute()
+    test_a_one_touch_is_a_pass_without_a_long_possession()
+    test_a_player_sixty_pixels_away_does_not_open_a_short_touch()
     test_a_possessor_without_a_team_is_not_a_pass_or_a_dispute()
     test_both_teams_on_the_ball_is_a_dispute()
     test_verified_pixel_flight_can_run_past_one_second()

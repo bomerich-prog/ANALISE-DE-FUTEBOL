@@ -65,6 +65,13 @@ PASS_DIRECTION_MIN_MOTION_PX = 20.0
 PASS_TRAJECTORY_MIN_PROGRESS = 0.5
 PASS_CONTEST_RADIUS_CM = 120.0
 PASS_CONTEST_RADIUS_PX = 45.0
+# A one-touch is closer than a ball rolling past a defender. Two observed
+# frames at this range can start a pass without a confirmed possession.
+TOUCH_RADIUS_CM = 80.0
+TOUCH_RADIUS_PX = 30.0
+TOUCH_MARGIN_CM = 30.0
+TOUCH_MARGIN_PX = 12.0
+TOUCH_MIN_OBSERVED = 2
 TURNOVER_BASE_SCORE = 70
 TURNOVER_TRAJECTORY_BONUS = 10
 TURNOVER_TRAJECTORY_PENALTY = -10
@@ -195,6 +202,14 @@ def _contest_radius(space):
     return PASS_CONTEST_RADIUS_CM if space == "field" else PASS_CONTEST_RADIUS_PX
 
 
+def _touch_radius(space):
+    return TOUCH_RADIUS_CM if space == "field" else TOUCH_RADIUS_PX
+
+
+def _touch_margin(space):
+    return TOUCH_MARGIN_CM if space == "field" else TOUCH_MARGIN_PX
+
+
 def _control_radius(space):
     return CONTROL_RADIUS_CM if space == "field" else CONTROL_RADIUS_PX
 
@@ -263,6 +278,9 @@ class PassDetector:
         self.disputes = 0
         self.conductions = 0
         self.wall_passes = 0
+        self.short_touch_passes = 0
+        self.touch = None
+        self.touch_origin = None
         self.unconfirmed_candidates = 0
         self.events = []
         self.unconfirmed_events = []
@@ -287,6 +305,7 @@ class PassDetector:
             "disputes": self.disputes,
             "conductions": self.conductions,
             "wall_passes": self.wall_passes,
+            "short_touch_passes": self.short_touch_passes,
             "unconfirmed_candidates": self.unconfirmed_candidates,
             "pass_score_threshold": self.score_threshold,
             "events": list(self.events),
@@ -305,6 +324,7 @@ class PassDetector:
         possessor_pos = _point_from_entity(possessor_player)
         observed_ball = _observed_ball_point(ball)
         self._log_frame(frame_number, fps, players, ball)
+        self._observe_touch(frame_number, players, ball, possessor_id)
 
         if self.pending is not None:
             if observed_ball is None:
@@ -395,6 +415,97 @@ class PassDetector:
         }
         self.recent_contest = False
 
+    def _observe_touch(self, frame_number, players, ball, possessor_id):
+        """A tight contact can start a pass. It does not change possession.
+
+        Predicted frames neither open nor erase the contact. A player the ball
+        only passes does not replace a touch that already left someone's foot.
+        """
+        if not ball or ball.get("source") not in (None, "observed"):
+            return
+        ball_point = _observed_ball_point(ball)
+        if ball_point is None:
+            return
+        ranked = []
+        for player in players or []:
+            team = _team_name_from_player(player)
+            if team not in {"Team 0", "Team 1"}:
+                continue
+            point = _point_from_entity(player)
+            distance, space = _distance(point, ball_point)
+            if distance is None or space != ball_point["space"]:
+                continue
+            try:
+                track_id = int(player.get("track_id"))
+            except (TypeError, ValueError):
+                continue
+            ranked.append({"id": track_id, "team": team, "distance": distance, "space": space, "pos": point})
+        ranked.sort(key=lambda item: item["distance"])
+        leader = ranked[0] if ranked else None
+        radius = _touch_radius(leader["space"]) if leader else None
+        margin = _touch_margin(leader["space"]) if leader else None
+        unique = (
+            leader is not None
+            and leader["distance"] <= radius
+            and (len(ranked) == 1 or ranked[1]["distance"] >= leader["distance"] + margin)
+        )
+        if not unique or int(leader["id"]) == int(possessor_id or -1):
+            # The confirmed possessor standing on the ball is possession, not a
+            # one-touch. A passer-by does not replace a touch already released.
+            if self.touch is not None and int(self.touch["frames"]) >= TOUCH_MIN_OBSERVED:
+                self._release_touch(frame_number)
+            else:
+                self.touch = None
+            return
+        touch = self.touch
+        if touch is None or int(touch["id"]) != int(leader["id"]):
+            if touch is not None and int(touch["frames"]) >= TOUCH_MIN_OBSERVED:
+                self._release_touch(frame_number)
+            if self.touch_origin is not None:
+                self.touch = None
+                return
+            self.touch = {
+                "id": leader["id"],
+                "team": leader["team"],
+                "frames": 1,
+                "pos": leader["pos"],
+                "first_frame": int(frame_number),
+                "frame": int(frame_number),
+            }
+            return
+        touch["frames"] = int(touch["frames"]) + 1
+        touch["pos"] = leader["pos"]
+        touch["frame"] = int(frame_number)
+
+    def _release_touch(self, frame_number):
+        touch = self.touch
+        self.touch = None
+        if touch is None or int(touch["frames"]) < TOUCH_MIN_OBSERVED:
+            return
+        if touch.get("team") not in {"Team 0", "Team 1"} or self.touch_origin is not None:
+            return
+        self.touch_origin = {
+            "id": touch["id"],
+            "team": touch["team"],
+            "pos": touch["pos"],
+            "from_frame": int(touch["first_frame"]),
+            "release_frame": int(frame_number),
+        }
+
+    def _claim_short_touch(self, to_id, to_team, from_id):
+        """Use a released one-touch as the pass origin when the receiver is a teammate."""
+        if self.touch is not None and int(self.touch["frames"]) >= TOUCH_MIN_OBSERVED:
+            self._release_touch(int(self.touch["frame"]))
+        origin = self.touch_origin
+        if origin is None:
+            return None
+        self.touch_origin = None
+        if int(origin["id"]) in {int(to_id), int(from_id or -1)}:
+            return None
+        if origin.get("team") != to_team or to_team not in {"Team 0", "Team 1"}:
+            return None
+        return origin
+
     def _resolve(self, frame_number, fps, possessor_id, possessor_team, possessor_pos):
         pending = self.pending
         self.pending = None
@@ -417,6 +528,29 @@ class PassDetector:
             pending.get("from_pos"),
             possessor_pos,
         )
+        origin = self._claim_short_touch(to_id, possessor_team, from_id)
+        if origin is not None:
+            prepared = self._prepare_pass(
+                origin["id"],
+                to_id,
+                origin["team"],
+                possessor_team,
+                origin["pos"],
+                possessor_pos,
+                origin["from_frame"],
+                origin["release_frame"],
+                gained_frame,
+                fps,
+                wall=False,
+                short_touch=True,
+            )
+            prepared["short_touch"] = True
+            if prepared.get("_status") != "timeout":
+                status = self._record_prepared(prepared, 0)
+                if status == "pass":
+                    self.short_touch_passes += 1
+                return
+
         contested = bool(pending.get("contested"))
         from_team = pending.get("from_team")
         if from_team not in {"Team 0", "Team 1"}:
@@ -630,6 +764,7 @@ class PassDetector:
         gained_frame,
         fps,
         wall,
+        short_touch=False,
     ):
         gap_seconds = max(0, int(gained_frame) - int(lost_frame)) / fps
         flight = self._flight_evidence(from_id, to_id, int(from_frame), int(lost_frame), int(gained_frame), fps)
@@ -644,7 +779,11 @@ class PassDetector:
             possessor_pos,
         )
         timing_seconds = gap_seconds
-        if flight["arrival_observed"] and flight["reception_lag_seconds"] <= PASS_MAX_RECEPTION_LAG_SECONDS:
+        if short_touch and flight["arrival_observed"]:
+            # The one-touch is the flight to the receiver's feet. Possession
+            # may confirm later; that wait is not the pass.
+            timing_seconds = flight["flight_seconds"]
+        elif flight["arrival_observed"] and flight["reception_lag_seconds"] <= PASS_MAX_RECEPTION_LAG_SECONDS:
             timing_seconds = min(gap_seconds, flight["flight_seconds"])
         verified_pixel_flight = (
             distance_cm is None
