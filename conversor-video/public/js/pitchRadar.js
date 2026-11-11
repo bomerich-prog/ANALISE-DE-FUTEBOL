@@ -42,6 +42,10 @@ export function inCalibratedThird(
   if (goalEnd !== 'low_x' && goalEnd !== 'high_x') return false;
   if (x === null || y === null) return false;
   if (y < -EDGE_TOLERANCE_CM || y > width + EDGE_TOLERANCE_CM) return false;
+  if (goalEnd === 'centre') {
+    const middle = length / 2;
+    return x >= middle - third - EDGE_TOLERANCE_CM && x <= middle + third + EDGE_TOLERANCE_CM;
+  }
   if (goalEnd === 'low_x') return x >= -EDGE_TOLERANCE_CM && x <= third + EDGE_TOLERANCE_CM;
   return x >= length - third - EDGE_TOLERANCE_CM && x <= length + EDGE_TOLERANCE_CM;
 }
@@ -49,7 +53,9 @@ export function inCalibratedThird(
 export function normalizePitchRadar(source) {
   const empty = emptyPitchRadar();
   if (!source || typeof source !== 'object') return empty;
-  const goalEnd = source.goal_end === 'high_x' || source.goal_end === 'low_x' ? source.goal_end : null;
+  const goalEnd = source.goal_end === 'high_x' || source.goal_end === 'low_x' || source.goal_end === 'centre'
+    ? source.goal_end
+    : null;
   const calibrated = Boolean(source.calibrated) && goalEnd !== null;
   const length = positive(source.field_length_cm, FIELD_LENGTH_CM);
   const width = positive(source.field_width_cm, FIELD_WIDTH_CM);
@@ -138,14 +144,21 @@ export function drawPitchRadar(ctx, width, height, radar) {
   ctx.fillStyle = GRASS_DIM;
   if (map.goal_end === 'low_x') ctx.fillRect(third, 0, width - third, height);
   else if (map.goal_end === 'high_x') ctx.fillRect(0, 0, width - third, height);
-  else ctx.fillRect(0, 0, width, height);
+  else if (map.goal_end === 'centre') {
+    const band = (width * map.visible_third_cm) / map.field_length_cm;
+    const middle = width / 2;
+    ctx.fillRect(0, 0, Math.max(0, middle - band), height);
+    ctx.fillRect(Math.min(width, middle + band), 0, Math.max(0, width - (middle + band)), height);
+  } else ctx.fillRect(0, 0, width, height);
   strokeTemplate(ctx, width, height);
-  if (map.goal_end === 'low_x' || map.goal_end === 'high_x') {
-    const x = map.goal_end === 'high_x' ? width - third : 0;
+  if (map.goal_end === 'low_x' || map.goal_end === 'high_x' || map.goal_end === 'centre') {
+    const band = map.goal_end === 'centre' ? third : third;
+    const x = map.goal_end === 'high_x' ? width - band : map.goal_end === 'centre' ? width / 2 - band : 0;
+    const span = map.goal_end === 'centre' ? band * 2 : band;
     ctx.save();
     ctx.strokeStyle = '#ffdc00';
     ctx.lineWidth = 2;
-    ctx.strokeRect(x + 1, 1, Math.max(0, third - 2), height - 2);
+    ctx.strokeRect(x + 1, 1, Math.max(0, span - 2), height - 2);
     ctx.restore();
   }
   const radius = Math.max(5, width / 70);

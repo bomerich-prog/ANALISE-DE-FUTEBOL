@@ -42,7 +42,13 @@ from roboflow_ball import BallTracker
 from roboflow_soccer_config import SoccerPitchConfiguration
 from roboflow_team import TeamClassifier, TeamTrackLock, crops_form_two_teams, reject_training_crop
 from pitch_homography import PitchHomographyGate, draw_projected_pitch
-from pitch_map import VisiblePitchMap, build_radar_snapshot, compose_pitch_radar, draw_visible_penalty
+from pitch_map import (
+    VisiblePitchMap,
+    build_radar_snapshot,
+    compose_pitch_radar,
+    draw_visible_centre,
+    draw_visible_penalty,
+)
 from roboflow_view import ViewTransformer
 from spatial_metrics import SpatialMetrics
 
@@ -4523,6 +4529,7 @@ def analyze(args):
             (ball_detections, detection_center),
         ):
             assign_map_coordinates(mapped_detections, visible_pitch_map, anchor)
+        radar_anchor = visible_pitch_map.anchor if map_decision.get("accepted") else "penalty"
         radar_positive_x = visible_pitch_map.positive_x if map_decision.get("accepted") else None
         radar_ball = ball_detections[0] if ball_detections else None
         pitch_radar_live = build_radar_snapshot(
@@ -4530,6 +4537,7 @@ def analyze(args):
             accepted_goalkeeper_detections,
             radar_ball,
             radar_positive_x,
+            anchor=radar_anchor,
         )
         spatial_metrics_live = spatial_metrics.observe(
             frame_number=current_frame_number,
@@ -4648,6 +4656,10 @@ def analyze(args):
             _draw_homography_debug(output_frame, homography_decision)
             if debug_frame is not None:
                 _draw_homography_debug(debug_frame, homography_decision)
+        if map_decision.get("accepted") and map_decision.get("anchor") == "centre" and map_decision.get("matrix") is not None:
+            draw_visible_centre(output_frame, map_decision["matrix"])
+            if debug_frame is not None:
+                draw_visible_centre(debug_frame, map_decision["matrix"])
         if map_decision.get("matrix") is not None and map_decision.get("positive_x") is not None:
             draw_visible_penalty(
                 output_frame,
@@ -4726,13 +4738,14 @@ def analyze(args):
             draw_detection(output_frame, detection["box"], "Ball", confidence)
             if debug_frame is not None:
                 draw_detection(debug_frame, detection["box"], "Ball", confidence)
-        if radar_positive_x is not None:
+        if map_decision.get("accepted") and (radar_anchor == "centre" or radar_positive_x is not None):
             compose_pitch_radar(
                 output_frame,
                 accepted_player_detections,
                 radar_ball,
                 radar_positive_x,
                 goalkeepers=accepted_goalkeeper_detections,
+                anchor=radar_anchor,
             )
             if debug_frame is not None:
                 compose_pitch_radar(
@@ -4741,6 +4754,7 @@ def analyze(args):
                     radar_ball,
                     radar_positive_x,
                     goalkeepers=accepted_goalkeeper_detections,
+                    anchor=radar_anchor,
                 )
         record_profile_stage(
             profile_state,

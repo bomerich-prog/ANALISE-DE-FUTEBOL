@@ -20,6 +20,8 @@ import numpy as np
 from pitch_homography import (
     _painted_arc_distance,
     _clean_paint,
+    centre_marks_still_on_paint,
+    fit_broadcast_centre,
     fit_broadcast_penalty,
 )
 from roboflow_soccer_config import SoccerPitchConfiguration
@@ -236,9 +238,16 @@ def inside_measured(x, y, positive_x, toward_goal_cm, toward_arc_cm, pitch=None,
     return -delta <= float(toward_arc_cm) + tolerance
 
 
-def inside_visible(x, y, positive_x, pitch=None, tolerance=EDGE_TOLERANCE_CM):
+def inside_visible(x, y, positive_x, pitch=None, tolerance=EDGE_TOLERANCE_CM, anchor="penalty"):
     if not np.isfinite(x) or not np.isfinite(y):
         return False
+    pitch = pitch or SoccerPitchConfiguration()
+    if anchor == "centre":
+        half = min(VISIBLE_THIRD_CM, float(pitch.length) / 2.0)
+        middle = float(pitch.length) / 2.0
+        return (middle - half - tolerance) <= float(x) <= (middle + half + tolerance) and (
+            -tolerance
+        ) <= float(y) <= (float(pitch.width) + tolerance)
     x0, x1, y0, y1 = visible_bounds(positive_x, pitch)
     return (x0 - tolerance) <= float(x) <= (x1 + tolerance) and (y0 - tolerance) <= float(y) <= (y1 + tolerance)
 
@@ -276,10 +285,10 @@ def radar_inset_box(width, height, margin=RADAR_MARGIN_PX):
     return width - radar_w - margin, height - radar_h - margin, radar_w, radar_h
 
 
-def _radar_person(detection, role, positive_x, pitch):
+def _radar_person(detection, role, positive_x, pitch, anchor="penalty"):
     x = _radar_number(detection.get("map_x"))
     y = _radar_number(detection.get("map_y"))
-    if x is None or y is None or not inside_visible(x, y, positive_x, pitch):
+    if x is None or y is None or not inside_visible(x, y, positive_x, pitch, anchor=anchor):
         return None
     team = detection.get("team_id")
     try:
@@ -296,9 +305,10 @@ def _radar_person(detection, role, positive_x, pitch):
     }
 
 
-def build_radar_snapshot(players, goalkeepers, ball, positive_x, pitch=None):
+def build_radar_snapshot(players, goalkeepers, ball, positive_x, pitch=None, anchor="penalty"):
     """Points the 2D panel may draw. An uncalibrated frame publishes nobody."""
     pitch = pitch or SoccerPitchConfiguration()
+    anchor = "centre" if anchor == "centre" else "penalty"
     empty = {
         "calibrated": False,
         "goal_end": None,
@@ -308,32 +318,50 @@ def build_radar_snapshot(players, goalkeepers, ball, positive_x, pitch=None):
         "players": [],
         "ball": None,
     }
-    if positive_x is None:
+    if anchor != "centre" and positive_x is None:
         return empty
+    side = bool(positive_x) if positive_x is not None else False
     people = []
     for detection in players or []:
-        row = _radar_person(detection, "player", bool(positive_x), pitch)
+        row = _radar_person(detection, "player", side, pitch, anchor)
         if row is not None:
             people.append(row)
     for detection in goalkeepers or []:
-        row = _radar_person(detection, "goalkeeper", bool(positive_x), pitch)
+        row = _radar_person(detection, "goalkeeper", side, pitch, anchor)
         if row is not None:
             people.append(row)
     ball_point = None
     if isinstance(ball, dict) and ball.get("source") not in _BALL_RADAR_SKIP:
         x = _radar_number(ball.get("map_x"))
         y = _radar_number(ball.get("map_y"))
-        if x is not None and y is not None and inside_visible(x, y, bool(positive_x), pitch):
+        if x is not None and y is not None and inside_visible(x, y, side, pitch, anchor=anchor):
             ball_point = {"map_x": round(x, 1), "map_y": round(y, 1)}
     return {
         "calibrated": True,
-        "goal_end": "high_x" if positive_x else "low_x",
+        "goal_end": "centre" if anchor == "centre" else ("high_x" if positive_x else "low_x"),
         "visible_third_cm": VISIBLE_THIRD_CM,
         "field_length_cm": float(pitch.length),
         "field_width_cm": float(pitch.width),
         "players": people,
         "ball": ball_point,
     }
+
+
+def draw_visible_centre(frame, matrix, color=(0, 220, 255)):
+    """Draw the centre circle and the halfway line that fixed this frame."""
+    if frame is None or matrix is None:
+        return
+    try:
+        inverse = np.linalg.inv(np.asarray(matrix, dtype=np.float64)).astype(np.float32)
+    except np.linalg.LinAlgError:
+        return
+    circle = [
+        (6000.0 + 915.0 * np.cos(angle), 3500.0 + 915.0 * np.sin(angle))
+        for angle in np.linspace(0, 2 * np.pi, 48)
+    ]
+    line = [(6000.0, y) for y in np.linspace(400.0, 6600.0, 24)]
+    _polyline(frame, inverse, np.array(circle, dtype=np.float32), color)
+    _polyline(frame, inverse, np.array(line, dtype=np.float32), color)
 
 
 def draw_visible_penalty(
@@ -426,14 +454,15 @@ def _draw_radar_dot(radar, x_cm, y_cm, pitch, color, radius):
     cv2.circle(radar, (px, py), radius, (255, 255, 255), 1, cv2.LINE_AA)
 
 
-def compose_pitch_radar(frame, players, ball, positive_x, goalkeepers=None):
-    """Paint the visible third in the corner. Missing coordinates leave no dot."""
-    if frame is None or positive_x is None:
+def compose_pitch_radar(frame, players, ball, positive_x, goalkeepers=None, anchor="penalty"):
+    """Paint the calibrated band in the corner. Missing coordinates leave no dot."""
+    anchor = "centre" if anchor == "centre" else "penalty"
+    if frame is None or (anchor != "centre" and positive_x is None):
         return None
     box = radar_inset_box(frame.shape[1], frame.shape[0])
     if box is None:
         return None
-    snapshot = build_radar_snapshot(players, goalkeepers, ball, positive_x)
+    snapshot = build_radar_snapshot(players, goalkeepers, ball, positive_x, anchor=anchor)
     if not snapshot["calibrated"]:
         return None
     x0, y0, radar_w, radar_h = box
@@ -441,7 +470,19 @@ def compose_pitch_radar(frame, players, ball, positive_x, goalkeepers=None):
     radar = np.zeros((radar_h, radar_w, 3), dtype=np.uint8)
     radar[:] = (42, 110, 48)
     third_px = max(1, int(round(radar_w * VISIBLE_THIRD_CM / float(pitch.length))))
-    if positive_x:
+    if snapshot["goal_end"] == "centre":
+        middle = float(pitch.length) / 2.0
+        left = int(round(radar_w * (middle - VISIBLE_THIRD_CM) / float(pitch.length)))
+        right = int(round(radar_w * (middle + VISIBLE_THIRD_CM) / float(pitch.length)))
+        left = min(max(left, 0), radar_w - 1)
+        right = min(max(right, left + 1), radar_w)
+        if left:
+            radar[:, :left] = (radar[:, :left].astype(np.float32) * _RADAR_DIM).astype(np.uint8)
+        if right < radar_w:
+            radar[:, right:] = (radar[:, right:].astype(np.float32) * _RADAR_DIM).astype(np.uint8)
+        third_x = left
+        third_px = right - left
+    elif positive_x:
         radar[:, : radar_w - third_px] = (radar[:, : radar_w - third_px].astype(np.float32) * _RADAR_DIM).astype(np.uint8)
         third_x = radar_w - third_px
     else:
@@ -492,6 +533,7 @@ class VisiblePitchMap:
         self.matrix = None
         self.transformer = None
         self.positive_x = None
+        self.anchor = "penalty"
         self.scale = None
         self.hold_left = 0
         self.generation = 0
@@ -508,7 +550,7 @@ class VisiblePitchMap:
         if report is not None and not scale_is_stable(self.scale, report["cm_per_px"]):
             self.reasons["scale_jump"] += 1
             report = None
-        if report is not None and grass_mask is not None:
+        if report is not None and grass_mask is not None and report.get("anchor") != "centre":
             patch = paint_patch(
                 report["matrix"], report["positive_x"], grass_mask, white_line_mask, self.pitch
             )
@@ -518,6 +560,12 @@ class VisiblePitchMap:
             else:
                 report["toward_goal_cm"] = patch["toward_goal_cm"]
                 report["toward_arc_cm"] = patch["toward_arc_cm"]
+        if report is None:
+            centre = fit_broadcast_centre(white_line_mask, self.pitch, frame)
+            if centre is not None and scale_is_stable(self.scale, centre["cm_per_px"]):
+                report = centre
+            elif centre is not None:
+                self.reasons["scale_jump"] += 1
         if report is not None:
             return self._accept(report, grass_mask)
         if self._still_on_paint(white_line_mask, grass_mask):
@@ -532,7 +580,9 @@ class VisiblePitchMap:
 
     def project(self, points):
         """Field centimetres inside the visible third, or None past it."""
-        if points is None or self.transformer is None or self.positive_x is None:
+        if points is None or self.transformer is None:
+            return []
+        if self.anchor != "centre" and self.positive_x is None:
             return []
         array = np.asarray(points, dtype=np.float32)
         if array.size == 0:
@@ -540,10 +590,10 @@ class VisiblePitchMap:
         transformed = self.transformer.transform_points(array.reshape(-1, 2))
         mapped = []
         for (image_x, image_y), (x, y) in zip(array.reshape(-1, 2), transformed):
-            if not inside_visible(float(x), float(y), self.positive_x, self.pitch):
+            if not inside_visible(float(x), float(y), self.positive_x, self.pitch, anchor=self.anchor):
                 mapped.append(None)
                 continue
-            if not inside_measured(
+            if self.anchor != "centre" and not inside_measured(
                 float(x),
                 float(y),
                 self.positive_x,
@@ -561,7 +611,9 @@ class VisiblePitchMap:
 
     def metrics(self):
         goal_end = None
-        if self.positive_x is True:
+        if self.anchor == "centre" and self.matrix is not None:
+            goal_end = "centre"
+        elif self.positive_x is True:
             goal_end = "high_x"
         elif self.positive_x is False:
             goal_end = "low_x"
@@ -589,7 +641,8 @@ class VisiblePitchMap:
             self.generation += 1
         self.matrix = report["matrix"]
         self.transformer = ViewTransformer.from_matrix(self.matrix)
-        self.positive_x = bool(report["positive_x"])
+        self.anchor = "centre" if report.get("anchor") == "centre" else "penalty"
+        self.positive_x = None if self.anchor == "centre" else bool(report["positive_x"])
         self.scale = scale
         self.toward_goal_cm = report.get("toward_goal_cm")
         self.toward_arc_cm = report.get("toward_arc_cm")
@@ -600,7 +653,15 @@ class VisiblePitchMap:
         return self._decision(True, False, "accepted")
 
     def _still_on_paint(self, white_line_mask, grass_mask=None):
-        if self.matrix is None or self.hold_left <= 0 or self.positive_x is None:
+        if self.matrix is None or self.hold_left <= 0:
+            return False
+        if self.anchor == "centre":
+            paint = _clean_paint(white_line_mask)
+            if paint is None or not centre_marks_still_on_paint(self.matrix, paint):
+                return False
+            self.grass = grass_mask
+            return True
+        if self.positive_x is None:
             return False
         if grass_mask is not None:
             patch = paint_patch(self.matrix, self.positive_x, grass_mask, white_line_mask, self.pitch)
@@ -620,6 +681,7 @@ class VisiblePitchMap:
         self.matrix = None
         self.transformer = None
         self.positive_x = None
+        self.anchor = "penalty"
         self.scale = None
         self.toward_goal_cm = None
         self.toward_arc_cm = None
@@ -636,5 +698,14 @@ class VisiblePitchMap:
             "toward_goal_cm": self.toward_goal_cm,
             "toward_arc_cm": self.toward_arc_cm,
             "generation": self.generation if accepted else None,
-            "goal_end": "high_x" if self.positive_x else "low_x" if self.positive_x is False else None,
+            "anchor": self.anchor if accepted else "penalty",
+            "goal_end": (
+                "centre"
+                if accepted and self.anchor == "centre"
+                else "high_x"
+                if self.positive_x
+                else "low_x"
+                if self.positive_x is False
+                else None
+            ),
         }

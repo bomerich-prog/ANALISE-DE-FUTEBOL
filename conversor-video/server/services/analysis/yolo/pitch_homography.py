@@ -351,8 +351,186 @@ def fit_broadcast_penalty(white_line_mask, pitch, frame=None):
     return {
         "matrix": matrix,
         "positive_x": positive_x,
+        "anchor": "penalty",
         "cm_per_px": _SPOT_FROM_FRONT_CM / gap,
         "front_x_cm": front_x,
+    }
+
+
+def _contour_circle(points):
+    """Tight circle on one paint contour. A straight line does not qualify."""
+    if len(points) < 80:
+        return None
+    rng = np.random.default_rng(1)
+    best = None
+    for _ in range(900):
+        sample = points[rng.choice(len(points), 3, replace=False)]
+        if min(
+            np.hypot(*(sample[0] - sample[1])),
+            np.hypot(*(sample[0] - sample[2])),
+            np.hypot(*(sample[1] - sample[2])),
+        ) < 18:
+            continue
+        circle = _circle_through(sample)
+        if circle is None:
+            continue
+        center, radius = circle
+        if not (70.0 <= radius <= 220.0):
+            continue
+        residual = np.abs(np.hypot(points[:, 0] - center[0], points[:, 1] - center[1]) - radius)
+        keep = int(np.count_nonzero(residual < 3.5))
+        if keep < 60:
+            continue
+        kept = points[residual < 3.5]
+        angles = np.arctan2(kept[:, 1] - center[1], kept[:, 0] - center[0])
+        span = float(np.degrees(angles.max() - angles.min()))
+        if span > 180.0:
+            span = 360.0 - span
+        if span < 50.0:
+            continue
+        median = float(np.median(residual[residual < 3.5]))
+        rank = (median, -keep)
+        if best is None or rank < best[0]:
+            best = (rank, center, float(radius))
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
+def _axis_through_center(paint, center):
+    """Unit direction of the straight paint that crosses the circle centre."""
+    edges = cv2.Canny(paint, 40, 120)
+    found = cv2.HoughLinesP(edges, 1, np.pi / 180, 16, minLineLength=30, maxLineGap=16)
+    if found is None:
+        return None
+    points = []
+    for x1, y1, x2, y2 in found.reshape(-1, 4):
+        direction = np.array([float(x2 - x1), float(y2 - y1)], np.float64)
+        length = float(np.linalg.norm(direction))
+        if length < 28:
+            continue
+        direction /= length
+        delta = center - np.array([float(x1), float(y1)], np.float64)
+        offset = abs(float(delta[0] * direction[1] - delta[1] * direction[0]))
+        if offset < 12:
+            points.extend(((float(x1), float(y1)), (float(x2), float(y2))))
+    if len(points) < 2:
+        return None
+    vx, vy, _x0, _y0 = cv2.fitLine(np.array(points, np.float32), cv2.DIST_L2, 0, 0.01, 0.01).reshape(-1)
+    direction = np.array([float(vx), float(vy)], np.float64)
+    norm = float(np.linalg.norm(direction))
+    if norm < 1e-6:
+        return None
+    return direction / norm
+
+
+def _centre_matrix(center, along, perp, radius):
+    centimetres = _ARC_RADIUS_CM / float(radius)
+    return np.array(
+        [
+            [
+                centimetres * perp[0],
+                centimetres * perp[1],
+                6000.0 - centimetres * float(np.dot(perp, center)),
+            ],
+            [
+                centimetres * along[0],
+                centimetres * along[1],
+                3500.0 - centimetres * float(np.dot(along, center)),
+            ],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _paint_distances(matrix, paint, field_points):
+    try:
+        inverse = np.linalg.inv(np.asarray(matrix, dtype=np.float64)).astype(np.float32)
+    except np.linalg.LinAlgError:
+        return []
+    projected = cv2.perspectiveTransform(
+        np.asarray(field_points, dtype=np.float32).reshape(-1, 1, 2), inverse
+    ).reshape(-1, 2)
+    distance = cv2.distanceTransform(cv2.bitwise_not(paint), cv2.DIST_L2, 3)
+    height, width = paint.shape[:2]
+    values = []
+    for x, y in projected:
+        if np.isfinite(x) and np.isfinite(y) and 0 <= x < width and 0 <= y < height:
+            values.append(float(distance[int(y), int(x)]))
+    return values
+
+
+def _visible_mark_sits_on_paint(values):
+    """The painted part of a mark is enough. The hidden half of a circle is not."""
+    if len(values) < 8:
+        return False
+    ordered = np.sort(np.asarray(values, dtype=np.float64))
+    count = max(6, int(round(len(ordered) * 0.33)))
+    close = int(np.count_nonzero(ordered <= 8.0))
+    return close >= 6 and float(np.median(ordered[:count])) <= 6.0
+
+
+def centre_marks_still_on_paint(matrix, paint):
+    """True when the visible centre circle and halfway line still sit on the paint."""
+    if matrix is None or paint is None:
+        return False
+    circle = [
+        (6000.0 + _ARC_RADIUS_CM * np.cos(angle), 3500.0 + _ARC_RADIUS_CM * np.sin(angle))
+        for angle in np.linspace(0, 2 * np.pi, 36)
+    ]
+    line = [(6000.0, y) for y in np.linspace(200.0, 6800.0, 24)]
+    return _visible_mark_sits_on_paint(_paint_distances(matrix, paint, circle)) and _visible_mark_sits_on_paint(
+        _paint_distances(matrix, paint, line)
+    )
+
+
+def fit_broadcast_centre(white_line_mask, pitch, frame=None):
+    """Image-to-field matrix from the centre circle and the halfway line through it.
+
+    A broadcast frame of the middle shows that circle, not a full penalty box.
+    The radius is 9.15 m and the line through the centre is the halfway line.
+    The right-hand side of the picture is the high-x goal. Returns None when the
+    circle or the line leaves the paint.
+    """
+    del frame, pitch
+    paint = _clean_paint(white_line_mask)
+    if paint is None:
+        return None
+    contours, _hierarchy = cv2.findContours(paint, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return None
+    circle = None
+    for contour in sorted(contours, key=len, reverse=True)[:4]:
+        circle = _contour_circle(contour.reshape(-1, 2).astype(np.float64))
+        if circle is not None:
+            break
+    if circle is None:
+        return None
+    center, radius = circle
+    along = _axis_through_center(paint, center)
+    if along is None:
+        return None
+    perp = np.array([-along[1], along[0]], np.float64)
+    matrix = _centre_matrix(center, along, perp, radius)
+    try:
+        inverse = np.linalg.inv(matrix)
+    except np.linalg.LinAlgError:
+        return None
+    right = inverse @ np.array([11000.0, 3500.0, 1.0])
+    left = inverse @ np.array([1000.0, 3500.0, 1.0])
+    if not (np.isfinite(right).all() and np.isfinite(left).all() and right[2] != 0 and left[2] != 0):
+        return None
+    if float(right[0] / right[2]) < float(left[0] / left[2]):
+        matrix = _centre_matrix(center, along, -perp, radius)
+    if not centre_marks_still_on_paint(matrix, paint):
+        return None
+    return {
+        "matrix": matrix,
+        "positive_x": None,
+        "anchor": "centre",
+        "cm_per_px": _ARC_RADIUS_CM / float(radius),
+        "front_x_cm": 6000.0,
     }
 
 
