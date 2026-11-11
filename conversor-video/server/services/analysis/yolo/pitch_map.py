@@ -5,6 +5,9 @@ painted 16.5 m line and the 9.15 m arc, which fixes the scale at the penalty
 spot 5.5 m behind that line. Coordinates are published only inside the 35 m
 third of the goal that calibration is looking at. The other half of the pitch
 stays empty. Possession and passes never read this matrix.
+
+The radar draws that same published point, on the video and in the 2D panel.
+A frame without a matrix draws no dots and does not keep the previous ones.
 """
 
 from __future__ import annotations
@@ -240,6 +243,99 @@ def inside_visible(x, y, positive_x, pitch=None, tolerance=EDGE_TOLERANCE_CM):
     return (x0 - tolerance) <= float(x) <= (x1 + tolerance) and (y0 - tolerance) <= float(y) <= (y1 + tolerance)
 
 
+RADAR_MARGIN_PX = 12
+RADAR_MAX_WIDTH_PX = 320
+_RADAR_DIM = 0.38
+_BALL_RADAR_SKIP = {"predicted", "remembered", "lost"}
+_TEAM_BGR = {0: (232, 122, 47), 1: (68, 68, 220)}
+
+
+def _radar_number(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(number):
+        return None
+    return number
+
+
+def radar_inset_box(width, height, margin=RADAR_MARGIN_PX):
+    """Bottom-right rectangle for the 2D pitch, or None when the frame is too small."""
+    width = int(width)
+    height = int(height)
+    if width < 80 or height < 80:
+        return None
+    radar_w = min(RADAR_MAX_WIDTH_PX, max(160, width // 4))
+    radar_h = int(round(radar_w * 7000 / 12000))
+    if radar_w + margin * 2 > width or radar_h + margin * 2 > height:
+        radar_w = width - margin * 2
+        radar_h = int(round(radar_w * 7000 / 12000))
+    if radar_w < 120 or radar_h < 70 or radar_h + margin > height:
+        return None
+    return width - radar_w - margin, height - radar_h - margin, radar_w, radar_h
+
+
+def _radar_person(detection, role, positive_x, pitch):
+    x = _radar_number(detection.get("map_x"))
+    y = _radar_number(detection.get("map_y"))
+    if x is None or y is None or not inside_visible(x, y, positive_x, pitch):
+        return None
+    team = detection.get("team_id")
+    try:
+        team = int(team)
+    except (TypeError, ValueError):
+        team = None
+    if team not in (0, 1):
+        team = None
+    return {
+        "map_x": round(x, 1),
+        "map_y": round(y, 1),
+        "team_id": team,
+        "role": role,
+    }
+
+
+def build_radar_snapshot(players, goalkeepers, ball, positive_x, pitch=None):
+    """Points the 2D panel may draw. An uncalibrated frame publishes nobody."""
+    pitch = pitch or SoccerPitchConfiguration()
+    empty = {
+        "calibrated": False,
+        "goal_end": None,
+        "visible_third_cm": VISIBLE_THIRD_CM,
+        "field_length_cm": float(pitch.length),
+        "field_width_cm": float(pitch.width),
+        "players": [],
+        "ball": None,
+    }
+    if positive_x is None:
+        return empty
+    people = []
+    for detection in players or []:
+        row = _radar_person(detection, "player", bool(positive_x), pitch)
+        if row is not None:
+            people.append(row)
+    for detection in goalkeepers or []:
+        row = _radar_person(detection, "goalkeeper", bool(positive_x), pitch)
+        if row is not None:
+            people.append(row)
+    ball_point = None
+    if isinstance(ball, dict) and ball.get("source") not in _BALL_RADAR_SKIP:
+        x = _radar_number(ball.get("map_x"))
+        y = _radar_number(ball.get("map_y"))
+        if x is not None and y is not None and inside_visible(x, y, bool(positive_x), pitch):
+            ball_point = {"map_x": round(x, 1), "map_y": round(y, 1)}
+    return {
+        "calibrated": True,
+        "goal_end": "high_x" if positive_x else "low_x",
+        "visible_third_cm": VISIBLE_THIRD_CM,
+        "field_length_cm": float(pitch.length),
+        "field_width_cm": float(pitch.width),
+        "players": people,
+        "ball": ball_point,
+    }
+
+
 def draw_visible_penalty(
     frame,
     matrix,
@@ -299,6 +395,92 @@ def _polyline(frame, inverse, field_points, color):
         run = []
     if len(run) >= 2:
         cv2.polylines(frame, [np.array(run, dtype=np.int32)], False, color, 2, cv2.LINE_AA)
+
+
+def _radar_pixel(x_cm, y_cm, radar_w, radar_h, pitch):
+    px = int(round(float(x_cm) / float(pitch.length) * (radar_w - 1)))
+    py = int(round(float(y_cm) / float(pitch.width) * (radar_h - 1)))
+    return px, py
+
+
+def _draw_radar_template(radar, pitch):
+    height, width = radar.shape[:2]
+    color = (230, 235, 230)
+    vertices = pitch.vertices
+    for start, end in pitch.edges:
+        x1, y1 = _radar_pixel(*vertices[start - 1], width, height, pitch)
+        x2, y2 = _radar_pixel(*vertices[end - 1], width, height, pitch)
+        cv2.line(radar, (x1, y1), (x2, y2), color, 1, cv2.LINE_AA)
+    center = _radar_pixel(pitch.length / 2.0, pitch.width / 2.0, width, height, pitch)
+    axis_x = max(1, int(round(pitch.centre_circle_radius / float(pitch.length) * (width - 1))))
+    axis_y = max(1, int(round(pitch.centre_circle_radius / float(pitch.width) * (height - 1))))
+    cv2.ellipse(radar, center, (axis_x, axis_y), 0, 0, 360, color, 1, cv2.LINE_AA)
+
+
+def _draw_radar_dot(radar, x_cm, y_cm, pitch, color, radius):
+    height, width = radar.shape[:2]
+    px, py = _radar_pixel(x_cm, y_cm, width, height, pitch)
+    if not (0 <= px < width and 0 <= py < height):
+        return
+    cv2.circle(radar, (px, py), radius, color, -1, cv2.LINE_AA)
+    cv2.circle(radar, (px, py), radius, (255, 255, 255), 1, cv2.LINE_AA)
+
+
+def compose_pitch_radar(frame, players, ball, positive_x, goalkeepers=None):
+    """Paint the visible third in the corner. Missing coordinates leave no dot."""
+    if frame is None or positive_x is None:
+        return None
+    box = radar_inset_box(frame.shape[1], frame.shape[0])
+    if box is None:
+        return None
+    snapshot = build_radar_snapshot(players, goalkeepers, ball, positive_x)
+    if not snapshot["calibrated"]:
+        return None
+    x0, y0, radar_w, radar_h = box
+    pitch = SoccerPitchConfiguration()
+    radar = np.zeros((radar_h, radar_w, 3), dtype=np.uint8)
+    radar[:] = (42, 110, 48)
+    third_px = max(1, int(round(radar_w * VISIBLE_THIRD_CM / float(pitch.length))))
+    if positive_x:
+        radar[:, : radar_w - third_px] = (radar[:, : radar_w - third_px].astype(np.float32) * _RADAR_DIM).astype(np.uint8)
+        third_x = radar_w - third_px
+    else:
+        radar[:, third_px:] = (radar[:, third_px:].astype(np.float32) * _RADAR_DIM).astype(np.uint8)
+        third_x = 0
+    _draw_radar_template(radar, pitch)
+    cv2.rectangle(radar, (third_x, 0), (third_x + third_px - 1, radar_h - 1), (0, 220, 255), 1)
+    cv2.putText(
+        radar,
+        "35 m",
+        (third_x + 4, radar_h - 6),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.35,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    radius = max(3, radar_w // 56)
+    for person in snapshot["players"]:
+        color = _TEAM_BGR.get(person["team_id"], (180, 180, 180))
+        _draw_radar_dot(radar, person["map_x"], person["map_y"], pitch, color, radius)
+        if person["role"] == "goalkeeper":
+            px, py = _radar_pixel(person["map_x"], person["map_y"], radar_w, radar_h, pitch)
+            cv2.circle(radar, (px, py), radius + 2, (7, 193, 255), 1, cv2.LINE_AA)
+    if snapshot["ball"] is not None:
+        ball_radius = max(2, radius - 1)
+        _draw_radar_dot(
+            radar,
+            snapshot["ball"]["map_x"],
+            snapshot["ball"]["map_y"],
+            pitch,
+            (255, 255, 255),
+            ball_radius,
+        )
+        ball_px, ball_py = _radar_pixel(snapshot["ball"]["map_x"], snapshot["ball"]["map_y"], radar_w, radar_h, pitch)
+        cv2.circle(radar, (ball_px, ball_py), ball_radius, (0, 140, 255), 1, cv2.LINE_AA)
+    cv2.rectangle(radar, (0, 0), (radar_w - 1, radar_h - 1), (255, 255, 255), 1)
+    frame[y0 : y0 + radar_h, x0 : x0 + radar_w] = radar
+    return snapshot
 
 
 class VisiblePitchMap:

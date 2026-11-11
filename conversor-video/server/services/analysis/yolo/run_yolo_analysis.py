@@ -42,7 +42,7 @@ from roboflow_ball import BallTracker
 from roboflow_soccer_config import SoccerPitchConfiguration
 from roboflow_team import TeamClassifier, TeamTrackLock, crops_form_two_teams, reject_training_crop
 from pitch_homography import PitchHomographyGate, draw_projected_pitch
-from pitch_map import VisiblePitchMap, draw_visible_penalty
+from pitch_map import VisiblePitchMap, build_radar_snapshot, compose_pitch_radar, draw_visible_penalty
 from roboflow_view import ViewTransformer
 from spatial_metrics import SpatialMetrics
 
@@ -3251,6 +3251,7 @@ def analyze(args):
     player_stats = PlayerStatsAccumulator(fps, pitch=SOCCER_PITCH_CONFIGURATION)
     ball_heatmap = BallHeatmapAccumulator(pitch=SOCCER_PITCH_CONFIGURATION)
     visible_pitch_map = VisiblePitchMap(pitch=SOCCER_PITCH_CONFIGURATION)
+    pitch_radar_live = build_radar_snapshot([], [], None, None)
     spatial_metrics = SpatialMetrics(fps=fps)
     pitch_homography_gate = PitchHomographyGate(pitch=SOCCER_PITCH_CONFIGURATION)
     pitch_homography_debug = os.getenv("PITCH_HOMOGRAPHY_DEBUG", "").strip().lower() in {"1", "true", "on", "yes"}
@@ -4522,6 +4523,14 @@ def analyze(args):
             (ball_detections, detection_center),
         ):
             assign_map_coordinates(mapped_detections, visible_pitch_map, anchor)
+        radar_positive_x = visible_pitch_map.positive_x if map_decision.get("accepted") else None
+        radar_ball = ball_detections[0] if ball_detections else None
+        pitch_radar_live = build_radar_snapshot(
+            accepted_player_detections,
+            accepted_goalkeeper_detections,
+            radar_ball,
+            radar_positive_x,
+        )
         spatial_metrics_live = spatial_metrics.observe(
             frame_number=current_frame_number,
             players=list(accepted_player_detections) + list(accepted_goalkeeper_detections),
@@ -4717,6 +4726,22 @@ def analyze(args):
             draw_detection(output_frame, detection["box"], "Ball", confidence)
             if debug_frame is not None:
                 draw_detection(debug_frame, detection["box"], "Ball", confidence)
+        if radar_positive_x is not None:
+            compose_pitch_radar(
+                output_frame,
+                accepted_player_detections,
+                radar_ball,
+                radar_positive_x,
+                goalkeepers=accepted_goalkeeper_detections,
+            )
+            if debug_frame is not None:
+                compose_pitch_radar(
+                    debug_frame,
+                    accepted_player_detections,
+                    radar_ball,
+                    radar_positive_x,
+                    goalkeepers=accepted_goalkeeper_detections,
+                )
         record_profile_stage(
             profile_state,
             "render_bounding_boxes",
@@ -4782,6 +4807,7 @@ def analyze(args):
                 "player_stats": player_stats_live,
                 "ball_heatmap": ball_heatmap.as_dict(),
                 "pitch_map": spatial_metrics_live,
+                "pitch_radar": pitch_radar_live,
                 "playerDetections": [
                     {
                         "track_id": int(detection.get("track_id", -1)),
@@ -4794,6 +4820,8 @@ def analyze(args):
                         "bounding_box": detection["bounding_box"],
                         "field_x": detection.get("field_x"),
                         "field_y": detection.get("field_y"),
+                        "map_x": detection.get("map_x"),
+                        "map_y": detection.get("map_y"),
                     }
                     for detection in accepted_player_detections
                 ],
@@ -4809,6 +4837,8 @@ def analyze(args):
                         "bounding_box": detection["bounding_box"],
                         "field_x": detection.get("field_x"),
                         "field_y": detection.get("field_y"),
+                        "map_x": detection.get("map_x"),
+                        "map_y": detection.get("map_y"),
                     }
                     for detection in accepted_goalkeeper_detections
                 ],
@@ -4828,6 +4858,8 @@ def analyze(args):
                         "bounding_box": detection["bounding_box"],
                         "field_x": detection.get("field_x"),
                         "field_y": detection.get("field_y"),
+                        "map_x": detection.get("map_x"),
+                        "map_y": detection.get("map_y"),
                     }
                     for detection in ball_detections
                 ],
@@ -4988,7 +5020,7 @@ def analyze(args):
             "player_duplicate_iou_threshold": PERSON_DUPLICATE_IOU_THRESHOLD,
             "field_filter": "player/goalkeeper/referee bbox bottom-center foot point must be inside white-line-guided playable-field polygon",
             "labels": "class name and confidence are burned into the annotated video",
-            "field_coordinates": "possession and passes stay in image pixels; map_x and map_y feed only the visible-third heatmap and spatial metrics",
+            "field_coordinates": "possession and passes stay in image pixels; map_x and map_y feed the visible-third heatmap, spatial metrics and the 2D radar",
         },
         "tracking": {
             "status": "implemented",
@@ -5074,6 +5106,7 @@ def analyze(args):
         "player_stats": player_stats.as_dict(),
         "ball_heatmap": ball_heatmap.as_dict(),
         "pitch_map": {**spatial_metrics.as_dict(), "calibration": visible_pitch_map.metrics()},
+        "pitch_radar": pitch_radar_live,
         "passes": pass_metrics,
         "artifacts": {
             "processed_video_path": str(output_path),
@@ -5102,6 +5135,7 @@ def analyze(args):
             "player_stats": player_stats.as_dict(),
             "ball_heatmap": ball_heatmap.as_dict(),
             "pitch_map": {**spatial_metrics.as_dict(), "calibration": visible_pitch_map.metrics()},
+            "pitch_radar": pitch_radar_live,
         }
     )
     emit({"type": "result", "result": result})

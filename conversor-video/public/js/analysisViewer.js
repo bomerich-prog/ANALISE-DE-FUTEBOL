@@ -18,6 +18,7 @@ import {
   formatHottestZone,
   formatHottestDetail,
 } from './ballHeatmap.js';
+import { readPitchRadar, drawPitchRadar } from './pitchRadar.js';
 import {
   readPlayerStats,
   sortPlayerTracks,
@@ -74,6 +75,8 @@ const pitchMapDefenseDetailEl = byId('pitchMapDefenseDetail');
 const pitchMapSpeedEl = byId('pitchMapSpeed');
 const pitchMapSpeedDetailEl = byId('pitchMapSpeedDetail');
 const heatmapPanelEl = byId('analysisHeatmapPanel');
+const pitchRadarCanvasEl = byId('pitchRadarCanvas');
+const pitchRadarEmptyEl = byId('pitchRadarEmpty');
 const playersPanelEl = byId('analysisPlayersPanel');
 const heatmapTabEl = byId('analysisTabHeatmap');
 const playersTabEl = byId('analysisTabPlayers');
@@ -184,6 +187,7 @@ function resetViewer() {
   setText(ballEl, 'Não detectada');
   renderPossessionByTeam(null);
   renderBallHeatmap(null);
+  renderPitchRadar(null);
   openPlayerTracks = new Set();
   renderPlayerStats(null);
   if (progressEl) progressEl.style.width = '0%';
@@ -370,6 +374,13 @@ function renderPitchMap(analysis, ctx) {
   );
 }
 
+function renderPitchRadar(analysis) {
+  const radar = readPitchRadar(analysis);
+  const ctx = pitchRadarCanvasEl ? pitchRadarCanvasEl.getContext('2d') : null;
+  if (ctx) drawPitchRadar(ctx, pitchRadarCanvasEl.width, pitchRadarCanvasEl.height, radar);
+  pitchRadarEmptyEl?.classList.toggle('hidden', Boolean(radar.calibrated));
+}
+
 function renderBallHeatmap(analysis) {
   const heatmap = readBallHeatmap(analysis);
   const ctx = ballHeatmapCanvasEl ? ballHeatmapCanvasEl.getContext('2d') : null;
@@ -404,6 +415,7 @@ function renderAnalysis(analysis) {
   renderMatchEvents(events);
   renderPossessionByTeam(analysis);
   renderBallHeatmap(analysis);
+  renderPitchRadar(analysis);
   renderPlayerStats(analysis);
   if (progressEl) progressEl.style.width = `${pct}%`;
 

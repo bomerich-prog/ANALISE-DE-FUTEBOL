@@ -62,6 +62,9 @@ class AnalysisService {
     if (result?.pitch_map && typeof result.pitch_map === 'object') {
       stats.pitch_map = result.pitch_map;
     }
+    if (result?.pitch_radar && typeof result.pitch_radar === 'object') {
+      stats.pitch_radar = result.pitch_radar;
+    }
     if (result?.artifacts?.debug_live_frame_url) {
       stats.debug_frame_url = result.artifacts.debug_live_frame_url;
     }

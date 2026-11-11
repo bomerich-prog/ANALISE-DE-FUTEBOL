@@ -14,9 +14,12 @@ from pitch_homography import fit_broadcast_penalty  # noqa: E402
 from pitch_map import (  # noqa: E402
     VisiblePitchMap,
     box_matches_visible_paint,
+    build_radar_snapshot,
+    compose_pitch_radar,
     inside_measured,
     inside_visible,
     paint_patch,
+    radar_inset_box,
     scale_is_stable,
     visible_bounds,
 )
@@ -244,6 +247,44 @@ def test_real_penalty_paint_locks_and_a_blank_frame_drops_it():
     assert_true(dropped["matrix"] is None, "the dropped frame has no coordinates")
 
 
+def test_radar_publishes_only_the_calibrated_third():
+    players = [
+        {"map_x": 1000.0, "map_y": 3500.0, "team_id": 0},
+        {"map_x": 6000.0, "map_y": 3500.0, "team_id": 1},
+        {"map_x": None, "map_y": None, "team_id": 0},
+    ]
+    keepers = [{"map_x": 400.0, "map_y": 3400.0, "team_id": 0}]
+    ball = {"map_x": 1500.0, "map_y": 3000.0, "source": "observed"}
+    remembered = {"map_x": 1600.0, "map_y": 3000.0, "source": "remembered"}
+    snapshot = build_radar_snapshot(players, keepers, ball, False)
+    assert_equal(snapshot["goal_end"], "low_x", "the near goal names the third")
+    assert_equal(len(snapshot["players"]), 2, "the midfield player and the empty point stay off")
+    assert_equal(snapshot["players"][1]["role"], "goalkeeper", "the keeper keeps a role")
+    assert_equal(snapshot["ball"]["map_x"], 1500.0, "the observed ball is on the map")
+    assert_true(build_radar_snapshot(players, keepers, remembered, False)["ball"] is None, "a remembered ball is not dragged onto the map")
+    assert_true(not build_radar_snapshot(players, keepers, ball, None)["calibrated"], "no matrix publishes nobody")
+    blank = np.zeros((480, 854, 3), dtype=np.uint8)
+    assert_true(compose_pitch_radar(blank, players, ball, None) is None, "an uncalibrated frame draws nothing")
+    assert_equal(int(blank.sum()), 0, "the uncalibrated frame stays empty")
+    near = blank.copy()
+    far = blank.copy()
+    compose_pitch_radar(near, [players[0]], ball, False, goalkeepers=keepers)
+    compose_pitch_radar(far, [players[1]], None, False)
+    assert_true(int(near.sum()) > 0, "the calibrated third is drawn")
+    assert_true(not np.array_equal(near, far), "a dot inside the third changes the radar")
+    template = blank.copy()
+    compose_pitch_radar(template, [], None, False)
+    assert_true(np.array_equal(far, template), "a point outside the third adds no dot")
+    x0, y0, radar_w, radar_h = radar_inset_box(854, 480)
+
+    def grass_at(x_cm, y_cm):
+        px = int(round(x_cm / 12000.0 * (radar_w - 1)))
+        py = int(round(y_cm / 7000.0 * (radar_h - 1)))
+        return near[y0 + py, x0 + px]
+
+    assert_true(int(grass_at(800, 1000).sum()) > int(grass_at(8000, 1000).sum()), "the far half of the radar is dimmer")
+
+
 def main():
     cv2.setRNGSeed(0)
     test_scale_jump_is_rejected_and_the_third_is_35_m()
@@ -255,6 +296,7 @@ def main():
     test_goal_line_in_the_stands_keeps_the_grass_patch()
     test_blank_paint_publishes_nothing()
     test_real_penalty_paint_locks_and_a_blank_frame_drops_it()
+    test_radar_publishes_only_the_calibrated_third()
     print("pitch map tests passed")
 
 
