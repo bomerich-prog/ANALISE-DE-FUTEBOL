@@ -357,71 +357,212 @@ def fit_broadcast_penalty(white_line_mask, pitch, frame=None):
     }
 
 
-def _contour_circle(points):
-    """Tight circle on one paint contour. A straight line does not qualify."""
-    if len(points) < 80:
-        return None
+def _curvature_split(paint):
+    """Straight paint versus curved paint. A cropped centre circle stays in the curved set."""
+    contours, _hierarchy = cv2.findContours(paint, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    curved = []
+    straight = []
+    step = 8
+    for contour in contours:
+        points = contour.reshape(-1, 2).astype(np.float64)
+        if len(points) < step * 2 + 2:
+            continue
+        for index in range(step, len(points) - step):
+            before = points[index] - points[index - step]
+            after = points[index + step] - points[index]
+            before_norm = float(np.linalg.norm(before))
+            after_norm = float(np.linalg.norm(after))
+            if before_norm < 1.0 or after_norm < 1.0:
+                straight.append(points[index])
+                continue
+            turn = abs(before[0] * after[1] - before[1] * after[0]) / (before_norm * after_norm)
+            if turn >= 0.10:
+                curved.append(points[index])
+            else:
+                straight.append(points[index])
+    curved = np.array(curved, dtype=np.float64) if curved else np.zeros((0, 2))
+    straight = np.array(straight, dtype=np.float64) if straight else np.zeros((0, 2))
+    return curved, straight
+
+
+def _arc_span(points, center):
+    angles = np.arctan2(points[:, 1] - center[1], points[:, 0] - center[0])
+    angles = np.sort(angles)
+    gaps = np.diff(angles)
+    wrap = float(angles[0] + 2 * np.pi - angles[-1])
+    largest_gap = max(float(gaps.max()) if len(gaps) else 0.0, wrap)
+    return float(np.degrees(2 * np.pi - largest_gap))
+
+
+def _fit_arcs(points, rounds=3):
+    """Circles supported by curved paint. Each round removes the circle it kept."""
+    if len(points) < 40:
+        return []
+    remaining = points
+    found = []
     rng = np.random.default_rng(1)
-    best = None
-    for _ in range(900):
-        sample = points[rng.choice(len(points), 3, replace=False)]
-        if min(
-            np.hypot(*(sample[0] - sample[1])),
-            np.hypot(*(sample[0] - sample[2])),
-            np.hypot(*(sample[1] - sample[2])),
-        ) < 18:
-            continue
-        circle = _circle_through(sample)
-        if circle is None:
-            continue
-        center, radius = circle
-        if not (70.0 <= radius <= 220.0):
-            continue
-        residual = np.abs(np.hypot(points[:, 0] - center[0], points[:, 1] - center[1]) - radius)
-        keep = int(np.count_nonzero(residual < 3.5))
-        if keep < 60:
-            continue
-        kept = points[residual < 3.5]
-        angles = np.arctan2(kept[:, 1] - center[1], kept[:, 0] - center[0])
-        span = float(np.degrees(angles.max() - angles.min()))
-        if span > 180.0:
-            span = 360.0 - span
-        if span < 50.0:
-            continue
-        median = float(np.median(residual[residual < 3.5]))
-        rank = (median, -keep)
-        if best is None or rank < best[0]:
-            best = (rank, center, float(radius))
-    if best is None:
-        return None
-    return best[1], best[2]
+    for _round in range(rounds):
+        if len(remaining) < 40:
+            break
+        best = None
+        for _attempt in range(700):
+            sample = remaining[rng.choice(len(remaining), 3, replace=False)]
+            if min(
+                np.hypot(*(sample[0] - sample[1])),
+                np.hypot(*(sample[0] - sample[2])),
+                np.hypot(*(sample[1] - sample[2])),
+            ) < 16:
+                continue
+            circle = _circle_through(sample)
+            if circle is None:
+                continue
+            center, radius = circle
+            if not (40.0 <= radius <= 280.0):
+                continue
+            residual = np.abs(np.hypot(remaining[:, 0] - center[0], remaining[:, 1] - center[1]) - radius)
+            kept = remaining[residual < 4.0]
+            if len(kept) < 35:
+                continue
+            span = _arc_span(kept, center)
+            if span < 40.0 or span > 320.0:
+                continue
+            median = float(np.median(residual[residual < 4.0]))
+            rank = (median, -len(kept))
+            if best is None or rank < best[0]:
+                best = (rank, center, float(radius), span, kept)
+        if best is None:
+            break
+        _rank, center, radius, span, kept = best
+        found.append({"center": center, "radius": radius, "span": span, "count": len(kept)})
+        residual = np.abs(np.hypot(remaining[:, 0] - center[0], remaining[:, 1] - center[1]) - radius)
+        remaining = remaining[residual >= 6.0]
+    return found
 
 
-def _axis_through_center(paint, center):
-    """Unit direction of the straight paint that crosses the circle centre."""
+def _line_offset(point, origin, direction):
+    delta = point - origin
+    return float(delta[0] * direction[1] - delta[1] * direction[0])
+
+
+def _collect_lines(paint):
     edges = cv2.Canny(paint, 40, 120)
-    found = cv2.HoughLinesP(edges, 1, np.pi / 180, 16, minLineLength=30, maxLineGap=16)
+    found = cv2.HoughLinesP(edges, 1, np.pi / 180, 18, minLineLength=40, maxLineGap=18)
     if found is None:
-        return None
-    points = []
+        return []
+    segments = []
     for x1, y1, x2, y2 in found.reshape(-1, 4):
         direction = np.array([float(x2 - x1), float(y2 - y1)], np.float64)
         length = float(np.linalg.norm(direction))
-        if length < 28:
+        if length < 36:
             continue
         direction /= length
-        delta = center - np.array([float(x1), float(y1)], np.float64)
-        offset = abs(float(delta[0] * direction[1] - delta[1] * direction[0]))
-        if offset < 12:
-            points.extend(((float(x1), float(y1)), (float(x2), float(y2))))
-    if len(points) < 2:
+        if direction[0] < 0:
+            direction = -direction
+        angle = float(np.degrees(np.arctan2(direction[1], direction[0])))
+        origin = np.array([float(x1), float(y1)], np.float64)
+        segments.append(
+            {
+                "origin": origin,
+                "direction": direction,
+                "length": length,
+                "angle": angle,
+                "mid_y": float(y1 + y2) / 2.0,
+            }
+        )
+    return segments
+
+
+def _far_touchline(lines, height):
+    """The long shallow line high in the frame, under the advertising boards."""
+    shallow = [
+        line
+        for line in lines
+        if abs(line["angle"]) <= 20.0 and line["mid_y"] < height * 0.46 and line["length"] >= 70.0
+    ]
+    if not shallow:
         return None
-    vx, vy, _x0, _y0 = cv2.fitLine(np.array(points, np.float32), cv2.DIST_L2, 0, 0.01, 0.01).reshape(-1)
-    direction = np.array([float(vx), float(vy)], np.float64)
-    norm = float(np.linalg.norm(direction))
-    if norm < 1e-6:
-        return None
-    return direction / norm
+    shallow.sort(key=lambda line: (line["mid_y"], -line["length"]))
+    return shallow[0]
+
+
+def _label_arc(arc, lines):
+    """Centre if any straight line passes through the centre. Penalty only when none does."""
+    if not lines:
+        return "unknown", None
+    through = []
+    offset_lines = []
+    for line in lines:
+        offset = abs(_line_offset(arc["center"], line["origin"], line["direction"]))
+        ratio = offset / arc["radius"]
+        if ratio <= 0.40:
+            through.append(line)
+        elif 0.45 <= ratio <= 0.78:
+            offset_lines.append(line)
+    if through:
+        return "centre", max(through, key=lambda line: line["length"])
+    if offset_lines and 80.0 <= arc["span"] <= 140.0:
+        return "penalty", max(offset_lines, key=lambda line: line["length"])
+    return "unknown", None
+
+
+def _pair_centre_and_penalty(arcs, lines, height):
+    """Two half-circles: the one on the halfway line is central. Depth, not the sideline, decides."""
+    labelled = []
+    for arc in arcs:
+        kind, line = _label_arc(arc, lines)
+        labelled.append((kind, line, arc))
+    centres = [item for item in labelled if item[0] == "centre"]
+    penalties = [item for item in labelled if item[0] == "penalty"]
+    if centres:
+        tight = [
+            item
+            for item in centres
+            if item[2].get("error", 9.0) <= 2.5
+            and item[2]["count"] >= 40
+            and item[2]["span"] >= 55.0
+            and item[2]["center"][1] > height * 0.18
+        ]
+        pool = tight or centres
+        centres = [min(pool, key=lambda item: (item[2].get("error", 9.0), -item[2]["count"]))]
+    if not centres and len(labelled) >= 2:
+        first, second = labelled[0], labelled[1]
+        delta = second[2]["center"] - first[2]["center"]
+        length = float(np.linalg.norm(delta))
+        if length < 1.0:
+            return None, None, None
+        direction = delta / length
+
+        def halfway_alignment(item):
+            _kind, line, arc = item
+            if line is None:
+                return 1.0
+            return abs(float(np.dot(line["direction"], direction)))
+
+        if halfway_alignment(first) <= halfway_alignment(second):
+            centres = [first]
+            penalties = [second]
+        else:
+            centres = [second]
+            penalties = [first]
+    if not centres:
+        return None, None, None
+    centre_kind, centre_line, centre_arc = centres[0]
+    penalty_arc = None
+    if centre_line is not None:
+        for _kind, _line, arc in labelled:
+            if arc is centre_arc:
+                continue
+            offset = abs(_line_offset(arc["center"], centre_line["origin"], centre_line["direction"]))
+            ratio = offset / max(centre_arc["radius"], 1.0)
+            separation = float(np.linalg.norm(arc["center"] - centre_arc["center"]))
+            depth = separation / max(centre_arc["radius"], 1.0)
+            # 49 m from the centre spot to the penalty spot is about 5.4 radii.
+            if 0.45 <= ratio <= 0.9 and 3.5 <= depth <= 7.5 and arc["span"] <= 150.0:
+                penalty_arc = arc
+                break
+    if penalty_arc is None and penalties:
+        penalty_arc = penalties[0][2]
+    return centre_arc, centre_line, penalty_arc
 
 
 def _centre_matrix(center, along, perp, radius):
@@ -471,58 +612,173 @@ def _visible_mark_sits_on_paint(values):
     return close >= 6 and float(np.median(ordered[:count])) <= 6.0
 
 
+def _mark_score(values):
+    if len(values) < 8:
+        return None
+    ordered = np.sort(np.asarray(values, dtype=np.float64))
+    count = max(8, int(round(len(ordered) * 0.4)))
+    return float(np.median(ordered[:count]))
+
+
 def centre_marks_still_on_paint(matrix, paint):
     """True when the visible centre circle and halfway line still sit on the paint."""
     if matrix is None or paint is None:
         return False
     circle = [
         (6000.0 + _ARC_RADIUS_CM * np.cos(angle), 3500.0 + _ARC_RADIUS_CM * np.sin(angle))
-        for angle in np.linspace(0, 2 * np.pi, 36)
+        for angle in np.linspace(0, 2 * np.pi, 48)
     ]
     line = [(6000.0, y) for y in np.linspace(200.0, 6800.0, 24)]
-    return _visible_mark_sits_on_paint(_paint_distances(matrix, paint, circle)) and _visible_mark_sits_on_paint(
-        _paint_distances(matrix, paint, line)
-    )
+    circle_score = _mark_score(_paint_distances(matrix, paint, circle))
+    line_score = _mark_score(_paint_distances(matrix, paint, line))
+    return circle_score is not None and line_score is not None and circle_score <= 5.0 and line_score <= 8.0
+
+
+def _orient_centre(center, along, radius, penalty_center):
+    """Point field +x toward the penalty arc when it is visible, otherwise to image right."""
+    perp = np.array([-along[1], along[0]], np.float64)
+    if penalty_center is not None:
+        toward = penalty_center - center
+        if float(np.dot(toward, perp)) < 0.0:
+            perp = -perp
+    else:
+        probe = center + perp * radius
+        other = center - perp * radius
+        if float(probe[0]) < float(other[0]):
+            perp = -perp
+    if float(np.dot(along, np.array([-perp[1], perp[0]]))) < 0.0:
+        along = -along
+    return along, perp
+
+
+def _component_arcs(paint, curved):
+    """One circle per curved patch, so a cropped centre arc is not mixed with a straight line."""
+    if len(curved) < 25:
+        return []
+    mask = np.zeros(paint.shape, np.uint8)
+    xs = np.clip(curved[:, 0].astype(int), 0, paint.shape[1] - 1)
+    ys = np.clip(curved[:, 1].astype(int), 0, paint.shape[0] - 1)
+    mask[ys, xs] = 255
+    mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+    components, _hierarchy = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    arcs = []
+    rng = np.random.default_rng(1)
+    for component in components:
+        x, y, width, height = cv2.boundingRect(component)
+        if width * height < 500 or max(width, height) < 28:
+            continue
+        selected = curved[
+            (curved[:, 0] >= x)
+            & (curved[:, 0] < x + width)
+            & (curved[:, 1] >= y)
+            & (curved[:, 1] < y + height)
+        ]
+        if len(selected) < 25:
+            continue
+        best = None
+        for _attempt in range(220):
+            sample = selected[rng.choice(len(selected), 3, replace=False)]
+            if min(
+                np.hypot(*(sample[0] - sample[1])),
+                np.hypot(*(sample[0] - sample[2])),
+                np.hypot(*(sample[1] - sample[2])),
+            ) < 10:
+                continue
+            circle = _circle_through(sample)
+            if circle is None:
+                continue
+            center, radius = circle
+            if not (45.0 <= radius <= 170.0):
+                continue
+            residual = np.abs(np.hypot(selected[:, 0] - center[0], selected[:, 1] - center[1]) - radius)
+            kept = int(np.count_nonzero(residual < 4.0))
+            if kept < 22:
+                continue
+            median = float(np.median(residual[residual < 4.0]))
+            span = _arc_span(selected[residual < 4.0], center)
+            if span < 35.0:
+                continue
+            rank = (median, -kept)
+            if best is None or rank < best[0]:
+                best = (rank, center, float(radius), span, kept)
+        if best is None:
+            continue
+        rank, center, radius, span, kept = best
+        arcs.append(
+            {
+                "center": center,
+                "radius": radius,
+                "span": span,
+                "count": kept,
+                "error": float(rank[0]),
+            }
+        )
+    return arcs
+
+
+def _snap_center_to_line(center, radius, line, support):
+    """Move the centre onto the straight line and keep the arc's radius."""
+    direction = line["direction"]
+    normal = np.array([-direction[1], direction[0]], np.float64)
+    signed = _line_offset(center, line["origin"], direction)
+    snapped = center - normal * signed
+    if abs(_line_offset(snapped, line["origin"], direction)) > abs(signed):
+        snapped = center + normal * signed
+    distances = np.hypot(support[:, 0] - snapped[0], support[:, 1] - snapped[1])
+    fitted = float(np.median(distances))
+    if not (45.0 <= fitted <= 170.0):
+        return None
+    error = np.abs(distances - fitted)
+    if int(np.count_nonzero(error < 6.0)) < 20 or float(np.median(error)) > 5.0:
+        return None
+    return snapped, fitted
 
 
 def fit_broadcast_centre(white_line_mask, pitch, frame=None):
-    """Image-to-field matrix from the centre circle and the halfway line through it.
+    """Image-to-field matrix from the centre circle, the halfway line and the far touchline.
 
-    A broadcast frame of the middle shows that circle, not a full penalty box.
-    The radius is 9.15 m and the line through the centre is the halfway line.
-    The right-hand side of the picture is the high-x goal. Returns None when the
-    circle or the line leaves the paint.
+    A cropped centre circle still counts when its centre lies on a straight line.
+    A penalty arc is the one whose centre lies 5.5 m off its line. Two arcs are
+    split by depth: the one toward the goal is the penalty arc. The matrix is
+    kept only when the projected circle covers the white arc.
     """
     del frame, pitch
     paint = _clean_paint(white_line_mask)
     if paint is None:
         return None
-    contours, _hierarchy = cv2.findContours(paint, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
-    if not contours:
+    curved, _straight = _curvature_split(paint)
+    arcs = _component_arcs(paint, curved)
+    lines = _collect_lines(paint)
+    centre_arc, centre_line, penalty_arc = _pair_centre_and_penalty(arcs, lines, paint.shape[0])
+    if centre_arc is None or centre_arc["radius"] < 60.0 or centre_arc["span"] < 55.0:
         return None
-    circle = None
-    for contour in sorted(contours, key=len, reverse=True)[:4]:
-        circle = _contour_circle(contour.reshape(-1, 2).astype(np.float64))
-        if circle is not None:
-            break
-    if circle is None:
-        return None
-    center, radius = circle
-    along = _axis_through_center(paint, center)
-    if along is None:
-        return None
-    perp = np.array([-along[1], along[0]], np.float64)
+    if centre_line is None:
+        nearest = None
+        for line in lines:
+            offset = abs(_line_offset(centre_arc["center"], line["origin"], line["direction"]))
+            if nearest is None or offset < nearest[0]:
+                nearest = (offset, line)
+        if nearest is None or nearest[0] > 0.4 * centre_arc["radius"]:
+            return None
+        centre_line = nearest[1]
+    support = curved[
+        np.abs(np.hypot(curved[:, 0] - centre_arc["center"][0], curved[:, 1] - centre_arc["center"][1]) - centre_arc["radius"])
+        < 6.0
+    ] if len(curved) else curved
+    if len(support) < 20:
+        support = curved
+    snapped = _snap_center_to_line(centre_arc["center"], centre_arc["radius"], centre_line, support)
+    if snapped is None:
+        center, radius = centre_arc["center"], centre_arc["radius"]
+    else:
+        center, radius = snapped
+    along, perp = _orient_centre(
+        center,
+        centre_line["direction"],
+        radius,
+        None if penalty_arc is None else penalty_arc["center"],
+    )
     matrix = _centre_matrix(center, along, perp, radius)
-    try:
-        inverse = np.linalg.inv(matrix)
-    except np.linalg.LinAlgError:
-        return None
-    right = inverse @ np.array([11000.0, 3500.0, 1.0])
-    left = inverse @ np.array([1000.0, 3500.0, 1.0])
-    if not (np.isfinite(right).all() and np.isfinite(left).all() and right[2] != 0 and left[2] != 0):
-        return None
-    if float(right[0] / right[2]) < float(left[0] / left[2]):
-        matrix = _centre_matrix(center, along, -perp, radius)
     if not centre_marks_still_on_paint(matrix, paint):
         return None
     return {
@@ -531,7 +787,15 @@ def fit_broadcast_centre(white_line_mask, pitch, frame=None):
         "anchor": "centre",
         "cm_per_px": _ARC_RADIUS_CM / float(radius),
         "front_x_cm": 6000.0,
+        "has_penalty_arc": penalty_arc is not None,
     }
+
+
+def _paint_points(paint):
+    ys, xs = np.where(paint > 0)
+    if len(xs) == 0:
+        return np.zeros((0, 2))
+    return np.stack([xs, ys], axis=1).astype(np.float64)
 
 
 class PitchHomographyGate:
