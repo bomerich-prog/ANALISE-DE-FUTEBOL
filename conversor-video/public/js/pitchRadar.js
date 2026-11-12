@@ -77,6 +77,7 @@ export function normalizePitchRadar(source) {
         map_y: y,
         team_id: team,
         role: person.role === 'goalkeeper' ? 'goalkeeper' : 'player',
+        held: person.held === true,
       });
       if (players.length >= 32) break;
     }
@@ -171,12 +172,18 @@ export function drawPitchRadar(ctx, width, height, radar) {
   map.players.forEach((person) => {
     const [x, y] = fieldPixel(person.map_x, person.map_y, width, height, map.field_length_cm, map.field_width_cm);
     ctx.beginPath();
-    ctx.fillStyle = TEAM_COLOR[person.team_id] || '#b4b4b4';
-    ctx.arc(x, y, radius, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.lineWidth = person.role === 'goalkeeper' ? 2.5 : 1.5;
-    ctx.strokeStyle = person.role === 'goalkeeper' ? '#ffc107' : '#ffffff';
-    ctx.stroke();
+    ctx.arc(x, y, person.held ? radius + 1.5 : radius, 0, Math.PI * 2);
+    if (person.held) {
+      ctx.strokeStyle = TEAM_COLOR[person.team_id] || '#b4b4b4';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    } else {
+      ctx.fillStyle = TEAM_COLOR[person.team_id] || '#b4b4b4';
+      ctx.fill();
+      ctx.lineWidth = person.role === 'goalkeeper' ? 2.5 : 1.5;
+      ctx.strokeStyle = person.role === 'goalkeeper' ? '#ffc107' : '#ffffff';
+      ctx.stroke();
+    }
     dots += 1;
   });
   if (map.ball) {

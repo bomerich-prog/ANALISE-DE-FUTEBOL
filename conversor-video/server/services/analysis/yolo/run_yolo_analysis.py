@@ -43,6 +43,7 @@ from roboflow_soccer_config import SoccerPitchConfiguration
 from roboflow_team import TeamClassifier, TeamTrackLock, crops_form_two_teams, reject_training_crop
 from pitch_homography import PitchHomographyGate, draw_projected_pitch
 from pitch_map import (
+    RadarTrackMemory,
     VisiblePitchMap,
     build_radar_snapshot,
     compose_pitch_radar,
@@ -3287,6 +3288,7 @@ def analyze(args):
     player_stats = PlayerStatsAccumulator(fps, pitch=SOCCER_PITCH_CONFIGURATION)
     ball_heatmap = BallHeatmapAccumulator(pitch=SOCCER_PITCH_CONFIGURATION)
     visible_pitch_map = VisiblePitchMap(pitch=SOCCER_PITCH_CONFIGURATION)
+    radar_memory = RadarTrackMemory()
     prime_visible_pitch_map(input_path, visible_pitch_map)
     pitch_radar_live = build_radar_snapshot([], [], None, None)
     spatial_metrics = SpatialMetrics(fps=fps)
@@ -4576,6 +4578,10 @@ def analyze(args):
             radar_positive_x,
             anchor=radar_anchor,
         )
+        if pitch_radar_live["calibrated"]:
+            pitch_radar_live["players"] = radar_memory.observe(pitch_radar_live["players"])
+        else:
+            radar_memory.observe([])
         spatial_metrics_live = spatial_metrics.observe(
             frame_number=current_frame_number,
             players=list(accepted_player_detections) + list(accepted_goalkeeper_detections),
@@ -4783,6 +4789,7 @@ def analyze(args):
                 radar_positive_x,
                 goalkeepers=accepted_goalkeeper_detections,
                 anchor=radar_anchor,
+                snapshot=pitch_radar_live,
             )
             if debug_frame is not None:
                 compose_pitch_radar(
@@ -4792,6 +4799,7 @@ def analyze(args):
                     radar_positive_x,
                     goalkeepers=accepted_goalkeeper_detections,
                     anchor=radar_anchor,
+                    snapshot=pitch_radar_live,
                 )
         record_profile_stage(
             profile_state,

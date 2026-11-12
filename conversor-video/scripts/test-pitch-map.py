@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server/services/an
 from ball_heatmap import BallHeatmapAccumulator  # noqa: E402
 from pitch_homography import fit_broadcast_penalty  # noqa: E402
 from pitch_map import (  # noqa: E402
+    RadarTrackMemory,
     VisiblePitchMap,
     box_matches_visible_paint,
     build_radar_snapshot,
@@ -253,6 +254,38 @@ def test_real_penalty_paint_locks_and_a_blank_frame_keeps_it():
     assert_true(not pitch_map._agrees({"matrix": mirrored, "cm_per_px": pitch_map.scale}), "a mirrored fit is refused")
 
 
+def test_radar_memory_holds_the_last_point_for_four_frames():
+    memory = RadarTrackMemory()
+    seen = {"track_id": 10, "map_x": 1000.0, "map_y": 2000.0, "team_id": 0, "role": "player"}
+    first = memory.observe([seen])
+    assert_equal(first[0]["held"], False, "a live detection is not a held point")
+    assert_equal(seen["map_x"], 1000.0, "the detection dict is not rewritten")
+    for gap in range(1, 5):
+        held = memory.observe([])
+        assert_equal(len(held), 1, f"gap {gap} still draws the player")
+        assert_equal(held[0]["held"], True, "the repeated point is marked as held")
+        assert_equal(held[0]["map_x"], 1000.0, "the point stays on the last coordinate")
+        assert_equal(held[0]["map_y"], 2000.0, "the point is not moved")
+        assert_equal(held[0]["track_id"], 10, "the hold keeps the same track")
+    assert_equal(memory.observe([]), [], "the fifth miss removes the point")
+    returned = memory.observe([
+        {"track_id": 10, "map_x": 1400.0, "map_y": 2100.0, "team_id": 0, "role": "player"},
+    ])
+    assert_equal(returned[0]["map_x"], 1400.0, "the same track takes the new detection")
+    assert_equal(returned[0]["held"], False, "a new detection clears the hold")
+    mixed = memory.observe([
+        {"track_id": 40, "map_x": 8000.0, "map_y": 3000.0, "team_id": 1, "role": "player"},
+    ])
+    by_id = {row["track_id"]: row for row in mixed}
+    assert_equal(by_id[40]["map_x"], 8000.0, "a new track starts at its own detection")
+    assert_equal(by_id[40]["held"], False, "a new track is not tied to the old one")
+    assert_equal(by_id[10]["held"], True, "the old track is only held, not moved to the new id")
+    assert_equal(by_id[10]["map_x"], 1400.0, "the old track keeps the position it last owned")
+    anonymous = RadarTrackMemory()
+    anonymous.observe([{"track_id": -1, "map_x": 500.0, "map_y": 500.0, "team_id": 0, "role": "player"}])
+    assert_equal(anonymous.observe([]), [], "a missing track id is not remembered")
+
+
 def test_radar_publishes_only_the_calibrated_third():
     players = [
         {"map_x": 1000.0, "map_y": 3500.0, "team_id": 0},
@@ -302,6 +335,7 @@ def main():
     test_goal_line_in_the_stands_keeps_the_grass_patch()
     test_blank_paint_publishes_nothing()
     test_real_penalty_paint_locks_and_a_blank_frame_keeps_it()
+    test_radar_memory_holds_the_last_point_for_four_frames()
     test_radar_publishes_only_the_calibrated_third()
     print("pitch map tests passed")
 

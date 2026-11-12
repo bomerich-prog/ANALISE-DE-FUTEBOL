@@ -53,6 +53,7 @@ function pitchRadarFromPayload(payload) {
         map_y: y,
         team_id: team,
         role: person.role === 'goalkeeper' ? 'goalkeeper' : 'player',
+        held: person.held === true,
       });
       if (players.length >= 32) break;
     }

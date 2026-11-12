@@ -29,6 +29,7 @@ from roboflow_view import ViewTransformer
 
 VISIBLE_THIRD_CM = 3500.0
 MAX_FIELD_SHIFT_CM = 1200.0
+RADAR_HOLD_FRAMES = 4
 EDGE_TOLERANCE_CM = 100.0
 HOLD_FRAMES = 15
 SCALE_JUMP_RATIO = 1.35
@@ -328,7 +329,77 @@ def _radar_person(detection, role, positive_x, pitch, anchor="penalty"):
         "map_y": round(y, 1),
         "team_id": team,
         "role": role,
+        "track_id": _radar_track_id(detection.get("track_id")),
+        "held": False,
     }
+
+
+def _radar_track_id(value):
+    try:
+        track_id = int(value)
+    except (TypeError, ValueError):
+        return None
+    if track_id < 0:
+        return None
+    return track_id
+
+
+class RadarTrackMemory:
+    """Repeat a track's last map point for a few missed frames.
+
+    This is only the drawing list. It does not move the point, and it never
+    writes back onto the detections that possession and the heatmaps read.
+    """
+
+    def __init__(self, hold_frames=RADAR_HOLD_FRAMES):
+        self.hold_frames = int(hold_frames)
+        self.tracks = {}
+
+    def observe(self, people):
+        seen = set()
+        drawn = []
+        for person in people or []:
+            track_id = _radar_track_id(person.get("track_id"))
+            fresh = {
+                "map_x": person["map_x"],
+                "map_y": person["map_y"],
+                "team_id": person.get("team_id"),
+                "role": person.get("role") or "player",
+                "track_id": track_id,
+                "held": False,
+            }
+            drawn.append(fresh)
+            if track_id is None:
+                continue
+            seen.add(track_id)
+            self.tracks[track_id] = {
+                "map_x": fresh["map_x"],
+                "map_y": fresh["map_y"],
+                "team_id": fresh["team_id"],
+                "role": fresh["role"],
+                "missing": 0,
+            }
+        expired = []
+        for track_id, saved in self.tracks.items():
+            if track_id in seen:
+                continue
+            saved["missing"] += 1
+            if saved["missing"] > self.hold_frames:
+                expired.append(track_id)
+                continue
+            drawn.append(
+                {
+                    "map_x": saved["map_x"],
+                    "map_y": saved["map_y"],
+                    "team_id": saved["team_id"],
+                    "role": saved["role"],
+                    "track_id": track_id,
+                    "held": True,
+                }
+            )
+        for track_id in expired:
+            del self.tracks[track_id]
+        return drawn
 
 
 def build_radar_snapshot(players, goalkeepers, ball, positive_x, pitch=None, anchor="penalty"):
@@ -472,25 +543,31 @@ def _draw_radar_template(radar, pitch):
     cv2.ellipse(radar, center, (axis_x, axis_y), 0, 0, 360, color, 1, cv2.LINE_AA)
 
 
-def _draw_radar_dot(radar, x_cm, y_cm, pitch, color, radius):
+def _draw_radar_dot(radar, x_cm, y_cm, pitch, color, radius, held=False):
     height, width = radar.shape[:2]
     px, py = _radar_pixel(x_cm, y_cm, width, height, pitch)
     if not (0 <= px < width and 0 <= py < height):
+        return
+    if held:
+        cv2.circle(radar, (px, py), radius + 2, color, 2, cv2.LINE_AA)
         return
     cv2.circle(radar, (px, py), radius, color, -1, cv2.LINE_AA)
     cv2.circle(radar, (px, py), radius, (255, 255, 255), 1, cv2.LINE_AA)
 
 
-def compose_pitch_radar(frame, players, ball, positive_x, goalkeepers=None, anchor="penalty"):
+def compose_pitch_radar(frame, players, ball, positive_x, goalkeepers=None, anchor="penalty", snapshot=None):
     """Paint the calibrated pitch in the corner. Missing coordinates leave no dot."""
-    if anchor not in ("centre", "shot", "penalty"):
-        anchor = "penalty"
-    if frame is None or (anchor == "penalty" and positive_x is None):
+    if snapshot is None:
+        if anchor not in ("centre", "shot", "penalty"):
+            anchor = "penalty"
+        if frame is None or (anchor == "penalty" and positive_x is None):
+            return None
+        snapshot = build_radar_snapshot(players, goalkeepers, ball, positive_x, anchor=anchor)
+    if frame is None:
         return None
     box = radar_inset_box(frame.shape[1], frame.shape[0])
     if box is None:
         return None
-    snapshot = build_radar_snapshot(players, goalkeepers, ball, positive_x, anchor=anchor)
     if not snapshot["calibrated"]:
         return None
     x0, y0, radar_w, radar_h = box
@@ -537,7 +614,15 @@ def compose_pitch_radar(frame, players, ball, positive_x, goalkeepers=None, anch
     radius = max(3, radar_w // 56)
     for person in snapshot["players"]:
         color = _TEAM_BGR.get(person["team_id"], (180, 180, 180))
-        _draw_radar_dot(radar, person["map_x"], person["map_y"], pitch, color, radius)
+        _draw_radar_dot(
+            radar,
+            person["map_x"],
+            person["map_y"],
+            pitch,
+            color,
+            radius,
+            held=bool(person.get("held")),
+        )
         if person["role"] == "goalkeeper":
             px, py = _radar_pixel(person["map_x"], person["map_y"], radar_w, radar_h, pitch)
             cv2.circle(radar, (px, py), radius + 2, (7, 193, 255), 1, cv2.LINE_AA)
