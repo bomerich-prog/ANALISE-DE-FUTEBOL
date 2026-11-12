@@ -36,7 +36,10 @@ SCALE_JUMP_RATIO = 1.35
 SAME_SHOT_SCALE_RATIO = 1.08
 MIN_FRONT_WHITE = 0.50
 ARC_MAX_DISTANCE_PX = 8.0
-ARC_P90_DISTANCE_PX = 8.0
+# The painted arc is an ellipse on a broadcast frame. The belly sits on the
+# white line; the last tenth of the samples can sit a few pixels off it.
+# A circle drawn on the wrong mark lands further out than this.
+ARC_P90_DISTANCE_PX = 16.0
 PROBE_HALF_WIDTH_CM = 1200.0
 PROBE_STEP_CM = 50.0
 MAX_GOAL_DEPTH_CM = 1650.0
@@ -671,27 +674,35 @@ class VisiblePitchMap:
         self.rejected_frames = 0
         self.reasons = Counter()
 
-    def update(self, white_line_mask, frame=None, grass_mask=None):
-        report = fit_broadcast_penalty(white_line_mask, self.pitch, frame)
-        if report is not None and not scale_is_stable(self.scale, report["cm_per_px"]):
+    def _screen(self, report, white_line_mask, grass_mask):
+        if report is None:
+            return None
+        if not scale_is_stable(self.scale, report["cm_per_px"]):
             self.reasons["scale_jump"] += 1
-            report = None
-        if report is not None and grass_mask is not None and report.get("anchor") != "centre":
+            return None
+        if grass_mask is not None and report.get("anchor") != "centre":
             patch = paint_patch(
                 report["matrix"], report["positive_x"], grass_mask, white_line_mask, self.pitch
             )
             if patch is None:
                 self.reasons["off_pitch"] += 1
-                report = None
-            else:
-                report["toward_goal_cm"] = patch["toward_goal_cm"]
-                report["toward_arc_cm"] = patch["toward_arc_cm"]
+                return None
+            report["toward_goal_cm"] = patch["toward_goal_cm"]
+            report["toward_arc_cm"] = patch["toward_arc_cm"]
+        return report
+
+    def update(self, white_line_mask, frame=None, grass_mask=None):
+        bow = fit_broadcast_centre(white_line_mask, self.pitch, frame)
+        shallow = bow if bow is not None and bow.get("anchor") == "penalty" else None
+        report = self._screen(shallow, white_line_mask, grass_mask)
         if report is None:
-            centre = fit_broadcast_centre(white_line_mask, self.pitch, frame)
-            if centre is not None and scale_is_stable(self.scale, centre["cm_per_px"]):
-                report = centre
-            elif centre is not None:
-                self.reasons["scale_jump"] += 1
+            report = self._screen(
+                fit_broadcast_penalty(white_line_mask, self.pitch, frame),
+                white_line_mask,
+                grass_mask,
+            )
+        if report is None and bow is not None and bow.get("anchor") == "centre":
+            report = self._screen(bow, white_line_mask, grass_mask)
         if report is not None and self.matrix is not None and not self._agrees(report):
             self.reasons["field_jump"] += 1
             report = None

@@ -137,16 +137,12 @@ def _circle_through(points):
     return np.array([float(center_x), float(center_y)], np.float64), float(np.sqrt(radius2))
 
 
-def _painted_arc_distance(matrix, paint, positive_x):
-    """Median distance, in pixels, from the painted penalty arc to the mask.
-
-    The front line is on the paint by construction, so only the arc outside
-    the box is scored. None when that arc leaves the frame.
-    """
+def _arc_distance_stats(matrix, paint, positive_x):
+    """Median and 90th-percentile distance, in pixels, from the penalty arc to the paint."""
     try:
         inverse = np.linalg.inv(matrix).astype(np.float32)
     except np.linalg.LinAlgError:
-        return None
+        return None, None
     length = 12000.0
     front = length - _PENALTY_DEPTH_CM if positive_x else _PENALTY_DEPTH_CM
     spot = length - _SPOT_FROM_GOAL_CM if positive_x else _SPOT_FROM_GOAL_CM
@@ -165,13 +161,24 @@ def _painted_arc_distance(matrix, paint, positive_x):
         if np.isfinite(x) and np.isfinite(y) and 0 <= x < width and 0 <= y < height:
             inside.append((float(x), float(y), distance[int(y), int(x)]))
     if len(inside) < 10:
-        return None
+        return None, None
     xs = [point[0] for point in inside]
     ys = [point[1] for point in inside]
     # A handful of pixels on a sock is not the arc.
     if max(xs) - min(xs) < 70 and max(ys) - min(ys) < 70:
-        return None
-    return float(np.median([point[2] for point in inside]))
+        return None, None
+    distances = [point[2] for point in inside]
+    return float(np.median(distances)), float(np.percentile(distances, 90))
+
+
+def _painted_arc_distance(matrix, paint, positive_x):
+    """Median distance, in pixels, from the painted penalty arc to the mask.
+
+    The front line is on the paint by construction, so only the arc outside
+    the box is scored. None when that arc leaves the frame.
+    """
+    median, _spread = _arc_distance_stats(matrix, paint, positive_x)
+    return median
 
 
 def _affine_matrix(origin, along, perp, px_per_cm, front_x, width_cm, positive_x):
@@ -485,6 +492,60 @@ def _far_touchline(lines, height):
     return shallow[0]
 
 
+def _line_continues_through(paint, line, support):
+    """True when the straight paint runs past the arc on both sides.
+
+    The halfway line crosses the centre circle and keeps going. The 16.5 m line
+    is only the chord of the penalty arc, so it does not come out the other side.
+    """
+    if len(support) < 8:
+        return False
+    direction = line["direction"]
+    origin = line["origin"]
+    along = np.array([float(np.dot(point - origin, direction)) for point in support])
+    low, high = np.percentile(along, [8, 92])
+    height, width = paint.shape[:2]
+
+    def paint_beyond(distance):
+        point = origin + direction * distance
+        x = int(round(point[0]))
+        y = int(round(point[1]))
+        if not (2 <= x < width - 2 and 2 <= y < height - 2):
+            return False
+        return bool(np.count_nonzero(paint[y - 2 : y + 3, x - 2 : x + 3]))
+
+    before = any(paint_beyond(low - step) for step in (24.0, 48.0, 80.0))
+    after = any(paint_beyond(high + step) for step in (24.0, 48.0, 80.0))
+    return before and after
+
+
+def _bow_ratio(line, support, radius):
+    signed = np.array([_line_offset(point, line["origin"], line["direction"]) for point in support])
+    if len(signed) == 0:
+        return None, 0.0
+    positive = int(np.count_nonzero(signed > 0))
+    fraction = max(positive, len(signed) - positive) / len(signed)
+    bow = float(np.max(np.abs(signed))) / max(float(radius), 1.0)
+    return bow, fraction
+
+
+def _mark_kind_from_line(paint, line, support, radius):
+    """Shallow one-sided cap: penalty arc. Line through both sides: centre circle."""
+    if line is None or len(support) < 12:
+        return "unknown"
+    bow, fraction = _bow_ratio(line, support, radius)
+    if bow is None:
+        return "unknown"
+    through = _line_continues_through(paint, line, support)
+    if through and bow >= 0.65:
+        return "centre"
+    if (not through) and fraction >= 0.85:
+        return "penalty"
+    if fraction >= 0.9 and bow <= 0.55:
+        return "penalty"
+    return "unknown"
+
+
 def _label_arc(arc, lines):
     """Centre if any straight line passes through the centre. Penalty only when none does."""
     if not lines:
@@ -734,61 +795,283 @@ def _snap_center_to_line(center, radius, line, support):
     return snapped, fitted
 
 
-def fit_broadcast_centre(white_line_mask, pitch, frame=None):
-    """Image-to-field matrix from the centre circle, the halfway line and the far touchline.
+def _length_fraction(point, paint, lines):
+    """0 at one end of the visible paint, 1 at the other, along the far touchline."""
+    touch = _far_touchline(lines, paint.shape[0])
+    axis = touch["direction"] if touch is not None else np.array([1.0, 0.0], np.float64)
+    ys, xs = np.where(paint > 0)
+    if len(xs) < 30:
+        return 0.5, axis
+    coords = xs.astype(np.float64) * axis[0] + ys.astype(np.float64) * axis[1]
+    low, high = np.percentile(coords, [4, 96])
+    if high - low < 1.0:
+        return 0.5, axis
+    value = float(point[0] * axis[0] + point[1] * axis[1])
+    return float((value - low) / (high - low)), axis
 
-    A cropped centre circle still counts when its centre lies on a straight line.
-    A penalty arc is the one whose centre lies 5.5 m off its line. Two arcs are
-    split by depth: the one toward the goal is the penalty arc. The matrix is
-    kept only when the projected circle covers the white arc.
-    """
-    del frame, pitch
-    paint = _clean_paint(white_line_mask)
-    if paint is None:
-        return None
-    curved, _straight = _curvature_split(paint)
-    arcs = _component_arcs(paint, curved)
-    lines = _collect_lines(paint)
-    centre_arc, centre_line, penalty_arc = _pair_centre_and_penalty(arcs, lines, paint.shape[0])
-    if centre_arc is None or centre_arc["radius"] < 60.0 or centre_arc["span"] < 55.0:
-        return None
-    if centre_line is None:
-        nearest = None
-        for line in lines:
-            offset = abs(_line_offset(centre_arc["center"], line["origin"], line["direction"]))
-            if nearest is None or offset < nearest[0]:
-                nearest = (offset, line)
-        if nearest is None or nearest[0] > 0.4 * centre_arc["radius"]:
-            return None
-        centre_line = nearest[1]
-    support = curved[
-        np.abs(np.hypot(curved[:, 0] - centre_arc["center"][0], curved[:, 1] - centre_arc["center"][1]) - centre_arc["radius"])
-        < 6.0
-    ] if len(curved) else curved
-    if len(support) < 20:
-        support = curved
-    snapped = _snap_center_to_line(centre_arc["center"], centre_arc["radius"], centre_line, support)
-    if snapped is None:
-        center, radius = centre_arc["center"], centre_arc["radius"]
-    else:
-        center, radius = snapped
-    along, perp = _orient_centre(
-        center,
-        centre_line["direction"],
-        radius,
-        None if penalty_arc is None else penalty_arc["center"],
+
+def _spot_matrix(center, along, perp, radius, spot_x, width_cm):
+    """Image point ``center`` is the penalty spot. ``perp`` points toward increasing field x."""
+    centimetres = _ARC_RADIUS_CM / float(radius)
+    return np.array(
+        [
+            [
+                centimetres * perp[0],
+                centimetres * perp[1],
+                float(spot_x) - centimetres * float(np.dot(perp, center)),
+            ],
+            [
+                centimetres * along[0],
+                centimetres * along[1],
+                width_cm / 2.0 - centimetres * float(np.dot(along, center)),
+            ],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
     )
-    matrix = _centre_matrix(center, along, perp, radius)
-    if not centre_marks_still_on_paint(matrix, paint):
+
+
+def _penalty_from_cap(arc, line, support, paint, pitch, goal_direction):
+    """A cap toward one goal is the penalty arc. Its fitted centre is the penalty spot."""
+    del support
+    if line is None or pitch is None:
         return None
+    direction = line["direction"]
+    perp = np.array([-direction[1], direction[0]], np.float64)
+    if float(np.dot(perp, goal_direction)) < 0.0:
+        perp = -perp
+    if float(np.dot(direction, np.array([-perp[1], perp[0]]))) < 0.0:
+        direction = -direction
+    positive_x = float(goal_direction[0]) >= 0.0
+    spot_x = float(pitch.length) - _SPOT_FROM_GOAL_CM if positive_x else _SPOT_FROM_GOAL_CM
+    best = None
+    for factor in np.linspace(0.75, 1.35, 9):
+        matrix = _spot_matrix(
+            arc["center"], direction, perp, arc["radius"] * float(factor), spot_x, float(pitch.width)
+        )
+        distance = _painted_arc_distance(matrix, paint, positive_x)
+        if distance is None:
+            continue
+        if best is None or distance < best[0]:
+            best = (distance, matrix, arc["radius"] * float(factor))
+    if best is None or best[0] > 8.0:
+        return None
+    return best[1], positive_x, best[2]
+
+
+def _caps_on_line(paint, origin, direction, ratio_min, ratio_max):
+    """Bows that leave a straight line and come back to it.
+
+    The chord is measured first. ``height / (chord / 2)`` is about 0.5 for the
+    penalty arc (3.65 m of bow on a 14.6 m chord) and about 1 for a semicircle
+    whose centre sits on the line.
+    """
+    ys, xs = np.where(paint > 0)
+    if len(xs) < 40:
+        return []
+    points = np.stack([xs, ys], axis=1).astype(np.float64)
+    delta = points - origin
+    along = delta @ direction
+    offset = delta[:, 0] * direction[1] - delta[:, 1] * direction[0]
+    on_line = np.abs(offset) < 8.0
+    if int(np.count_nonzero(on_line)) < 30:
+        return []
+    low = float(np.percentile(along[on_line], 2))
+    high = float(np.percentile(along[on_line], 98))
+    step = 14.0
+    edges = np.arange(low - step, high + step, step)
+    found = []
+    for sign in (1.0, -1.0):
+        values = []
+        for edge in edges:
+            chosen = (along >= edge) & (along < edge + step) & (offset * sign > 8.0) & (offset * sign < 220.0)
+            if int(np.count_nonzero(chosen)) < 5:
+                values.append(0.0)
+            else:
+                values.append(float(np.percentile(offset[chosen] * sign, 80)))
+        values = np.asarray(values, dtype=np.float64)
+        index = 0
+        while index < len(values):
+            if values[index] < 16.0:
+                index += 1
+                continue
+            end = index
+            while end < len(values) and values[end] >= 16.0:
+                end += 1
+            segment = values[index:end]
+            peak = int(np.argmax(segment))
+            if end - index >= 4 and 0 < peak < len(segment) - 1:
+                height = float(segment.max())
+                chord = float((end - index) * step)
+                left_shoulder = float(values[index - 1]) if index > 0 else height
+                right_shoulder = float(values[end]) if end < len(values) else height
+                half = chord / 2.0
+                ratio = height / half if half > 1.0 else 99.0
+                if (
+                    left_shoulder < 0.45 * height
+                    and right_shoulder < 0.45 * height
+                    and height >= 28.0
+                    and chord >= 80.0
+                    and ratio_min <= ratio <= ratio_max
+                ):
+                    radius = (height * height + half * half) / (2.0 * height)
+                    found.append(
+                        {
+                            "sign": float(sign),
+                            "height": height,
+                            "chord": chord,
+                            "radius": float(radius),
+                            "ratio": float(ratio),
+                            "left": float(edges[index]),
+                            "right": float(edges[end - 1] + step),
+                        }
+                    )
+            index = end
+    return found
+
+
+def _goal_from_cap(direction, sign):
+    """Unit image vector from the 16.5 m line toward the penalty spot.
+
+    The painted bow is on the other side of that line, toward midfield.
+    """
+    goal = np.array([-float(direction[1]), float(direction[0])], np.float64) * float(sign)
+    norm = float(np.linalg.norm(goal))
+    if norm < 1e-6:
+        return None
+    return goal / norm
+
+
+def _same_painted_line(first, second):
+    if first is None or second is None:
+        return False
+    origin, direction = first
+    other_origin, other_direction = second
+    if abs(float(np.dot(direction, other_direction))) < np.cos(np.deg2rad(12.0)):
+        return False
+    return abs(_line_offset(origin, other_origin, other_direction)) < 18.0
+
+
+def _line_extends_past(paint, origin, direction, left, right):
+    """True when the straight paint keeps going past both ends of the bow."""
+    height, width = paint.shape[:2]
+
+    def hits(distance):
+        point = origin + direction * float(distance)
+        x = int(round(float(point[0])))
+        y = int(round(float(point[1])))
+        if not (2 <= x < width - 2 and 2 <= y < height - 2):
+            return False
+        return bool(np.count_nonzero(paint[y - 2 : y + 3, x - 2 : x + 3]))
+
+    before = any(hits(left - step) for step in (20.0, 45.0, 80.0))
+    after = any(hits(right + step) for step in (20.0, 45.0, 80.0))
+    return before and after
+
+
+def _fit_shallow_penalty(paint, pitch):
+    """Penalty arc: a shallow bow on the 16.5 m line, spot 5.5 m behind it."""
+    line = _penalty_line(paint)
+    if line is None or pitch is None:
+        return None
+    origin, direction = line
+    best = None
+    for cap in _caps_on_line(paint, origin, direction, 0.32, 0.85):
+        toward_spot = _goal_from_cap(direction, cap["sign"])
+        if toward_spot is None:
+            continue
+        # The right-hand goal is high field x. A spot on the left of its line is the other goal.
+        positive_x = bool(toward_spot[0] >= 0.0)
+        perp = toward_spot if positive_x else -toward_spot
+        along = np.array(direction, dtype=np.float64, copy=True)
+        if float(np.dot(along, np.array([-perp[1], perp[0]]))) < 0.0:
+            along = -along
+        spot_x = float(pitch.length) - _SPOT_FROM_GOAL_CM if positive_x else _SPOT_FROM_GOAL_CM
+        midpoint = 0.5 * (cap["left"] + cap["right"])
+        for foot_along in (midpoint - 24.0, midpoint, midpoint + 24.0):
+            foot = origin + direction * float(foot_along)
+            for scale in (0.9, 1.0, 1.1):
+                radius = float(cap["radius"]) * float(scale)
+                if not (70.0 <= radius <= 340.0):
+                    continue
+                spot = foot + toward_spot * (radius * _SPOT_FROM_FRONT_CM / _ARC_RADIUS_CM)
+                matrix = _spot_matrix(spot, along, perp, radius, spot_x, float(pitch.width))
+                median, spread = _arc_distance_stats(matrix, paint, positive_x)
+                if median is None or median > 8.0 or spread > 16.0:
+                    continue
+                if best is None or (median, spread) < best[0]:
+                    best = ((median, spread), matrix, positive_x, radius)
+    if best is None:
+        return None
+    _rank, matrix, positive_x, radius = best
+    return {
+        "matrix": matrix,
+        "positive_x": positive_x,
+        "anchor": "penalty",
+        "cm_per_px": _ARC_RADIUS_CM / float(radius),
+        "front_x_cm": float(pitch.length) - _PENALTY_DEPTH_CM if positive_x else _PENALTY_DEPTH_CM,
+        "has_penalty_arc": True,
+    }
+
+
+def _fit_deep_centre(paint, pitch):
+    """Centre circle: the line crosses the arc and the bow is about one radius deep."""
+    del pitch
+    penalty_line = _penalty_line(paint)
+    best = None
+    for line in _collect_lines(paint):
+        if line["length"] < 120.0:
+            continue
+        candidate = (line["origin"], line["direction"])
+        if _same_painted_line(candidate, penalty_line):
+            continue
+        for cap in _caps_on_line(paint, line["origin"], line["direction"], 0.85, 1.35):
+            if not _line_extends_past(paint, line["origin"], line["direction"], cap["left"], cap["right"]):
+                continue
+            radius = float(cap["height"])
+            if not (50.0 <= radius <= 260.0):
+                continue
+            center = line["origin"] + line["direction"] * (0.5 * (cap["left"] + cap["right"]))
+            along, perp = _orient_centre(center, line["direction"], radius, None)
+            matrix = _centre_matrix(center, along, perp, radius)
+            if not centre_marks_still_on_paint(matrix, paint):
+                continue
+            rank = (abs(cap["ratio"] - 1.0), -line["length"])
+            if best is None or rank < best[0]:
+                best = (rank, matrix, radius)
+    if best is None:
+        return None
+    _rank, matrix, radius = best
     return {
         "matrix": matrix,
         "positive_x": None,
         "anchor": "centre",
         "cm_per_px": _ARC_RADIUS_CM / float(radius),
         "front_x_cm": 6000.0,
-        "has_penalty_arc": penalty_arc is not None,
+        "has_penalty_arc": False,
     }
+
+
+def fit_broadcast_centre(white_line_mask, pitch, frame=None):
+    """Image-to-field matrix from the bow of the visible arc.
+
+    The straight line is measured first. A shallow bow on one side of the
+    16.5 m line is the penalty arc, and its centre is 5.5 m behind that line.
+    A deep bow, with the line continuing out of both sides, is the centre
+    circle even when the camera crops it. A short arc is not the centre circle
+    just because a fitted centre falls near the chord. The matrix is kept only
+    when the projected mark covers the white paint.
+    """
+    del frame
+    if pitch is None:
+        pitch = SoccerPitchConfiguration()
+    paint = _clean_paint(white_line_mask)
+    if paint is None:
+        return None
+    penalty = _fit_shallow_penalty(paint, pitch)
+    if penalty is not None:
+        return penalty
+    return _fit_deep_centre(paint, pitch)
 
 
 def _paint_points(paint):

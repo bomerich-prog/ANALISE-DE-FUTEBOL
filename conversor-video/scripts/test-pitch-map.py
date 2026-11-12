@@ -10,7 +10,11 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server/services/analysis/yolo"))
 
 from ball_heatmap import BallHeatmapAccumulator  # noqa: E402
-from pitch_homography import _label_arc, fit_broadcast_centre, fit_broadcast_penalty  # noqa: E402
+from pitch_homography import (  # noqa: E402
+    _mark_kind_from_line,
+    fit_broadcast_centre,
+    fit_broadcast_penalty,
+)
 from pitch_map import (  # noqa: E402
     RadarTrackMemory,
     VisiblePitchMap,
@@ -254,23 +258,61 @@ def test_real_penalty_paint_locks_and_a_blank_frame_keeps_it():
     assert_true(not pitch_map._agrees({"matrix": mirrored, "cm_per_px": pitch_map.scale}), "a mirrored fit is refused")
 
 
-def test_a_cropped_centre_circle_is_not_called_a_penalty_arc():
-    through = {
-        "origin": np.array([100.0, 100.0]),
+def test_a_shallow_bow_is_the_penalty_arc_and_a_deep_bow_is_the_centre():
+    shallow = paint_penalty()
+    penalty = fit_broadcast_centre(shallow, SoccerPitchConfiguration(), None)
+    assert_true(penalty is not None and penalty["anchor"] == "penalty", "a shallow bow on the 16.5 m line is the penalty arc")
+    assert_true(penalty["positive_x"] is False, "the spot sits behind that line, toward the near goal")
+    mask = np.zeros((500, 800), np.uint8)
+    radius = 90
+    center = (400, 280)
+    arc = []
+    for degree in range(8, 173, 2):
+        angle = np.deg2rad(degree)
+        arc.append((int(center[0] + radius * np.cos(angle)), int(center[1] + radius * np.sin(angle))))
+    cv2.polylines(mask, [np.array(arc, dtype=np.int32)], False, 255, 2)
+    cv2.line(mask, (30, center[1]), (770, center[1]), 255, 2)
+    cv2.line(mask, (40, 70), (760, 78), 255, 2)
+    centre = fit_broadcast_centre(mask, SoccerPitchConfiguration(), None)
+    assert_true(centre is not None and centre["anchor"] == "centre", "a deep bow crossed by the line is the centre circle")
+    inverse = np.linalg.inv(centre["matrix"]).astype(np.float32)
+    circle = np.array(
+        [(6000.0 + 915.0 * np.cos(angle), 3500.0 + 915.0 * np.sin(angle)) for angle in np.linspace(0, 2 * np.pi, 36)],
+        dtype=np.float32,
+    )
+    projected = cv2.perspectiveTransform(circle.reshape(-1, 1, 2), inverse).reshape(-1, 2)
+    painted = np.array(arc, dtype=np.float64)
+    distance = np.min(
+        np.hypot(projected[:, None, 0] - painted[None, :, 0], projected[:, None, 1] - painted[None, :, 1]),
+        axis=1,
+    )
+    assert_true(float(np.median(np.sort(distance)[:12])) < 8.0, "the projected centre circle covers the painted arc")
+
+
+def test_a_shallow_cap_on_one_side_of_the_line_is_the_penalty_arc():
+    paint = np.zeros((240, 320), np.uint8)
+    cv2.line(paint, (20, 120), (220, 120), 255, 2)
+    # The spot is 5.5 m off the 16.5 m line. The cap outside the box is only 3.6 m deep.
+    center = np.array([120.0, 103.0])
+    bow = []
+    for degree in range(40, 141, 4):
+        angle = np.deg2rad(degree)
+        bow.append((int(center[0] + 28 * np.cos(angle)), int(center[1] + 28 * np.sin(angle))))
+    cv2.polylines(paint, [np.array(bow, dtype=np.int32)], False, 255, 2)
+    line = {
+        "origin": np.array([20.0, 120.0]),
         "direction": np.array([1.0, 0.0]),
-        "length": 240.0,
+        "length": 200.0,
         "angle": 0.0,
-        "mid_y": 100.0,
+        "mid_y": 120.0,
     }
-    centre = {"center": np.array([180.0, 108.0]), "radius": 80.0, "span": 100.0, "count": 50, "error": 0.8}
-    kind, _line = _label_arc(centre, [through])
-    assert_equal(kind, "centre", "a half-circle whose centre sits on a line is the centre circle")
-    penalty = {"center": np.array([180.0, 148.0]), "radius": 80.0, "span": 110.0, "count": 40, "error": 0.9}
-    kind, _line = _label_arc(penalty, [through])
-    assert_equal(kind, "penalty", "a half-circle 5.5 m off the line is the penalty arc")
-    wide = {"center": np.array([180.0, 148.0]), "radius": 80.0, "span": 200.0, "count": 40, "error": 0.9}
-    kind, _line = _label_arc(wide, [through])
-    assert_equal(kind, "unknown", "a long arc off the line is not accepted as the penalty arc")
+    support = np.array([(x, y) for x, y in bow if y > 122], dtype=np.float64)
+    assert_true(len(support) >= 12, "the shallow cap has paint outside the line")
+    assert_equal(
+        _mark_kind_from_line(paint, line, support, 28.0),
+        "penalty",
+        "a shallow cap on one side of the line is the penalty arc",
+    )
 
 
 def test_centre_fit_covers_the_painted_arc():
@@ -282,8 +324,8 @@ def test_centre_fit_covers_the_painted_arc():
         angle = np.deg2rad(degree)
         points.append((int(center[0] + radius * np.cos(angle)), int(center[1] + radius * np.sin(angle))))
     cv2.polylines(mask, [np.array(points, dtype=np.int32)], False, 255, 2)
-    cv2.line(mask, (center[0] - 200, center[1] - 100), (center[0] + 240, center[1] + 120), 255, 2)
-    cv2.line(mask, (30, 100), (760, 112), 255, 2)
+    cv2.line(mask, (40, center[1]), (760, center[1]), 255, 2)
+    cv2.line(mask, (30, 90), (760, 102), 255, 2)
     report = fit_broadcast_centre(mask, SoccerPitchConfiguration(), None)
     assert_true(report is not None, "the painted centre arc and its line lock")
     assert_equal(report["anchor"], "centre", "the fit is the centre circle")
@@ -381,7 +423,8 @@ def main():
     test_goal_line_in_the_stands_keeps_the_grass_patch()
     test_blank_paint_publishes_nothing()
     test_real_penalty_paint_locks_and_a_blank_frame_keeps_it()
-    test_a_cropped_centre_circle_is_not_called_a_penalty_arc()
+    test_a_shallow_bow_is_the_penalty_arc_and_a_deep_bow_is_the_centre()
+    test_a_shallow_cap_on_one_side_of_the_line_is_the_penalty_arc()
     test_centre_fit_covers_the_painted_arc()
     test_radar_memory_holds_the_last_point_for_four_frames()
     test_radar_publishes_only_the_calibrated_third()
