@@ -651,6 +651,36 @@ def assign_map_coordinates(detections, pitch_map, anchor_getter):
         detection["map_y"] = float(point[1])
 
 
+def prime_visible_pitch_map(input_path, pitch_map, max_frames=150):
+    """Lock the shot from the opening frames, then keep that map for the whole clip.
+
+    The main loop starts again at frame zero. Counters from this search are cleared
+    so the report describes the clip itself. The matrix stays.
+    """
+    capture = cv2.VideoCapture(str(input_path))
+    if not capture.isOpened():
+        return False
+    try:
+        for _ in range(int(max_frames)):
+            ok, frame = capture.read()
+            if not ok:
+                break
+            grass_mask = build_grass_support_mask(frame)
+            white_line_mask = build_white_line_mask(frame, grass_mask)
+            pitch_map.update(white_line_mask, frame, grass_mask)
+            if pitch_map.locked:
+                break
+    finally:
+        capture.release()
+    if not pitch_map.locked:
+        return False
+    pitch_map.accepted_frames = 0
+    pitch_map.held_frames = 0
+    pitch_map.rejected_frames = 0
+    pitch_map.reasons = Counter()
+    return True
+
+
 def assign_field_coordinates_to_detections(detections, view_transformer, anchor_getter):
     if not detections:
         return
@@ -3257,6 +3287,7 @@ def analyze(args):
     player_stats = PlayerStatsAccumulator(fps, pitch=SOCCER_PITCH_CONFIGURATION)
     ball_heatmap = BallHeatmapAccumulator(pitch=SOCCER_PITCH_CONFIGURATION)
     visible_pitch_map = VisiblePitchMap(pitch=SOCCER_PITCH_CONFIGURATION)
+    prime_visible_pitch_map(input_path, visible_pitch_map)
     pitch_radar_live = build_radar_snapshot([], [], None, None)
     spatial_metrics = SpatialMetrics(fps=fps)
     pitch_homography_gate = PitchHomographyGate(pitch=SOCCER_PITCH_CONFIGURATION)
@@ -4529,7 +4560,13 @@ def analyze(args):
             (ball_detections, detection_center),
         ):
             assign_map_coordinates(mapped_detections, visible_pitch_map, anchor)
-        radar_anchor = visible_pitch_map.anchor if map_decision.get("accepted") else "penalty"
+        radar_anchor = (
+            "shot"
+            if map_decision.get("accepted") and visible_pitch_map.locked
+            else visible_pitch_map.anchor
+            if map_decision.get("accepted")
+            else "penalty"
+        )
         radar_positive_x = visible_pitch_map.positive_x if map_decision.get("accepted") else None
         radar_ball = ball_detections[0] if ball_detections else None
         pitch_radar_live = build_radar_snapshot(
@@ -4656,7 +4693,7 @@ def analyze(args):
             _draw_homography_debug(output_frame, homography_decision)
             if debug_frame is not None:
                 _draw_homography_debug(debug_frame, homography_decision)
-        if map_decision.get("accepted") and map_decision.get("anchor") == "centre" and map_decision.get("matrix") is not None:
+        if map_decision.get("accepted") and visible_pitch_map.anchor == "centre" and map_decision.get("matrix") is not None:
             draw_visible_centre(output_frame, map_decision["matrix"])
             if debug_frame is not None:
                 draw_visible_centre(debug_frame, map_decision["matrix"])
@@ -4738,7 +4775,7 @@ def analyze(args):
             draw_detection(output_frame, detection["box"], "Ball", confidence)
             if debug_frame is not None:
                 draw_detection(debug_frame, detection["box"], "Ball", confidence)
-        if map_decision.get("accepted") and (radar_anchor == "centre" or radar_positive_x is not None):
+        if map_decision.get("accepted") and (radar_anchor in ("shot", "centre") or radar_positive_x is not None):
             compose_pitch_radar(
                 output_frame,
                 accepted_player_detections,

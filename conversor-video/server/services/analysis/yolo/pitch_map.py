@@ -28,6 +28,7 @@ from roboflow_soccer_config import SoccerPitchConfiguration
 from roboflow_view import ViewTransformer
 
 VISIBLE_THIRD_CM = 3500.0
+MAX_FIELD_SHIFT_CM = 1200.0
 EDGE_TOLERANCE_CM = 100.0
 HOLD_FRAMES = 15
 SCALE_JUMP_RATIO = 1.35
@@ -238,10 +239,35 @@ def inside_measured(x, y, positive_x, toward_goal_cm, toward_arc_cm, pitch=None,
     return -delta <= float(toward_arc_cm) + tolerance
 
 
+def field_shift_cm(old_matrix, new_matrix):
+    """How far the same image points move on the pitch, in centimetres.
+
+    A mirrored field moves them by tens of metres. A small camera drift does not.
+    """
+    samples = np.array(
+        [(x, y) for x in (3000.0, 6000.0, 9000.0) for y in (2000.0, 3500.0, 5000.0)],
+        dtype=np.float32,
+    ).reshape(-1, 1, 2)
+    try:
+        inverse = np.linalg.inv(np.asarray(old_matrix, dtype=np.float64)).astype(np.float32)
+    except np.linalg.LinAlgError:
+        return None
+    image = cv2.perspectiveTransform(samples, inverse)
+    back = cv2.perspectiveTransform(image, np.asarray(new_matrix, dtype=np.float32)).reshape(-1, 2)
+    if not np.isfinite(back).all():
+        return None
+    original = samples.reshape(-1, 2)
+    return float(np.median(np.hypot(back[:, 0] - original[:, 0], back[:, 1] - original[:, 1])))
+
+
 def inside_visible(x, y, positive_x, pitch=None, tolerance=EDGE_TOLERANCE_CM, anchor="penalty"):
     if not np.isfinite(x) or not np.isfinite(y):
         return False
     pitch = pitch or SoccerPitchConfiguration()
+    if anchor == "shot":
+        return (-tolerance) <= float(x) <= (float(pitch.length) + tolerance) and (
+            -tolerance
+        ) <= float(y) <= (float(pitch.width) + tolerance)
     if anchor == "centre":
         half = min(VISIBLE_THIRD_CM, float(pitch.length) / 2.0)
         middle = float(pitch.length) / 2.0
@@ -308,7 +334,8 @@ def _radar_person(detection, role, positive_x, pitch, anchor="penalty"):
 def build_radar_snapshot(players, goalkeepers, ball, positive_x, pitch=None, anchor="penalty"):
     """Points the 2D panel may draw. An uncalibrated frame publishes nobody."""
     pitch = pitch or SoccerPitchConfiguration()
-    anchor = "centre" if anchor == "centre" else "penalty"
+    if anchor not in ("centre", "shot", "penalty"):
+        anchor = "penalty"
     empty = {
         "calibrated": False,
         "goal_end": None,
@@ -318,7 +345,7 @@ def build_radar_snapshot(players, goalkeepers, ball, positive_x, pitch=None, anc
         "players": [],
         "ball": None,
     }
-    if anchor != "centre" and positive_x is None:
+    if anchor == "penalty" and positive_x is None:
         return empty
     side = bool(positive_x) if positive_x is not None else False
     people = []
@@ -338,7 +365,7 @@ def build_radar_snapshot(players, goalkeepers, ball, positive_x, pitch=None, anc
             ball_point = {"map_x": round(x, 1), "map_y": round(y, 1)}
     return {
         "calibrated": True,
-        "goal_end": "centre" if anchor == "centre" else ("high_x" if positive_x else "low_x"),
+        "goal_end": "pitch" if anchor == "shot" else "centre" if anchor == "centre" else ("high_x" if positive_x else "low_x"),
         "visible_third_cm": VISIBLE_THIRD_CM,
         "field_length_cm": float(pitch.length),
         "field_width_cm": float(pitch.width),
@@ -455,9 +482,10 @@ def _draw_radar_dot(radar, x_cm, y_cm, pitch, color, radius):
 
 
 def compose_pitch_radar(frame, players, ball, positive_x, goalkeepers=None, anchor="penalty"):
-    """Paint the calibrated band in the corner. Missing coordinates leave no dot."""
-    anchor = "centre" if anchor == "centre" else "penalty"
-    if frame is None or (anchor != "centre" and positive_x is None):
+    """Paint the calibrated pitch in the corner. Missing coordinates leave no dot."""
+    if anchor not in ("centre", "shot", "penalty"):
+        anchor = "penalty"
+    if frame is None or (anchor == "penalty" and positive_x is None):
         return None
     box = radar_inset_box(frame.shape[1], frame.shape[0])
     if box is None:
@@ -470,7 +498,12 @@ def compose_pitch_radar(frame, players, ball, positive_x, goalkeepers=None, anch
     radar = np.zeros((radar_h, radar_w, 3), dtype=np.uint8)
     radar[:] = (42, 110, 48)
     third_px = max(1, int(round(radar_w * VISIBLE_THIRD_CM / float(pitch.length))))
-    if snapshot["goal_end"] == "centre":
+    label = "35 m"
+    if snapshot["goal_end"] == "pitch":
+        third_x = 0
+        third_px = radar_w
+        label = ""
+    elif snapshot["goal_end"] == "centre":
         middle = float(pitch.length) / 2.0
         left = int(round(radar_w * (middle - VISIBLE_THIRD_CM) / float(pitch.length)))
         right = int(round(radar_w * (middle + VISIBLE_THIRD_CM) / float(pitch.length)))
@@ -489,17 +522,18 @@ def compose_pitch_radar(frame, players, ball, positive_x, goalkeepers=None, anch
         radar[:, third_px:] = (radar[:, third_px:].astype(np.float32) * _RADAR_DIM).astype(np.uint8)
         third_x = 0
     _draw_radar_template(radar, pitch)
-    cv2.rectangle(radar, (third_x, 0), (third_x + third_px - 1, radar_h - 1), (0, 220, 255), 1)
-    cv2.putText(
-        radar,
-        "35 m",
-        (third_x + 4, radar_h - 6),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.35,
-        (255, 255, 255),
-        1,
-        cv2.LINE_AA,
-    )
+    if label:
+        cv2.rectangle(radar, (third_x, 0), (min(radar_w, third_x + third_px) - 1, radar_h - 1), (0, 220, 255), 1)
+        cv2.putText(
+            radar,
+            label,
+            (third_x + 4, radar_h - 6),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.35,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
     radius = max(3, radar_w // 56)
     for person in snapshot["players"]:
         color = _TEAM_BGR.get(person["team_id"], (180, 180, 180))
@@ -525,7 +559,13 @@ def compose_pitch_radar(frame, players, ball, positive_x, goalkeepers=None, anch
 
 
 class VisiblePitchMap:
-    """One penalty homography per shot, dropped as soon as the paint disagrees."""
+    """One pitch for the whole shot.
+
+    The first fit that sits on the paint locks which side of the picture is
+    which goal. Later fits may nudge that map. A fit that would throw the
+    players to the other half is ignored, and a frame with no lines keeps the
+    locked map. Players do not change ends between two frames.
+    """
 
     def __init__(self, pitch=None, hold_frames=HOLD_FRAMES):
         self.pitch = pitch or SoccerPitchConfiguration()
@@ -534,6 +574,7 @@ class VisiblePitchMap:
         self.transformer = None
         self.positive_x = None
         self.anchor = "penalty"
+        self.locked = False
         self.scale = None
         self.hold_left = 0
         self.generation = 0
@@ -566,13 +607,15 @@ class VisiblePitchMap:
                 report = centre
             elif centre is not None:
                 self.reasons["scale_jump"] += 1
+        if report is not None and self.matrix is not None and not self._agrees(report):
+            self.reasons["field_jump"] += 1
+            report = None
         if report is not None:
             return self._accept(report, grass_mask)
-        if self._still_on_paint(white_line_mask, grass_mask):
-            self.hold_left -= 1
+        if self.matrix is not None:
             self.held_frames += 1
-            self.reasons["held"] += 1
-            return self._decision(True, True, "held")
+            self.reasons["carried"] += 1
+            return self._decision(True, True, "carried")
         self._drop()
         self.rejected_frames += 1
         self.reasons["no_visible_penalty"] += 1
@@ -582,7 +625,7 @@ class VisiblePitchMap:
         """Field centimetres inside the visible third, or None past it."""
         if points is None or self.transformer is None:
             return []
-        if self.anchor != "centre" and self.positive_x is None:
+        if not self.locked and self.anchor != "centre" and self.positive_x is None:
             return []
         array = np.asarray(points, dtype=np.float32)
         if array.size == 0:
@@ -590,10 +633,11 @@ class VisiblePitchMap:
         transformed = self.transformer.transform_points(array.reshape(-1, 2))
         mapped = []
         for (image_x, image_y), (x, y) in zip(array.reshape(-1, 2), transformed):
-            if not inside_visible(float(x), float(y), self.positive_x, self.pitch, anchor=self.anchor):
+            anchor = "shot" if self.locked else self.anchor
+            if not inside_visible(float(x), float(y), self.positive_x, self.pitch, anchor=anchor):
                 mapped.append(None)
                 continue
-            if self.anchor != "centre" and not inside_measured(
+            if not self.locked and self.anchor != "centre" and not inside_measured(
                 float(x),
                 float(y),
                 self.positive_x,
@@ -611,7 +655,9 @@ class VisiblePitchMap:
 
     def metrics(self):
         goal_end = None
-        if self.anchor == "centre" and self.matrix is not None:
+        if self.locked and self.matrix is not None:
+            goal_end = "pitch"
+        elif self.anchor == "centre" and self.matrix is not None:
             goal_end = "centre"
         elif self.positive_x is True:
             goal_end = "high_x"
@@ -634,11 +680,17 @@ class VisiblePitchMap:
             "reasons": dict(self.reasons),
         }
 
+    def _agrees(self, report):
+        if not scale_is_stable(self.scale, report.get("cm_per_px"), 1.25):
+            return False
+        shift = field_shift_cm(self.matrix, report["matrix"])
+        return shift is not None and shift <= MAX_FIELD_SHIFT_CM
+
     def _accept(self, report, grass_mask):
         scale = float(report["cm_per_px"])
-        same_shot = self.matrix is not None and scale_is_stable(self.scale, scale, SAME_SHOT_SCALE_RATIO)
-        if not same_shot:
+        if not self.locked:
             self.generation += 1
+        self.locked = True
         self.matrix = report["matrix"]
         self.transformer = ViewTransformer.from_matrix(self.matrix)
         self.anchor = "centre" if report.get("anchor") == "centre" else "penalty"
@@ -682,6 +734,7 @@ class VisiblePitchMap:
         self.transformer = None
         self.positive_x = None
         self.anchor = "penalty"
+        self.locked = False
         self.scale = None
         self.toward_goal_cm = None
         self.toward_arc_cm = None
@@ -698,9 +751,11 @@ class VisiblePitchMap:
             "toward_goal_cm": self.toward_goal_cm,
             "toward_arc_cm": self.toward_arc_cm,
             "generation": self.generation if accepted else None,
-            "anchor": self.anchor if accepted else "penalty",
+            "anchor": "shot" if accepted and self.locked else (self.anchor if accepted else "penalty"),
             "goal_end": (
-                "centre"
+                "pitch"
+                if accepted and self.locked
+                else "centre"
                 if accepted and self.anchor == "centre"
                 else "high_x"
                 if self.positive_x

@@ -42,6 +42,9 @@ export function inCalibratedThird(
   if (goalEnd !== 'low_x' && goalEnd !== 'high_x') return false;
   if (x === null || y === null) return false;
   if (y < -EDGE_TOLERANCE_CM || y > width + EDGE_TOLERANCE_CM) return false;
+  if (goalEnd === 'pitch') {
+    return x >= -EDGE_TOLERANCE_CM && x <= length + EDGE_TOLERANCE_CM;
+  }
   if (goalEnd === 'centre') {
     const middle = length / 2;
     return x >= middle - third - EDGE_TOLERANCE_CM && x <= middle + third + EDGE_TOLERANCE_CM;
@@ -53,7 +56,7 @@ export function inCalibratedThird(
 export function normalizePitchRadar(source) {
   const empty = emptyPitchRadar();
   if (!source || typeof source !== 'object') return empty;
-  const goalEnd = source.goal_end === 'high_x' || source.goal_end === 'low_x' || source.goal_end === 'centre'
+  const goalEnd = source.goal_end === 'high_x' || source.goal_end === 'low_x' || source.goal_end === 'centre' || source.goal_end === 'pitch'
     ? source.goal_end
     : null;
   const calibrated = Boolean(source.calibrated) && goalEnd !== null;
@@ -142,7 +145,9 @@ export function drawPitchRadar(ctx, width, height, radar) {
   ctx.fillRect(0, 0, width, height);
   const third = (width * map.visible_third_cm) / map.field_length_cm;
   ctx.fillStyle = GRASS_DIM;
-  if (map.goal_end === 'low_x') ctx.fillRect(third, 0, width - third, height);
+  if (map.goal_end === 'pitch') {
+    // The shot is already locked. The whole template stays bright.
+  } else if (map.goal_end === 'low_x') ctx.fillRect(third, 0, width - third, height);
   else if (map.goal_end === 'high_x') ctx.fillRect(0, 0, width - third, height);
   else if (map.goal_end === 'centre') {
     const band = (width * map.visible_third_cm) / map.field_length_cm;

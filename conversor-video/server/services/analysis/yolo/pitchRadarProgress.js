@@ -18,6 +18,9 @@ function positive(value, fallback) {
 function inThird(x, y, goalEnd, length, width, third) {
   if (x === null || y === null) return false;
   if (y < -EDGE_TOLERANCE_CM || y > width + EDGE_TOLERANCE_CM) return false;
+  if (goalEnd === 'pitch') {
+    return x >= -EDGE_TOLERANCE_CM && x <= length + EDGE_TOLERANCE_CM;
+  }
   if (goalEnd === 'centre') {
     const middle = length / 2;
     return x >= middle - third - EDGE_TOLERANCE_CM && x <= middle + third + EDGE_TOLERANCE_CM;
@@ -29,7 +32,7 @@ function inThird(x, y, goalEnd, length, width, third) {
 function pitchRadarFromPayload(payload) {
   const radar = payload && payload.pitch_radar;
   if (!radar || typeof radar !== 'object') return null;
-  const goalEnd = radar.goal_end === 'high_x' || radar.goal_end === 'low_x' || radar.goal_end === 'centre'
+  const goalEnd = radar.goal_end === 'high_x' || radar.goal_end === 'low_x' || radar.goal_end === 'centre' || radar.goal_end === 'pitch'
     ? radar.goal_end
     : null;
   const calibrated = Boolean(radar.calibrated) && goalEnd !== null;

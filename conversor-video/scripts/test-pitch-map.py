@@ -16,6 +16,7 @@ from pitch_map import (  # noqa: E402
     box_matches_visible_paint,
     build_radar_snapshot,
     compose_pitch_radar,
+    field_shift_cm,
     inside_measured,
     inside_visible,
     paint_patch,
@@ -221,7 +222,7 @@ def test_blank_paint_publishes_nothing():
     assert_true(decision["matrix"] is None, "a rejected frame keeps no matrix")
 
 
-def test_real_penalty_paint_locks_and_a_blank_frame_drops_it():
+def test_real_penalty_paint_locks_and_a_blank_frame_keeps_it():
     mask = paint_penalty()
     report = fit_broadcast_penalty(mask, SoccerPitchConfiguration(), frame=None)
     if report is None:
@@ -240,11 +241,16 @@ def test_real_penalty_paint_locks_and_a_blank_frame_drops_it():
     assert_true(pitch_map.reasons["scale_jump"] >= 1, "a doubled image scale is refused")
     assert_true(refused["matrix"] is None or abs(pitch_map.scale - report["cm_per_px"]) < 1.0, "the jump does not replace the map")
     blank = np.zeros_like(mask)
-    dropped = pitch_map.update(blank)
-    if dropped["accepted"]:
-        dropped = pitch_map.update(blank)
-    assert_true(not dropped["accepted"], "a blank frame does not keep a stale matrix")
-    assert_true(dropped["matrix"] is None, "the dropped frame has no coordinates")
+    carried = pitch_map.update(blank)
+    assert_true(carried["accepted"] and carried["held"], "a blank frame keeps the locked map")
+    assert_true(carried["matrix"] is not None, "the carried frame still has coordinates")
+    assert_true(pitch_map.reasons["carried"] >= 1, "the blank frame is carried, not refit")
+    mirrored = np.array(pitch_map.matrix, dtype=np.float64).copy()
+    mirrored[0, :] *= -1.0
+    mirrored[0, 2] += 12000.0
+    shift = field_shift_cm(pitch_map.matrix, mirrored)
+    assert_true(shift is not None and shift > 1200.0, "mirroring the field moves players by more than 12 m")
+    assert_true(not pitch_map._agrees({"matrix": mirrored, "cm_per_px": pitch_map.scale}), "a mirrored fit is refused")
 
 
 def test_radar_publishes_only_the_calibrated_third():
@@ -295,7 +301,7 @@ def main():
     test_a_box_in_the_stands_is_not_published()
     test_goal_line_in_the_stands_keeps_the_grass_patch()
     test_blank_paint_publishes_nothing()
-    test_real_penalty_paint_locks_and_a_blank_frame_drops_it()
+    test_real_penalty_paint_locks_and_a_blank_frame_keeps_it()
     test_radar_publishes_only_the_calibrated_third()
     print("pitch map tests passed")
 
