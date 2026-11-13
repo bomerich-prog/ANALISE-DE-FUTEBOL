@@ -1,10 +1,12 @@
 """Project the visible penalty third, and nothing past it.
 
-The broadcast camera in this clip shows one penalty area. The fit uses the
-painted 16.5 m line and the 9.15 m arc, which fixes the scale at the penalty
-spot 5.5 m behind that line. Coordinates are published only inside the 35 m
-third of the goal that calibration is looking at. The other half of the pitch
-stays empty. Possession and passes never read this matrix.
+The fit uses the painted 16.5 m line and the 9.15 m arc, which fixes the scale
+at the penalty spot 5.5 m behind that line. Coordinates are published only
+inside the 35 m third of the goal that calibration is looking at. When that
+arc leaves the paint, the matrix is dropped and the next penalty that sits on
+the paint replaces it, even if the camera has moved to the other end. A new
+fit that flips the same line, or jumps the scale while the line stays put, is
+refused. Possession and passes never read this matrix.
 """
 
 from __future__ import annotations
@@ -25,11 +27,23 @@ from roboflow_view import ViewTransformer
 VISIBLE_THIRD_CM = 3500.0
 EDGE_TOLERANCE_CM = 100.0
 HOLD_FRAMES = 15
+# While the current arc still sits on the paint, a fit that moves the same
+# field points further than this is a rival, not a camera pan.
+MAX_FIELD_SHIFT_CM = 1200.0
+# The 16.5 m line has to travel this far in the picture before the old end
+# is allowed to give way to the other penalty.
+LINE_MOVE_PX = 140.0
+SANE_CM_MIN = 2.0
+SANE_CM_MAX = 25.0
+# A noisy frame may miss the arc by a few pixels. Past this, the line has left.
+ARC_HOLD_DISTANCE_PX = 16.0
 SCALE_JUMP_RATIO = 1.35
 SAME_SHOT_SCALE_RATIO = 1.08
 MIN_FRONT_WHITE = 0.50
 ARC_MAX_DISTANCE_PX = 8.0
-ARC_P90_DISTANCE_PX = 8.0
+# The belly of the arc has to sit on the paint. The last tenth of a broadcast
+# ellipse can sit a few pixels off it; a circle on the wrong mark lands further.
+ARC_P90_DISTANCE_PX = 14.0
 PROBE_HALF_WIDTH_CM = 1200.0
 PROBE_STEP_CM = 50.0
 MAX_GOAL_DEPTH_CM = 1650.0
@@ -46,6 +60,52 @@ def scale_is_stable(previous, new, ratio=SCALE_JUMP_RATIO):
     if previous <= 0:
         return False
     return (previous / ratio) <= new <= (previous * ratio)
+
+
+def field_shift_cm(old_matrix, new_matrix):
+    """How far the same image points move on the pitch, in centimetres.
+
+    A mirrored field moves them by tens of metres. A small camera drift does not.
+    """
+    samples = np.array(
+        [(x, y) for x in (3000.0, 6000.0, 9000.0) for y in (2000.0, 3500.0, 5000.0)],
+        dtype=np.float32,
+    ).reshape(-1, 1, 2)
+    try:
+        inverse = np.linalg.inv(np.asarray(old_matrix, dtype=np.float64)).astype(np.float32)
+    except np.linalg.LinAlgError:
+        return None
+    image = cv2.perspectiveTransform(samples, inverse)
+    back = cv2.perspectiveTransform(image, np.asarray(new_matrix, dtype=np.float32)).reshape(-1, 2)
+    if not np.isfinite(back).all():
+        return None
+    original = samples.reshape(-1, 2)
+    return float(np.median(np.hypot(back[:, 0] - original[:, 0], back[:, 1] - original[:, 1])))
+
+
+def replacement_verdict(same_side, scale_ok, shift_cm, line_move_px, coherent, sane=True):
+    """How a validated fit relates to the matrix already on screen.
+
+    A nudge stays on the same penalty. A camera move is a different line,
+    after the old arc has left the paint, and it may cross 12 m. A flip or a
+    scale jump that keeps the line in place is refused.
+    """
+    if not sane:
+        return "absurd"
+    modest = same_side and scale_ok and shift_cm is not None and shift_cm <= MAX_FIELD_SHIFT_CM
+    if modest:
+        return "nudge"
+    if coherent:
+        if not same_side:
+            return "mirrored"
+        if not scale_ok:
+            return "scale_jump"
+        return "field_jump"
+    if line_move_px is not None and line_move_px >= LINE_MOVE_PX:
+        return "camera_move"
+    if not same_side:
+        return "mirrored"
+    return "scale_jump"
 
 
 def visible_bounds(positive_x, pitch=None):
@@ -83,6 +143,17 @@ def _project_one(matrix, point):
     projected = _project_field(matrix, [point])
     if projected is None:
         return float("nan"), float("nan")
+    return float(projected[0][0]), float(projected[0][1])
+
+
+def front_image_point(matrix, positive_x, pitch=None):
+    """Where the middle of the 16.5 m line falls in the picture."""
+    if matrix is None or positive_x is None:
+        return None
+    pitch = pitch or SoccerPitchConfiguration()
+    projected = _project_field(matrix, [(_front_x(bool(positive_x), pitch), float(pitch.width) / 2.0)])
+    if projected is None:
+        return None
     return float(projected[0][0]), float(projected[0][1])
 
 
@@ -302,7 +373,13 @@ def _polyline(frame, inverse, field_points, color):
 
 
 class VisiblePitchMap:
-    """One penalty homography per shot, dropped as soon as the paint disagrees."""
+    """The penalty in frame, replaced when the camera shows a different one.
+
+    A frame whose arc still sits on the paint keeps its matrix. A fit that
+    only rescales or mirrors that same line is ignored. When the arc has left
+    the paint, the next line that lands on the white marks takes over, even
+    if that moves the field by more than 12 m.
+    """
 
     def __init__(self, pitch=None, hold_frames=HOLD_FRAMES):
         self.pitch = pitch or SoccerPitchConfiguration()
@@ -323,8 +400,8 @@ class VisiblePitchMap:
 
     def update(self, white_line_mask, frame=None, grass_mask=None):
         report = fit_broadcast_penalty(white_line_mask, self.pitch, frame)
-        if report is not None and not scale_is_stable(self.scale, report["cm_per_px"]):
-            self.reasons["scale_jump"] += 1
+        if report is not None and not (SANE_CM_MIN <= float(report["cm_per_px"]) <= SANE_CM_MAX):
+            self.reasons["absurd"] += 1
             report = None
         if report is not None and grass_mask is not None:
             patch = paint_patch(
@@ -336,9 +413,33 @@ class VisiblePitchMap:
             else:
                 report["toward_goal_cm"] = patch["toward_goal_cm"]
                 report["toward_arc_cm"] = patch["toward_arc_cm"]
+        coherent = self._geometry_holds(white_line_mask, grass_mask)
+        fresh_view = False
+        if report is not None and self.matrix is not None:
+            same_side = bool(report["positive_x"]) == bool(self.positive_x)
+            scale_ok = scale_is_stable(self.scale, report["cm_per_px"])
+            shift = field_shift_cm(self.matrix, report["matrix"])
+            verdict = replacement_verdict(
+                same_side,
+                scale_ok,
+                shift,
+                self._front_move_px(report),
+                coherent,
+            )
+            if verdict == "camera_move":
+                fresh_view = True
+                self.reasons["camera_move"] += 1
+            elif verdict != "nudge":
+                self.reasons[verdict] += 1
+                report = None
         if report is not None:
-            return self._accept(report, grass_mask)
-        if self._still_on_paint(white_line_mask, grass_mask):
+            return self._accept(report, grass_mask, fresh_view=fresh_view)
+        if coherent:
+            self.held_frames += 1
+            self.hold_left = self.hold_frames
+            self.reasons["held"] += 1
+            return self._decision(True, True, "held")
+        if self._arc_still_close(white_line_mask) and self.hold_left > 0:
             self.hold_left -= 1
             self.held_frames += 1
             self.reasons["held"] += 1
@@ -400,9 +501,13 @@ class VisiblePitchMap:
             "reasons": dict(self.reasons),
         }
 
-    def _accept(self, report, grass_mask):
+    def _accept(self, report, grass_mask, fresh_view=False):
         scale = float(report["cm_per_px"])
-        same_shot = self.matrix is not None and scale_is_stable(self.scale, scale, SAME_SHOT_SCALE_RATIO)
+        same_shot = (
+            not fresh_view
+            and self.matrix is not None
+            and scale_is_stable(self.scale, scale, SAME_SHOT_SCALE_RATIO)
+        )
         if not same_shot:
             self.generation += 1
         self.matrix = report["matrix"]
@@ -417,8 +522,16 @@ class VisiblePitchMap:
         self.reasons["accepted"] += 1
         return self._decision(True, False, "accepted")
 
-    def _still_on_paint(self, white_line_mask, grass_mask=None):
-        if self.matrix is None or self.hold_left <= 0 or self.positive_x is None:
+    def _front_move_px(self, report):
+        old = front_image_point(self.matrix, self.positive_x, self.pitch)
+        new = front_image_point(report["matrix"], report["positive_x"], self.pitch)
+        if old is None or new is None:
+            return None
+        return float(np.hypot(new[0] - old[0], new[1] - old[1]))
+
+    def _geometry_holds(self, white_line_mask, grass_mask=None):
+        """True when the current arc still lands on this frame. The hold counter is ignored."""
+        if self.matrix is None or self.positive_x is None:
             return False
         if grass_mask is not None:
             patch = paint_patch(self.matrix, self.positive_x, grass_mask, white_line_mask, self.pitch)
@@ -433,6 +546,21 @@ class VisiblePitchMap:
             return False
         distance = _painted_arc_distance(self.matrix, paint, self.positive_x)
         return distance is not None and distance <= ARC_MAX_DISTANCE_PX
+
+    def _arc_still_close(self, white_line_mask):
+        """A few pixels of miss can be noise. A line that left the frame cannot."""
+        if self.matrix is None or self.positive_x is None:
+            return False
+        paint = _clean_paint(white_line_mask)
+        if paint is None:
+            return False
+        distance = _painted_arc_distance(self.matrix, paint, self.positive_x)
+        return distance is not None and distance <= ARC_HOLD_DISTANCE_PX
+
+    def _still_on_paint(self, white_line_mask, grass_mask=None):
+        if self.hold_left <= 0:
+            return False
+        return self._geometry_holds(white_line_mask, grass_mask)
 
     def _drop(self):
         self.matrix = None

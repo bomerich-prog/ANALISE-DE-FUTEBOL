@@ -76,8 +76,29 @@ def _line_segments(paint):
     return rows
 
 
-def _penalty_line(paint):
-    """The long painted edge of the penalty area, as a point and a unit direction."""
+def _family_line(family):
+    """One collinear run, as a point and a unit direction."""
+    points = []
+    for _, _, x1, y1, x2, y2 in family:
+        points.extend(((x1, y1), (x2, y2)))
+    vx, vy, x0, y0 = cv2.fitLine(np.array(points, np.float32), cv2.DIST_L2, 0, 0.01, 0.01).reshape(-1)
+    direction = np.array([float(vx), float(vy)], np.float64)
+    norm = float(np.linalg.norm(direction))
+    if norm < 1e-6:
+        return None
+    direction /= norm
+    if direction[1] < 0:
+        direction = -direction
+    return np.array([float(x0), float(y0)], np.float64), direction
+
+
+def _penalty_lines(paint):
+    """Every long painted edge that could be a 16.5 m line, longest first.
+
+    The longest edge is often the touchline's neighbour, not the penalty
+    line in frame. Each family is scored later by how close its arc sits
+    to the paint, so a shorter true penalty can beat a longer distractor.
+    """
     families = []
     for segment in _line_segments(paint):
         length, angle, x1, y1, x2, y2 = segment
@@ -103,23 +124,25 @@ def _penalty_line(paint):
                 break
         else:
             families.append([segment])
-    if not families:
+    lines = []
+    for family in families:
+        total = sum(item[0] for item in family)
+        if total < 220:
+            continue
+        fitted = _family_line(family)
+        if fitted is None:
+            continue
+        lines.append((total, fitted[0], fitted[1]))
+    lines.sort(key=lambda item: item[0], reverse=True)
+    return [(origin, direction) for _total, origin, direction in lines]
+
+
+def _penalty_line(paint):
+    """The longest painted edge of the penalty area, as a point and a unit direction."""
+    lines = _penalty_lines(paint)
+    if not lines:
         return None
-    family = max(families, key=lambda items: sum(item[0] for item in items))
-    if sum(item[0] for item in family) < 220:
-        return None
-    points = []
-    for _, _, x1, y1, x2, y2 in family:
-        points.extend(((x1, y1), (x2, y2)))
-    vx, vy, x0, y0 = cv2.fitLine(np.array(points, np.float32), cv2.DIST_L2, 0, 0.01, 0.01).reshape(-1)
-    direction = np.array([float(vx), float(vy)], np.float64)
-    norm = float(np.linalg.norm(direction))
-    if norm < 1e-6:
-        return None
-    direction /= norm
-    if direction[1] < 0:
-        direction = -direction
-    return np.array([float(x0), float(y0)], np.float64), direction
+    return lines[0]
 
 
 def _circle_through(points):
@@ -309,42 +332,75 @@ def _goal_mouth_contradicts(post_groups, center, gap, perp, positive_x):
     return nearest is not None and nearest > 2.2 * expect
 
 
+def _side_matches_image(matrix, positive_x, width):
+    """The goal has to sit toward the edge the penalty line is already on.
+
+    A mirror of the template draws the same arc and then labels the right-hand
+    box as the left end of the pitch. That is what pins every player to one side.
+    """
+    try:
+        inverse = np.linalg.inv(np.asarray(matrix, dtype=np.float64)).astype(np.float32)
+    except np.linalg.LinAlgError:
+        return False
+    front = 12000.0 - _PENALTY_DEPTH_CM if positive_x else _PENALTY_DEPTH_CM
+    projected = cv2.perspectiveTransform(
+        np.array([[[front, 3500.0]]], np.float32),
+        inverse,
+    )
+    if projected is None or not np.isfinite(projected).all():
+        return False
+    line_x = float(projected[0, 0, 0])
+    if line_x < float(width) * 0.30:
+        return not bool(positive_x)
+    if line_x > float(width) * 0.70:
+        return bool(positive_x)
+    return True
+
+
 def fit_broadcast_penalty(white_line_mask, pitch, frame=None):
     """Image-to-field matrix from the penalty line and the arc outside it.
 
     The keypoint model on a broadcast frame labels the right-hand penalty
     marks and then draws them in open grass. The white paint still has the
     penalty line and the arc, and the spot sits 5.5m behind that line on a
-    9.15m arc. Returns None when that pair is not on the paint, or when the
-    goal posts are visible and this arc does not face them.
+    9.15m arc. Both ends of the template are scored. The one that is kept
+    points the goal toward the edge the line already sits on, so a right-hand
+    box is not published as the left end. Returns None when that pair is not
+    on the paint, or when the goal posts are visible and this arc does not
+    face them.
     """
     paint = _clean_paint(white_line_mask)
-    if paint is None:
+    if paint is None or pitch is None:
         return None
-    line = _penalty_line(paint)
-    if line is None:
+    lines = _penalty_lines(paint)
+    if not lines:
         return None
-    origin, direction = line
     post_groups = _goal_post_groups(frame)
     best = None
-    for inliers, center, _radius, _signed in _arc_candidates(paint, origin, direction):
-        foot = origin + direction * float(np.dot(center - origin, direction))
-        gap = float(np.linalg.norm(center - foot))
-        if gap < 40:
-            continue
-        perp = (center - foot) / gap
-        positive_x = float(center[0]) >= float(foot[0])
-        if _goal_mouth_contradicts(post_groups, center, gap, perp, positive_x):
-            continue
-        front_x = float(pitch.length) - _PENALTY_DEPTH_CM if positive_x else _PENALTY_DEPTH_CM
-        matrix = _affine_matrix(foot, direction, perp, gap / _SPOT_FROM_FRONT_CM, front_x, float(pitch.width), positive_x)
-        distance = _painted_arc_distance(matrix, paint, positive_x)
-        if distance is None or distance > 8.0:
-            continue
-        # The arc has to sit on the paint. Inlier count breaks the remaining ties.
-        rank = (distance, -inliers)
-        if best is None or rank < best[0]:
-            best = (rank, matrix, bool(positive_x), float(gap), float(front_x))
+    for origin, direction in lines:
+        for inliers, center, _radius, _signed in _arc_candidates(paint, origin, direction):
+            foot = origin + direction * float(np.dot(center - origin, direction))
+            gap = float(np.linalg.norm(center - foot))
+            if gap < 40:
+                continue
+            perp = (center - foot) / gap
+            natural = float(center[0]) >= float(foot[0])
+            for positive_x in (natural, not natural):
+                if _goal_mouth_contradicts(post_groups, center, gap, perp, positive_x):
+                    continue
+                front_x = float(pitch.length) - _PENALTY_DEPTH_CM if positive_x else _PENALTY_DEPTH_CM
+                matrix = _affine_matrix(
+                    foot, direction, perp, gap / _SPOT_FROM_FRONT_CM, front_x, float(pitch.width), positive_x
+                )
+                distance = _painted_arc_distance(matrix, paint, positive_x)
+                if distance is None or distance > 8.0:
+                    continue
+                if not _side_matches_image(matrix, positive_x, paint.shape[1]):
+                    continue
+                # The arc has to sit on the paint. Inlier count breaks the remaining ties.
+                rank = (distance, -inliers)
+                if best is None or rank < best[0]:
+                    best = (rank, matrix, bool(positive_x), float(gap), float(front_x))
     if best is None:
         return None
     _rank, matrix, positive_x, gap, front_x = best

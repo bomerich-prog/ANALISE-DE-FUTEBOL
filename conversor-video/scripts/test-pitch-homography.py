@@ -9,7 +9,13 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server/services/analysis/yolo"))
 
-from pitch_homography import PitchHomographyGate, line_support  # noqa: E402
+from pitch_homography import (  # noqa: E402
+    PitchHomographyGate,
+    _affine_matrix,
+    _side_matches_image,
+    fit_broadcast_penalty,
+    line_support,
+)
 from roboflow_soccer_config import SoccerPitchConfiguration  # noqa: E402
 
 
@@ -147,6 +153,48 @@ def test_support_of_the_true_matrix_is_high():
     assert_close(support, 1.0, "exact lines cover the mask", tolerance=0.05)
 
 
+def test_a_line_on_the_right_cannot_be_the_left_goal():
+    along = np.array([0.0, 1.0])
+    perp = np.array([1.0, 0.0])
+    scale = 100.0 / 550.0
+    right = _affine_matrix(np.array([1800.0, 500.0]), along, perp, scale, 12000.0 - 1650.0, 7000.0, True)
+    mirrored = _affine_matrix(np.array([1800.0, 500.0]), along, perp, scale, 1650.0, 7000.0, False)
+    assert_true(_side_matches_image(right, True, 1920), "a line on the right may be the right goal")
+    assert_true(not _side_matches_image(mirrored, False, 1920), "the same line is not the left goal")
+    left = _affine_matrix(np.array([120.0, 500.0]), along, perp, scale, 1650.0, 7000.0, False)
+    flipped = _affine_matrix(np.array([120.0, 500.0]), along, perp, scale, 12000.0 - 1650.0, 7000.0, True)
+    assert_true(_side_matches_image(left, False, 1920), "a line on the left may be the left goal")
+    assert_true(not _side_matches_image(flipped, True, 1920), "the same line is not the right goal")
+
+
+def _penalty_mask(shift, width=1920, height=1080):
+    mask = np.zeros((height, width), dtype=np.uint8)
+    start = np.array([220.0, 420.0]) + np.array(shift, dtype=np.float64)
+    end = np.array([980.0, 680.0]) + np.array(shift, dtype=np.float64)
+    direction = end - start
+    direction = direction / np.linalg.norm(direction)
+    perp = np.array([-direction[1], direction[0]])
+    center = (start + end) / 2.0 + perp * 100.0
+    radius = 100.0 * 9.15 / 5.5
+    cv2.line(mask, tuple(np.round(start).astype(int)), tuple(np.round(end).astype(int)), 255, 5)
+    base = np.arctan2(-perp[1], -perp[0])
+    points = []
+    for degrees in np.linspace(-50, 50, 70):
+        angle = base + np.deg2rad(degrees)
+        points.append(center + radius * np.array([np.cos(angle), np.sin(angle)]))
+    cv2.polylines(mask, [np.round(np.array(points)).astype(np.int32)], False, 255, 5)
+    return mask
+
+
+def test_a_right_hand_penalty_is_published_on_the_right():
+    pitch = SoccerPitchConfiguration()
+    left = fit_broadcast_penalty(_penalty_mask((0.0, 0.0)), pitch, frame=None)
+    right = fit_broadcast_penalty(_penalty_mask((800.0, 0.0)), pitch, frame=None)
+    assert_true(left is not None and left["positive_x"] is False, "the left box stays the near goal")
+    assert_true(right is not None and right["positive_x"] is True, "the right box is the far goal")
+    assert_true(right["front_x_cm"] > 8000.0, "the right box uses the far 16.5 m line")
+
+
 def main():
     cv2.setRNGSeed(0)
     test_support_of_the_true_matrix_is_high()
@@ -156,6 +204,8 @@ def main():
     test_last_good_matrix_is_kept_only_while_the_lines_still_match()
     test_hold_expires()
     test_four_points_do_not_register_the_pitch()
+    test_a_line_on_the_right_cannot_be_the_left_goal()
+    test_a_right_hand_penalty_is_published_on_the_right()
     print("pitch homography gate tests passed")
 
 

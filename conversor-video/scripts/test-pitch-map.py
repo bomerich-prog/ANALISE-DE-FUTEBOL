@@ -12,11 +12,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server/services/an
 from ball_heatmap import BallHeatmapAccumulator  # noqa: E402
 from pitch_homography import fit_broadcast_penalty  # noqa: E402
 from pitch_map import (  # noqa: E402
+    LINE_MOVE_PX,
     VisiblePitchMap,
     box_matches_visible_paint,
+    front_image_point,
     inside_measured,
     inside_visible,
     paint_patch,
+    replacement_verdict,
     scale_is_stable,
     visible_bounds,
 )
@@ -41,11 +44,11 @@ def assert_close(actual, expected, label, tolerance=1.0):
         raise AssertionError(f"{label}: expected {expected!r}, got {actual!r}")
 
 
-def paint_penalty(gap=100.0):
+def paint_penalty(gap=100.0, shift=(0.0, 0.0)):
     """Penalty line plus the arc the fitter expects 5.5 m behind it."""
     mask = np.zeros((750, 1338), dtype=np.uint8)
-    start = np.array([220.0, 300.0])
-    end = np.array([980.0, 560.0])
+    start = np.array([220.0, 300.0]) + np.array(shift, dtype=np.float64)
+    end = np.array([980.0, 560.0]) + np.array(shift, dtype=np.float64)
     direction = end - start
     direction = direction / np.linalg.norm(direction)
     perp = np.array([-direction[1], direction[0]])
@@ -218,6 +221,68 @@ def test_blank_paint_publishes_nothing():
     assert_true(decision["matrix"] is None, "a rejected frame keeps no matrix")
 
 
+def test_a_camera_move_replaces_a_matrix_that_left_the_paint():
+    pitch_map = VisiblePitchMap(hold_frames=15)
+    first = pitch_map.update(paint_penalty())
+    assert_true(first["accepted"] and not first["held"], "the opening penalty is accepted")
+    old_front = front_image_point(pitch_map.matrix, pitch_map.positive_x)
+    moved = pitch_map.update(paint_penalty(shift=(300.0, 20.0)))
+    assert_true(moved["accepted"] and not moved["held"], "the other line replaces the old matrix")
+    assert_true(pitch_map.reasons["camera_move"] >= 1, "a real change of line is not blocked at 12 m")
+    new_front = front_image_point(pitch_map.matrix, pitch_map.positive_x)
+    travel = float(np.hypot(new_front[0] - old_front[0], new_front[1] - old_front[1]))
+    assert_true(travel >= LINE_MOVE_PX, "the published line followed the paint")
+    assert_true(pitch_map.generation >= 2, "a new region does not inherit the old shot")
+    inside = pitch_map.project(np.array([[700.0, 430.0]], dtype=np.float32))
+    assert_true(inside[0] is not None, "the new penalty still publishes inside its third")
+    assert_true(inside[0][0] <= 3600.0, "the new side does not draw the other half")
+
+
+def test_a_matrix_that_left_the_paint_is_not_carried():
+    pitch_map = VisiblePitchMap(hold_frames=15)
+    assert_true(pitch_map.update(paint_penalty())["accepted"], "the penalty locks")
+    blank = np.zeros((750, 1338), dtype=np.uint8)
+    decision = None
+    for _ in range(3):
+        decision = pitch_map.update(blank)
+    assert_true(not decision["accepted"], "blank frames do not keep the old shot")
+    assert_true(decision["matrix"] is None, "the matrix is gone once the arc has left")
+    assert_true(pitch_map.reasons["no_visible_penalty"] >= 1, "the drop is recorded")
+
+
+def test_replacement_refuses_a_mirror_and_allows_a_far_camera():
+    assert_equal(
+        replacement_verdict(True, True, 400.0, 20.0, True),
+        "nudge",
+        "a few metres on the same line is the same penalty",
+    )
+    assert_equal(
+        replacement_verdict(True, True, 5000.0, 20.0, True),
+        "field_jump",
+        "12 m still blocks a teleport while the arc is on the paint",
+    )
+    assert_equal(
+        replacement_verdict(False, True, 5000.0, 30.0, True),
+        "mirrored",
+        "flipping the same line is a mirror",
+    )
+    assert_equal(
+        replacement_verdict(False, True, 400.0, 40.0, False),
+        "mirrored",
+        "a flip in place is still a mirror after the old arc slips",
+    )
+    assert_equal(
+        replacement_verdict(False, False, 8000.0, 400.0, False),
+        "camera_move",
+        "the other penalty may cross 12 m once its line has moved",
+    )
+    assert_equal(
+        replacement_verdict(True, False, 800.0, 30.0, False),
+        "scale_jump",
+        "a doubled scale on the same line is not a new camera",
+    )
+
+
 def test_real_penalty_paint_locks_and_a_blank_frame_drops_it():
     mask = paint_penalty()
     report = fit_broadcast_penalty(mask, SoccerPitchConfiguration(), frame=None)
@@ -255,6 +320,9 @@ def main():
     test_goal_line_in_the_stands_keeps_the_grass_patch()
     test_blank_paint_publishes_nothing()
     test_real_penalty_paint_locks_and_a_blank_frame_drops_it()
+    test_a_camera_move_replaces_a_matrix_that_left_the_paint()
+    test_a_matrix_that_left_the_paint_is_not_carried()
+    test_replacement_refuses_a_mirror_and_allows_a_far_camera()
     print("pitch map tests passed")
 
 
