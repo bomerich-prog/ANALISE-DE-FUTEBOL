@@ -145,9 +145,19 @@ def measure_torso(crop: np.ndarray) -> Dict[str, object]:
         & (saturation >= TORSO_YELLOW_SATURATION_MIN)
         & (value >= TORSO_YELLOW_VALUE_MIN)
     )
-    if float(yellow.mean()) >= TORSO_YELLOW_FRACTION:
+    yellow_fraction = float(yellow.mean())
+    if yellow_fraction >= TORSO_YELLOW_FRACTION:
         return _weak_torso("yellow")
     usable = ~grass
+    saturated_shirt = usable & (saturation >= TORSO_HUE_SATURATION_MIN)
+    # A partial crop of a fluorescent official is still yellow when that hue
+    # dominates the saturated pixels. A blue or red shirt keeps its own hue.
+    if (
+        yellow_fraction >= 0.18
+        and int(saturated_shirt.sum()) >= TORSO_HUE_MIN_PIXELS
+        and TORSO_YELLOW_HUE_MIN <= float(np.median(hue[saturated_shirt])) <= TORSO_YELLOW_HUE_MAX
+    ):
+        return _weak_torso("yellow")
     pixel_count = int(usable.sum())
     if pixel_count < TORSO_MIN_PIXELS:
         return _weak_torso("few_pixels")

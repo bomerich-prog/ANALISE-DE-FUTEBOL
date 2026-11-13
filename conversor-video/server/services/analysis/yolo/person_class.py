@@ -1,13 +1,15 @@
 """Lock Player, Referee and Goalkeeper labels per track.
 
 Thin posts, corner flags and incompatible boxes are rejected before a track
-exists. A confirmed player stays a player, and a confirmed referee stays a
-referee. One opposite frame does not flip the label before that confirmation.
+exists. A confirmed player stays a player until an official kit holds for
+several frames, and a confirmed referee stays a referee until a team shirt
+holds for longer than that. One opposite frame does not flip the label.
 
 Flags and sideline equipment whose box is wide enough to pass that first
 cut are removed after ByteTrack, once color, motion and pitch position agree.
-A neon yellow torso can mark an unconfirmed official. A team-colored shirt,
-including fluorescent green, cannot. At most three referee boxes are published
+A yellow or black torso can mark an official, including after the track
+already locked as a player. A team-colored shirt, including fluorescent
+green, cannot. At most three referee boxes are published
 after that choice. A goalkeeper stays a goalkeeper. The track id stays alive.
 """
 
@@ -23,6 +25,11 @@ import supervision as sv
 
 PERSON_CLASS_CONFIRM_STREAK = 3
 PERSON_CLASS_UNLOCK_STREAK = 3
+# A locked player becomes a referee only after this many consecutive official
+# frames. Raw detector flicker is not enough, and a team shirt never counts.
+PLAYER_TO_REFEREE_STREAK = 5
+# A locked referee returns to a player only after a team shirt holds this long.
+REFEREE_TO_PLAYER_STREAK = 8
 
 
 def non_person_rejection_reason(box, frame=None) -> Optional[str]:
@@ -153,10 +160,14 @@ class PersonClassLock:
 
         state["last_frame"] = frame_number
         if state["locked"] and _referee_boundary(state["class_id"], effective):
-            self.refresh_checks += 1
-            self.refresh_contradictions += 1
-            self.blocked_role_changes += 1
-            return self._finish(state)
+            return self._resolve_referee_boundary(
+                state,
+                track_id,
+                effective,
+                frame_number,
+                prefer_referee=prefer_referee,
+                referee_blocked=referee_blocked,
+            )
 
         if not state["locked"]:
             current = int(state["class_id"])
@@ -191,6 +202,8 @@ class PersonClassLock:
         if effective == int(state["class_id"]):
             self.refresh_agreements += 1
             state["contradiction_streak"] = 0
+            state["challenger_class"] = None
+            state["challenger_streak"] = 0
             return self._finish(state)
 
         self.refresh_contradictions += 1
@@ -211,6 +224,69 @@ class PersonClassLock:
         state["locked"] = False
         state["class_id"] = effective
         state["confirm_streak"] = 1
+        state["challenger_class"] = None
+        state["challenger_streak"] = 0
+        state["contradiction_streak"] = 0
+        return self._finish(state)
+
+    def _resolve_referee_boundary(
+        self,
+        state: dict,
+        track_id: int,
+        effective: int,
+        frame_number: int,
+        prefer_referee: bool,
+        referee_blocked: bool,
+    ) -> int:
+        """Let a locked role move only on sustained evidence.
+
+        Official yellow can promote a player after several consecutive frames.
+        A team shirt can release a referee after a longer run. A raw label by
+        itself cannot cross the boundary, so a coloured outfield player does
+        not flicker into a referee.
+        """
+        current = int(state["class_id"])
+        promote = (
+            current == GATE_PLAYER_CLASS_ID
+            and int(effective) == GATE_REFEREE_CLASS_ID
+            and bool(prefer_referee)
+        )
+        release = (
+            current == GATE_REFEREE_CLASS_ID
+            and int(effective) == GATE_PLAYER_CLASS_ID
+            and bool(referee_blocked)
+        )
+        self.refresh_checks += 1
+        self.refresh_contradictions += 1
+        if not promote and not release:
+            state["challenger_class"] = None
+            state["challenger_streak"] = 0
+            self.blocked_role_changes += 1
+            return self._finish(state)
+
+        needed = PLAYER_TO_REFEREE_STREAK if promote else REFEREE_TO_PLAYER_STREAK
+        challenger = state.get("challenger_class")
+        if challenger is None or int(challenger) != int(effective):
+            state["challenger_class"] = int(effective)
+            state["challenger_streak"] = 1
+        else:
+            state["challenger_streak"] = int(state.get("challenger_streak", 0)) + 1
+        if int(state["challenger_streak"]) < needed:
+            self.blocked_role_changes += 1
+            return self._finish(state)
+
+        previous_class = int(state["class_id"])
+        self.class_changes_after_lock.append(
+            {
+                "track_id": int(track_id),
+                "from_class": previous_class,
+                "to_class": int(effective),
+                "frame": int(frame_number),
+            }
+        )
+        state["class_id"] = int(effective)
+        state["locked"] = True
+        state["confirm_streak"] = int(state["challenger_streak"])
         state["challenger_class"] = None
         state["challenger_streak"] = 0
         state["contradiction_streak"] = 0
@@ -276,13 +352,13 @@ REFEREE_VOTE_MIN = 3
 REFEREE_CLEAR_FRAMES = 8
 
 YELLOW_HUE_MIN = 16
-YELLOW_HUE_MAX = 32
+YELLOW_HUE_MAX = 42
 YELLOW_SATURATION_MIN = 120
 YELLOW_VALUE_MIN = 120
-YELLOW_TORSO_MIN = 0.40
+YELLOW_TORSO_MIN = 0.30
 YELLOW_CONFIRM_FRAMES = 3
 YELLOW_CLEAR_FRAMES = 6
-NEON_GREEN_HUE_MIN = 35
+NEON_GREEN_HUE_MIN = 46
 NEON_GREEN_HUE_MAX = 75
 NEON_GREEN_SATURATION_MIN = 70
 NEON_GREEN_VALUE_MIN = 160
@@ -313,16 +389,16 @@ def _referee_boundary(current, raw) -> bool:
 
 
 def _effective_role(raw_class_id, state, referee_blocked: bool, prefer_referee: bool) -> int:
-    """A team shirt cannot open a referee role. Yellow can, until the role locks."""
+    """A team shirt cannot open a referee role. Yellow can, before and after the lock."""
     effective = int(raw_class_id)
     locked = state is not None and bool(state.get("locked"))
     locked_class = None if state is None else int(state.get("class_id"))
-    if locked and locked_class == GATE_REFEREE_CLASS_ID:
-        return effective
     if referee_blocked and effective == GATE_REFEREE_CLASS_ID:
         return GATE_PLAYER_CLASS_ID
-    if prefer_referee and not locked and effective != GATE_GOALKEEPER_CLASS_ID and not referee_blocked:
-        return GATE_REFEREE_CLASS_ID
+    goalkeeper = effective == GATE_GOALKEEPER_CLASS_ID or locked_class == GATE_GOALKEEPER_CLASS_ID
+    if prefer_referee and not goalkeeper and not referee_blocked:
+        if not locked or locked_class == GATE_PLAYER_CLASS_ID:
+            return GATE_REFEREE_CLASS_ID
     return effective
 
 PITCH_LENGTH_CM = 12000.0

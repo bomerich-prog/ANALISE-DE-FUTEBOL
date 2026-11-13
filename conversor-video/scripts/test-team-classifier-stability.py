@@ -200,6 +200,23 @@ def test_a_small_clear_shirt_votes_and_a_small_gray_shirt_does_not():
     assert_equal(measure_torso(gray)["reason"], "small", "dull color does not open the small gate")
 
 
+def test_broadcast_lime_yellow_abstains_and_team_shirts_still_vote():
+    dark = [solid_bgr(112, saturation=160, value=110) for _ in range(6)]
+    light = [solid_bgr(0, saturation=12, value=230) for _ in range(6)]
+    classifier = TeamClassifier()
+    classifier.fit(dark + light)
+    lime = solid_bgr(35, saturation=220, value=230)
+    blue = solid_bgr(112, saturation=170, value=115)
+    white = solid_bgr(0, saturation=10, value=235)
+    assert_equal(measure_torso(lime)["reason"], "yellow", "fluorescent yellow abstains")
+    assert_equal(int(classifier.predict([lime])[0]), -1, "the official receives no team")
+    assert_equal(classifier.matches_team(lime), False, "yellow does not match a team shirt")
+    assert_equal(int(classifier.predict([blue])[0]), 0, "blue stays team 0")
+    assert_equal(int(classifier.predict([white])[0]), 1, "white stays team 1")
+    assert_equal(classifier.matches_team(blue), True, "blue still matches a team")
+    assert_equal(classifier.matches_team(white), True, "white still matches a team")
+
+
 def test_weak_crops_do_not_vote():
     classifier = fit_light_and_dark()
     tiny = solid_bgr(0, saturation=10, value=210, width=8, height=20)
@@ -304,6 +321,7 @@ if __name__ == "__main__":
     test_gradual_broadcast_shirts_still_split()
     test_shadowed_white_stays_light_and_sunlit_dark_stays_dark()
     test_a_small_clear_shirt_votes_and_a_small_gray_shirt_does_not()
+    test_broadcast_lime_yellow_abstains_and_team_shirts_still_vote()
     test_weak_crops_do_not_vote()
     test_red_and_neon_green_shirts_split()
     test_one_shirt_color_does_not_count_as_two_teams()

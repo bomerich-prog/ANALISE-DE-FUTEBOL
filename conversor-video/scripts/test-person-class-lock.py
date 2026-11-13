@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server/services/an
 from person_class import (  # noqa: E402
     PERSON_CLASS_CONFIRM_STREAK,
     PERSON_CLASS_UNLOCK_STREAK,
+    PLAYER_TO_REFEREE_STREAK,
+    REFEREE_TO_PLAYER_STREAK,
     PersonClassLock,
     TrackAppearanceGate,
     appearance_profile,
@@ -868,6 +870,88 @@ def test_dark_official_is_not_dropped_as_a_corner_flag():
     assert_equal(gate.metrics()["dropped_corner_flag"], 0, "he was not counted as a flag")
 
 
+def test_broadcast_lime_yellow_is_official_and_team_shirts_are_not():
+    def shirt(hue, saturation, value):
+        image = solid_bgr(hue, saturation=saturation, value=value, width=48, height=120)
+        image[int(image.shape[0] * 0.62) :] = (20, 20, 20)
+        return image
+
+    lime = appearance_profile(shirt(35, 220, 230), [0, 0, 48, 120])
+    blue = appearance_profile(shirt(110, 180, 120), [0, 0, 48, 120])
+    white = appearance_profile(shirt(0, 12, 230), [0, 0, 48, 120])
+    green = appearance_profile(shirt(50, 140, 220), [0, 0, 48, 120])
+    assert lime["torso_yellow"] >= 0.30, lime
+    assert lime["neon_green"] < 0.22, lime
+    assert blue["torso_yellow"] < 0.40, blue
+    assert white["torso_yellow"] < 0.40, white
+    assert green["torso_yellow"] < 0.40, green
+    assert green["neon_green"] >= 0.22, green
+
+
+def test_locked_player_becomes_referee_only_after_sustained_yellow():
+    lock = PersonClassLock()
+    for frame in range(1, PERSON_CLASS_CONFIRM_STREAK + 1):
+        lock.assign(13, PLAYER, frame, verifying=False)
+    assert_equal(lock.is_locked(13), True, "player role locked first")
+    for offset in range(PLAYER_TO_REFEREE_STREAK - 1):
+        label = lock.assign(13, PLAYER, 10 + offset, verifying=True, prefer_referee=True)
+        assert_equal(label, PLAYER, "a short yellow run stays a player")
+    label = lock.assign(
+        13,
+        PLAYER,
+        10 + PLAYER_TO_REFEREE_STREAK - 1,
+        verifying=True,
+        prefer_referee=True,
+    )
+    assert_equal(label, REFEREE, "sustained yellow becomes the referee")
+    assert_equal(lock.is_locked(13), True, "the referee role stays locked")
+    assert_equal(lock.metrics()["class_changes_after_lock"], 1, "the role changed once")
+    assert_equal(
+        lock.assign(13, PLAYER, 40, verifying=True),
+        REFEREE,
+        "one later player label does not undo the referee",
+    )
+
+
+def test_a_gap_resets_the_yellow_promotion():
+    lock = PersonClassLock()
+    for frame in range(1, PERSON_CLASS_CONFIRM_STREAK + 1):
+        lock.assign(4, PLAYER, frame, verifying=False)
+    for frame in range(10, 13):
+        lock.assign(4, PLAYER, frame, verifying=True, prefer_referee=True)
+    lock.assign(4, PLAYER, 13, verifying=True, prefer_referee=False)
+    for offset in range(PLAYER_TO_REFEREE_STREAK - 1):
+        label = lock.assign(4, PLAYER, 20 + offset, verifying=True, prefer_referee=True)
+        assert_equal(label, PLAYER, "the yellow streak starts again")
+
+
+def test_team_shirt_never_becomes_a_referee():
+    lock = PersonClassLock()
+    for frame in range(1, PERSON_CLASS_CONFIRM_STREAK + 1):
+        lock.assign(7, REFEREE, frame, verifying=False, referee_blocked=True)
+    for frame in range(10, 30):
+        label = lock.assign(7, REFEREE, frame, verifying=True, referee_blocked=True)
+        assert_equal(label, PLAYER, "a team shirt the detector calls referee stays a player")
+    assert_equal(lock.metrics()["class_changes_after_lock"], 0, "team color never promotes")
+
+
+def test_a_long_team_run_can_release_a_referee():
+    lock = PersonClassLock()
+    for frame in range(1, PERSON_CLASS_CONFIRM_STREAK + 1):
+        lock.assign(8, REFEREE, frame, verifying=False)
+    for offset in range(REFEREE_TO_PLAYER_STREAK - 1):
+        label = lock.assign(8, PLAYER, 10 + offset, verifying=True, referee_blocked=True)
+        assert_equal(label, REFEREE, "a short team run keeps the referee")
+    label = lock.assign(
+        8,
+        PLAYER,
+        10 + REFEREE_TO_PLAYER_STREAK - 1,
+        verifying=True,
+        referee_blocked=True,
+    )
+    assert_equal(label, PLAYER, "a long team run returns the player")
+
+
 def test_referee_post_selection_keeps_three_and_holds_the_rest():
     candidates = [
         {
@@ -940,4 +1024,9 @@ if __name__ == "__main__":
     test_referee_vote_needs_three_labels_and_does_not_rewrite_goalkeeper()
     test_linesman_beside_flag_becomes_referee_and_players_do_not()
     test_yellow_kit_referee_spares_goalkeeper_and_outfield_kits()
+    test_broadcast_lime_yellow_is_official_and_team_shirts_are_not()
+    test_locked_player_becomes_referee_only_after_sustained_yellow()
+    test_a_gap_resets_the_yellow_promotion()
+    test_team_shirt_never_becomes_a_referee()
+    test_a_long_team_run_can_release_a_referee()
     print("person class lock tests passed")
