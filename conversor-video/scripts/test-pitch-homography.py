@@ -153,6 +153,34 @@ def test_support_of_the_true_matrix_is_high():
     assert_close(support, 1.0, "exact lines cover the mask", tolerance=0.05)
 
 
+def test_a_goal_that_steps_back_past_the_line_is_the_other_end():
+    along = np.array([0.0, 1.0])
+    width = 1338
+    # The 16.5 m line sits near the middle, so the 30/70 band does not decide.
+    # The goal has to stay on its own side of that line, apart from a small fold.
+    folded_left = _affine_matrix(
+        np.array([646.0, 331.0]), along, np.array([1.0, 0.0]), 112.0 / 1650.0, 1650.0, 7000.0, False
+    )
+    assert_true(
+        not _side_matches_image(folded_left, False, width),
+        "a middle line whose goal steps back into the picture is not the left goal",
+    )
+    small_fold = _affine_matrix(
+        np.array([646.0, 400.0]), along, np.array([-1.0, 0.0]), 55.0 / 1650.0, 12000.0 - 1650.0, 7000.0, True
+    )
+    assert_true(
+        _side_matches_image(small_fold, True, width),
+        "a goal that folds a few dozen pixels still belongs to that penalty",
+    )
+    large_fold = _affine_matrix(
+        np.array([646.0, 400.0]), along, np.array([-1.0, 0.0]), 200.0 / 1650.0, 12000.0 - 1650.0, 7000.0, True
+    )
+    assert_true(
+        not _side_matches_image(large_fold, True, width),
+        "a goal that steps well past the line is the other end",
+    )
+
+
 def test_a_line_on_the_right_cannot_be_the_left_goal():
     along = np.array([0.0, 1.0])
     perp = np.array([1.0, 0.0])
@@ -204,6 +232,7 @@ def main():
     test_last_good_matrix_is_kept_only_while_the_lines_still_match()
     test_hold_expires()
     test_four_points_do_not_register_the_pitch()
+    test_a_goal_that_steps_back_past_the_line_is_the_other_end()
     test_a_line_on_the_right_cannot_be_the_left_goal()
     test_a_right_hand_penalty_is_published_on_the_right()
     print("pitch homography gate tests passed")

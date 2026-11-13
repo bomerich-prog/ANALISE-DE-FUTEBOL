@@ -94,6 +94,24 @@ def test_heatmap_reads_the_map_channel():
     assert_equal(report["observed_points"], 1, "the map point is counted")
 
 
+def test_the_measured_strip_does_not_erase_the_visible_third():
+    pitch_map = VisiblePitchMap()
+    pitch_map.transformer = ViewTransformer.from_matrix(np.eye(3))
+    pitch_map.matrix = np.eye(3)
+    pitch_map.positive_x = False
+    pitch_map.toward_goal_cm = 200.0
+    pitch_map.toward_arc_cm = 200.0
+    deep = pitch_map.project(np.array([[2500.0, 3500.0]], dtype=np.float32))
+    assert_true(deep[0] is not None, "25 m stays on the map when the probe stopped at 2 m")
+    assert_close(deep[0][0], 2500.0, "the published point keeps its field position", tolerance=0.1)
+    assert_true(
+        not inside_measured(2500.0, 3500.0, False, 200.0, 200.0),
+        "the probe itself still marks that point as past the measured depth",
+    )
+    far = pitch_map.project(np.array([[5000.0, 3500.0]], dtype=np.float32))
+    assert_true(far[0] is None, "50 m is outside the visible third")
+
+
 def test_projection_drops_the_far_half():
     pitch_map = VisiblePitchMap()
     pitch_map.transformer = pitch_map.transformer
@@ -238,15 +256,19 @@ def test_a_camera_move_replaces_a_matrix_that_left_the_paint():
     assert_true(inside[0][0] <= 3600.0, "the new side does not draw the other half")
 
 
-def test_a_matrix_that_left_the_paint_is_not_carried():
+def test_a_short_gap_keeps_the_last_matrix_then_drops_it():
     pitch_map = VisiblePitchMap(hold_frames=15)
     assert_true(pitch_map.update(paint_penalty())["accepted"], "the penalty locks")
     blank = np.zeros((750, 1338), dtype=np.uint8)
-    decision = None
-    for _ in range(3):
+    point = np.array([[500.0, 400.0]], dtype=np.float32)
+    for _ in range(15):
         decision = pitch_map.update(blank)
-    assert_true(not decision["accepted"], "blank frames do not keep the old shot")
-    assert_true(decision["matrix"] is None, "the matrix is gone once the arc has left")
+        assert_true(decision["accepted"] and decision["held"], "a short gap keeps the last matrix")
+        assert_true(pitch_map.project(point)[0] is not None, "players stay on the map during the gap")
+    dropped = pitch_map.update(blank)
+    assert_true(not dropped["accepted"], "the bridge ends")
+    assert_true(dropped["matrix"] is None, "the matrix is gone after the gap")
+    assert_true(pitch_map.reasons["bridge"] == 15, "each gap frame is counted")
     assert_true(pitch_map.reasons["no_visible_penalty"] >= 1, "the drop is recorded")
 
 
@@ -302,10 +324,10 @@ def test_real_penalty_paint_locks_and_a_blank_frame_drops_it():
     assert_true(pitch_map.reasons["scale_jump"] >= 1, "a doubled image scale is refused")
     assert_true(refused["matrix"] is None or abs(pitch_map.scale - report["cm_per_px"]) < 1.0, "the jump does not replace the map")
     blank = np.zeros_like(mask)
-    dropped = pitch_map.update(blank)
-    if dropped["accepted"]:
+    dropped = None
+    for _ in range(pitch_map.hold_frames + 1):
         dropped = pitch_map.update(blank)
-    assert_true(not dropped["accepted"], "a blank frame does not keep a stale matrix")
+    assert_true(not dropped["accepted"], "the bridge does not keep a stale matrix")
     assert_true(dropped["matrix"] is None, "the dropped frame has no coordinates")
 
 
@@ -315,13 +337,14 @@ def main():
     test_map_coordinates_do_not_change_possession_distance()
     test_heatmap_reads_the_map_channel()
     test_projection_drops_the_far_half()
+    test_the_measured_strip_does_not_erase_the_visible_third()
     test_spatial_metrics_use_only_mapped_players()
     test_a_box_in_the_stands_is_not_published()
     test_goal_line_in_the_stands_keeps_the_grass_patch()
     test_blank_paint_publishes_nothing()
     test_real_penalty_paint_locks_and_a_blank_frame_drops_it()
     test_a_camera_move_replaces_a_matrix_that_left_the_paint()
-    test_a_matrix_that_left_the_paint_is_not_carried()
+    test_a_short_gap_keeps_the_last_matrix_then_drops_it()
     test_replacement_refuses_a_mirror_and_allows_a_far_camera()
     print("pitch map tests passed")
 

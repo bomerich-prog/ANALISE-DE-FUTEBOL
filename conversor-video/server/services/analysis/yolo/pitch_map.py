@@ -1,12 +1,12 @@
 """Project the visible penalty third, and nothing past it.
 
 The fit uses the painted 16.5 m line and the 9.15 m arc, which fixes the scale
-at the penalty spot 5.5 m behind that line. Coordinates are published only
-inside the 35 m third of the goal that calibration is looking at. When that
-arc leaves the paint, the matrix is dropped and the next penalty that sits on
-the paint replaces it, even if the camera has moved to the other end. A new
-fit that flips the same line, or jumps the scale while the line stays put, is
-refused. Possession and passes never read this matrix.
+at the penalty spot 5.5 m behind that line. Coordinates are published inside
+the 35 m third of the goal the calibration is looking at. The grass probe
+accepts or rejects that calibration. It does not erase a player or the ball
+who already land inside the third. A short gap keeps the last good matrix,
+then drops it. A new fit that flips the same line, or jumps the scale while
+the line stays put, is refused. Possession and passes never read this matrix.
 """
 
 from __future__ import annotations
@@ -35,8 +35,6 @@ MAX_FIELD_SHIFT_CM = 1200.0
 LINE_MOVE_PX = 140.0
 SANE_CM_MIN = 2.0
 SANE_CM_MAX = 25.0
-# A noisy frame may miss the arc by a few pixels. Past this, the line has left.
-ARC_HOLD_DISTANCE_PX = 16.0
 SCALE_JUMP_RATIO = 1.35
 SAME_SHOT_SCALE_RATIO = 1.08
 MIN_FRONT_WHITE = 0.50
@@ -291,7 +289,11 @@ def box_matches_visible_paint(matrix, positive_x, grass_mask, white_mask=None, p
 
 
 def inside_measured(x, y, positive_x, toward_goal_cm, toward_arc_cm, pitch=None, tolerance=EDGE_TOLERANCE_CM):
-    """True when the point stays inside the depth the grass probe verified."""
+    """True when a probe point stays inside the depth that accepted the homography.
+
+    Drawing does not call this. A player inside the visible third is published
+    even when the probe stopped short of the goal line.
+    """
     if toward_goal_cm is None or toward_arc_cm is None:
         return True
     if not np.isfinite(x) or not np.isfinite(y):
@@ -376,9 +378,9 @@ class VisiblePitchMap:
     """The penalty in frame, replaced when the camera shows a different one.
 
     A frame whose arc still sits on the paint keeps its matrix. A fit that
-    only rescales or mirrors that same line is ignored. When the arc has left
-    the paint, the next line that lands on the white marks takes over, even
-    if that moves the field by more than 12 m.
+    only rescales or mirrors that same line is ignored. A short gap keeps the
+    last good matrix, then drops it. The next line that lands on the white
+    marks takes over, even if that moves the field by more than 12 m.
     """
 
     def __init__(self, pitch=None, hold_frames=HOLD_FRAMES):
@@ -439,10 +441,11 @@ class VisiblePitchMap:
             self.hold_left = self.hold_frames
             self.reasons["held"] += 1
             return self._decision(True, True, "held")
-        if self._arc_still_close(white_line_mask) and self.hold_left > 0:
+        # A few bad frames keep the last good matrix. The counter does not refill.
+        if self.matrix is not None and self.hold_left > 0:
             self.hold_left -= 1
             self.held_frames += 1
-            self.reasons["held"] += 1
+            self.reasons["bridge"] += 1
             return self._decision(True, True, "held")
         self._drop()
         self.rejected_frames += 1
@@ -450,7 +453,11 @@ class VisiblePitchMap:
         return self._decision(False, False, "no_visible_penalty")
 
     def project(self, points):
-        """Field centimetres inside the visible third, or None past it."""
+        """Field centimetres inside the visible third, or None past it.
+
+        The grass probe already accepted this matrix. A point on the grass
+        inside that third is published. The probe depth is not a second cut.
+        """
         if points is None or self.transformer is None or self.positive_x is None:
             return []
         array = np.asarray(points, dtype=np.float32)
@@ -460,16 +467,6 @@ class VisiblePitchMap:
         mapped = []
         for (image_x, image_y), (x, y) in zip(array.reshape(-1, 2), transformed):
             if not inside_visible(float(x), float(y), self.positive_x, self.pitch):
-                mapped.append(None)
-                continue
-            if not inside_measured(
-                float(x),
-                float(y),
-                self.positive_x,
-                self.toward_goal_cm,
-                self.toward_arc_cm,
-                self.pitch,
-            ):
                 mapped.append(None)
                 continue
             if self.grass is not None and _classify_pixel(float(image_x), float(image_y), self.grass) != "grass":
@@ -546,16 +543,6 @@ class VisiblePitchMap:
             return False
         distance = _painted_arc_distance(self.matrix, paint, self.positive_x)
         return distance is not None and distance <= ARC_MAX_DISTANCE_PX
-
-    def _arc_still_close(self, white_line_mask):
-        """A few pixels of miss can be noise. A line that left the frame cannot."""
-        if self.matrix is None or self.positive_x is None:
-            return False
-        paint = _clean_paint(white_line_mask)
-        if paint is None:
-            return False
-        distance = _painted_arc_distance(self.matrix, paint, self.positive_x)
-        return distance is not None and distance <= ARC_HOLD_DISTANCE_PX
 
     def _still_on_paint(self, white_line_mask, grass_mask=None):
         if self.hold_left <= 0:

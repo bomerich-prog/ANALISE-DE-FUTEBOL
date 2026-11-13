@@ -343,17 +343,25 @@ def _side_matches_image(matrix, positive_x, width):
     except np.linalg.LinAlgError:
         return False
     front = 12000.0 - _PENALTY_DEPTH_CM if positive_x else _PENALTY_DEPTH_CM
+    goal = 12000.0 if positive_x else 0.0
     projected = cv2.perspectiveTransform(
-        np.array([[[front, 3500.0]]], np.float32),
+        np.array([[[front, 3500.0], [goal, 3500.0]]], np.float32),
         inverse,
     )
     if projected is None or not np.isfinite(projected).all():
         return False
     line_x = float(projected[0, 0, 0])
+    goal_x = float(projected[0, 1, 0])
     if line_x < float(width) * 0.30:
         return not bool(positive_x)
     if line_x > float(width) * 0.70:
         return bool(positive_x)
+    # A small fold near the edge is normal. A goal that steps well past the
+    # 16.5 m line, back into the picture, is the other end of the pitch.
+    if positive_x and goal_x < line_x - 80.0:
+        return False
+    if not positive_x and goal_x > line_x + 80.0:
+        return False
     return True
 
 
