@@ -10,13 +10,22 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server/services/analysis/yolo"))
 
 from ball_heatmap import BallHeatmapAccumulator  # noqa: E402
-from pitch_homography import fit_broadcast_penalty  # noqa: E402
+from pitch_homography import (  # noqa: E402
+    _mark_kind_from_line,
+    fit_broadcast_centre,
+    fit_broadcast_penalty,
+)
 from pitch_map import (  # noqa: E402
+    RadarTrackMemory,
     VisiblePitchMap,
     box_matches_visible_paint,
+    build_radar_snapshot,
+    compose_pitch_radar,
+    field_shift_cm,
     inside_measured,
     inside_visible,
     paint_patch,
+    radar_inset_box,
     scale_is_stable,
     visible_bounds,
 )
@@ -218,7 +227,7 @@ def test_blank_paint_publishes_nothing():
     assert_true(decision["matrix"] is None, "a rejected frame keeps no matrix")
 
 
-def test_real_penalty_paint_locks_and_a_blank_frame_drops_it():
+def test_real_penalty_paint_locks_and_a_blank_frame_keeps_it():
     mask = paint_penalty()
     report = fit_broadcast_penalty(mask, SoccerPitchConfiguration(), frame=None)
     if report is None:
@@ -237,11 +246,170 @@ def test_real_penalty_paint_locks_and_a_blank_frame_drops_it():
     assert_true(pitch_map.reasons["scale_jump"] >= 1, "a doubled image scale is refused")
     assert_true(refused["matrix"] is None or abs(pitch_map.scale - report["cm_per_px"]) < 1.0, "the jump does not replace the map")
     blank = np.zeros_like(mask)
-    dropped = pitch_map.update(blank)
-    if dropped["accepted"]:
-        dropped = pitch_map.update(blank)
-    assert_true(not dropped["accepted"], "a blank frame does not keep a stale matrix")
-    assert_true(dropped["matrix"] is None, "the dropped frame has no coordinates")
+    carried = pitch_map.update(blank)
+    assert_true(carried["accepted"] and carried["held"], "a blank frame keeps the locked map")
+    assert_true(carried["matrix"] is not None, "the carried frame still has coordinates")
+    assert_true(pitch_map.reasons["carried"] >= 1, "the blank frame is carried, not refit")
+    mirrored = np.array(pitch_map.matrix, dtype=np.float64).copy()
+    mirrored[0, :] *= -1.0
+    mirrored[0, 2] += 12000.0
+    shift = field_shift_cm(pitch_map.matrix, mirrored)
+    assert_true(shift is not None and shift > 1200.0, "mirroring the field moves players by more than 12 m")
+    assert_true(not pitch_map._agrees({"matrix": mirrored, "cm_per_px": pitch_map.scale}), "a mirrored fit is refused")
+
+
+def test_a_shallow_bow_is_the_penalty_arc_and_a_deep_bow_is_the_centre():
+    shallow = paint_penalty()
+    penalty = fit_broadcast_centre(shallow, SoccerPitchConfiguration(), None)
+    assert_true(penalty is not None and penalty["anchor"] == "penalty", "a shallow bow on the 16.5 m line is the penalty arc")
+    assert_true(penalty["positive_x"] is False, "the spot sits behind that line, toward the near goal")
+    mask = np.zeros((500, 800), np.uint8)
+    radius = 90
+    center = (400, 280)
+    arc = []
+    for degree in range(8, 173, 2):
+        angle = np.deg2rad(degree)
+        arc.append((int(center[0] + radius * np.cos(angle)), int(center[1] + radius * np.sin(angle))))
+    cv2.polylines(mask, [np.array(arc, dtype=np.int32)], False, 255, 2)
+    cv2.line(mask, (30, center[1]), (770, center[1]), 255, 2)
+    cv2.line(mask, (40, 70), (760, 78), 255, 2)
+    centre = fit_broadcast_centre(mask, SoccerPitchConfiguration(), None)
+    assert_true(centre is not None and centre["anchor"] == "centre", "a deep bow crossed by the line is the centre circle")
+    inverse = np.linalg.inv(centre["matrix"]).astype(np.float32)
+    circle = np.array(
+        [(6000.0 + 915.0 * np.cos(angle), 3500.0 + 915.0 * np.sin(angle)) for angle in np.linspace(0, 2 * np.pi, 36)],
+        dtype=np.float32,
+    )
+    projected = cv2.perspectiveTransform(circle.reshape(-1, 1, 2), inverse).reshape(-1, 2)
+    painted = np.array(arc, dtype=np.float64)
+    distance = np.min(
+        np.hypot(projected[:, None, 0] - painted[None, :, 0], projected[:, None, 1] - painted[None, :, 1]),
+        axis=1,
+    )
+    assert_true(float(np.median(np.sort(distance)[:12])) < 8.0, "the projected centre circle covers the painted arc")
+
+
+def test_a_shallow_cap_on_one_side_of_the_line_is_the_penalty_arc():
+    paint = np.zeros((240, 320), np.uint8)
+    cv2.line(paint, (20, 120), (220, 120), 255, 2)
+    # The spot is 5.5 m off the 16.5 m line. The cap outside the box is only 3.6 m deep.
+    center = np.array([120.0, 103.0])
+    bow = []
+    for degree in range(40, 141, 4):
+        angle = np.deg2rad(degree)
+        bow.append((int(center[0] + 28 * np.cos(angle)), int(center[1] + 28 * np.sin(angle))))
+    cv2.polylines(paint, [np.array(bow, dtype=np.int32)], False, 255, 2)
+    line = {
+        "origin": np.array([20.0, 120.0]),
+        "direction": np.array([1.0, 0.0]),
+        "length": 200.0,
+        "angle": 0.0,
+        "mid_y": 120.0,
+    }
+    support = np.array([(x, y) for x, y in bow if y > 122], dtype=np.float64)
+    assert_true(len(support) >= 12, "the shallow cap has paint outside the line")
+    assert_equal(
+        _mark_kind_from_line(paint, line, support, 28.0),
+        "penalty",
+        "a shallow cap on one side of the line is the penalty arc",
+    )
+
+
+def test_centre_fit_covers_the_painted_arc():
+    mask = np.zeros((500, 800), np.uint8)
+    center = (460, 300)
+    radius = 80
+    points = []
+    for degree in range(15, 165, 2):
+        angle = np.deg2rad(degree)
+        points.append((int(center[0] + radius * np.cos(angle)), int(center[1] + radius * np.sin(angle))))
+    cv2.polylines(mask, [np.array(points, dtype=np.int32)], False, 255, 2)
+    cv2.line(mask, (40, center[1]), (760, center[1]), 255, 2)
+    cv2.line(mask, (30, 90), (760, 102), 255, 2)
+    report = fit_broadcast_centre(mask, SoccerPitchConfiguration(), None)
+    assert_true(report is not None, "the painted centre arc and its line lock")
+    assert_equal(report["anchor"], "centre", "the fit is the centre circle")
+    inverse = np.linalg.inv(report["matrix"]).astype(np.float32)
+    circle = np.array(
+        [
+            (6000.0 + 915.0 * np.cos(angle), 3500.0 + 915.0 * np.sin(angle))
+            for angle in np.linspace(0, 2 * np.pi, 36)
+        ],
+        dtype=np.float32,
+    )
+    projected = cv2.perspectiveTransform(circle.reshape(-1, 1, 2), inverse).reshape(-1, 2)
+    distance = np.min(np.hypot(projected[:, None, 0] - np.array(points)[None, :, 0], projected[:, None, 1] - np.array(points)[None, :, 1]), axis=1)
+    assert_true(float(np.median(np.sort(distance)[:12])) < 8.0, "the projected circle covers the painted arc")
+
+
+def test_radar_memory_holds_the_last_point_for_four_frames():
+    memory = RadarTrackMemory()
+    seen = {"track_id": 10, "map_x": 1000.0, "map_y": 2000.0, "team_id": 0, "role": "player"}
+    first = memory.observe([seen])
+    assert_equal(first[0]["held"], False, "a live detection is not a held point")
+    assert_equal(seen["map_x"], 1000.0, "the detection dict is not rewritten")
+    for gap in range(1, 5):
+        held = memory.observe([])
+        assert_equal(len(held), 1, f"gap {gap} still draws the player")
+        assert_equal(held[0]["held"], True, "the repeated point is marked as held")
+        assert_equal(held[0]["map_x"], 1000.0, "the point stays on the last coordinate")
+        assert_equal(held[0]["map_y"], 2000.0, "the point is not moved")
+        assert_equal(held[0]["track_id"], 10, "the hold keeps the same track")
+    assert_equal(memory.observe([]), [], "the fifth miss removes the point")
+    returned = memory.observe([
+        {"track_id": 10, "map_x": 1400.0, "map_y": 2100.0, "team_id": 0, "role": "player"},
+    ])
+    assert_equal(returned[0]["map_x"], 1400.0, "the same track takes the new detection")
+    assert_equal(returned[0]["held"], False, "a new detection clears the hold")
+    mixed = memory.observe([
+        {"track_id": 40, "map_x": 8000.0, "map_y": 3000.0, "team_id": 1, "role": "player"},
+    ])
+    by_id = {row["track_id"]: row for row in mixed}
+    assert_equal(by_id[40]["map_x"], 8000.0, "a new track starts at its own detection")
+    assert_equal(by_id[40]["held"], False, "a new track is not tied to the old one")
+    assert_equal(by_id[10]["held"], True, "the old track is only held, not moved to the new id")
+    assert_equal(by_id[10]["map_x"], 1400.0, "the old track keeps the position it last owned")
+    anonymous = RadarTrackMemory()
+    anonymous.observe([{"track_id": -1, "map_x": 500.0, "map_y": 500.0, "team_id": 0, "role": "player"}])
+    assert_equal(anonymous.observe([]), [], "a missing track id is not remembered")
+
+
+def test_radar_publishes_only_the_calibrated_third():
+    players = [
+        {"map_x": 1000.0, "map_y": 3500.0, "team_id": 0},
+        {"map_x": 6000.0, "map_y": 3500.0, "team_id": 1},
+        {"map_x": None, "map_y": None, "team_id": 0},
+    ]
+    keepers = [{"map_x": 400.0, "map_y": 3400.0, "team_id": 0}]
+    ball = {"map_x": 1500.0, "map_y": 3000.0, "source": "observed"}
+    remembered = {"map_x": 1600.0, "map_y": 3000.0, "source": "remembered"}
+    snapshot = build_radar_snapshot(players, keepers, ball, False)
+    assert_equal(snapshot["goal_end"], "low_x", "the near goal names the third")
+    assert_equal(len(snapshot["players"]), 2, "the midfield player and the empty point stay off")
+    assert_equal(snapshot["players"][1]["role"], "goalkeeper", "the keeper keeps a role")
+    assert_equal(snapshot["ball"]["map_x"], 1500.0, "the observed ball is on the map")
+    assert_true(build_radar_snapshot(players, keepers, remembered, False)["ball"] is None, "a remembered ball is not dragged onto the map")
+    assert_true(not build_radar_snapshot(players, keepers, ball, None)["calibrated"], "no matrix publishes nobody")
+    blank = np.zeros((480, 854, 3), dtype=np.uint8)
+    assert_true(compose_pitch_radar(blank, players, ball, None) is None, "an uncalibrated frame draws nothing")
+    assert_equal(int(blank.sum()), 0, "the uncalibrated frame stays empty")
+    near = blank.copy()
+    far = blank.copy()
+    compose_pitch_radar(near, [players[0]], ball, False, goalkeepers=keepers)
+    compose_pitch_radar(far, [players[1]], None, False)
+    assert_true(int(near.sum()) > 0, "the calibrated third is drawn")
+    assert_true(not np.array_equal(near, far), "a dot inside the third changes the radar")
+    template = blank.copy()
+    compose_pitch_radar(template, [], None, False)
+    assert_true(np.array_equal(far, template), "a point outside the third adds no dot")
+    x0, y0, radar_w, radar_h = radar_inset_box(854, 480)
+
+    def grass_at(x_cm, y_cm):
+        px = int(round(x_cm / 12000.0 * (radar_w - 1)))
+        py = int(round(y_cm / 7000.0 * (radar_h - 1)))
+        return near[y0 + py, x0 + px]
+
+    assert_true(int(grass_at(800, 1000).sum()) > int(grass_at(8000, 1000).sum()), "the far half of the radar is dimmer")
 
 
 def main():
@@ -254,7 +422,12 @@ def main():
     test_a_box_in_the_stands_is_not_published()
     test_goal_line_in_the_stands_keeps_the_grass_patch()
     test_blank_paint_publishes_nothing()
-    test_real_penalty_paint_locks_and_a_blank_frame_drops_it()
+    test_real_penalty_paint_locks_and_a_blank_frame_keeps_it()
+    test_a_shallow_bow_is_the_penalty_arc_and_a_deep_bow_is_the_centre()
+    test_a_shallow_cap_on_one_side_of_the_line_is_the_penalty_arc()
+    test_centre_fit_covers_the_painted_arc()
+    test_radar_memory_holds_the_last_point_for_four_frames()
+    test_radar_publishes_only_the_calibrated_third()
     print("pitch map tests passed")
 
 

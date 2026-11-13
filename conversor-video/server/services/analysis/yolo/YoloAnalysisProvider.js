@@ -8,6 +8,7 @@ const { passProgressFromPayload } = require('./passProgress');
 const { possessionProgressFromPayload } = require('./possessionProgress');
 const { playerStatsFromPayload } = require('./playerStatsProgress');
 const { ballHeatmapFromPayload } = require('./ballHeatmapProgress');
+const { pitchRadarFromPayload } = require('./pitchRadarProgress');
 const { resolvePythonCached } = require('./pythonResolver');
 
 const WINDOWS_STORE_ALIAS_HINT =
@@ -152,6 +153,8 @@ class YoloAnalysisProvider extends AnalysisProvider {
           if (payload.pitch_map && typeof payload.pitch_map === 'object') {
             details.progress_stats.pitch_map = payload.pitch_map;
           }
+          const pitchRadar = pitchRadarFromPayload(payload);
+          if (pitchRadar) details.progress_stats.pitch_radar = pitchRadar;
           if (payload.debugFrameUpdated) {
             details.progress_stats.debug_frame_url = `/api/analyses/${analysisId}/debug-frame?t=${Date.now()}`;
             if (payload.debugFrameJpeg) {

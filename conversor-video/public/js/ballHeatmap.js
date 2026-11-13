@@ -9,6 +9,7 @@ const PENALTY_BOX_WIDTH_CM = 4100;
 const GOAL_BOX_LENGTH_CM = 550;
 const GOAL_BOX_WIDTH_CM = 1832;
 const CENTRE_CIRCLE_RADIUS_CM = 915;
+const VISIBLE_THIRD_CM = 3500;
 
 const LOW_COLOR = [255, 235, 59];
 const MID_COLOR = [255, 152, 0];
@@ -198,16 +199,23 @@ export function drawBallHeatmap(ctx, width, height, heatmap) {
   return painted;
 }
 
+export function visibleThirdRect(width, goalEnd, length = DEFAULT_LENGTH_CM, third = VISIBLE_THIRD_CM) {
+  if (goalEnd !== 'high_x' && goalEnd !== 'low_x') return null;
+  const span = (width * third) / length;
+  const x = goalEnd === 'high_x' ? width - span : 0;
+  return { x, width: span };
+}
+
 export function drawVisibleThird(ctx, width, height, goalEnd) {
-  if (!ctx || (goalEnd !== 'high_x' && goalEnd !== 'low_x')) return;
-  const third = width / 3;
-  const x = goalEnd === 'high_x' ? width - third : 0;
+  const rect = visibleThirdRect(width, goalEnd);
+  if (!ctx || !rect) return rect;
   ctx.save();
   ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
   ctx.setLineDash([7, 5]);
   ctx.lineWidth = 2;
-  ctx.strokeRect(x + 2, 2, third - 4, height - 4);
+  ctx.strokeRect(rect.x + 2, 2, Math.max(0, rect.width - 4), height - 4);
   ctx.restore();
+  return rect;
 }
 
 export function drawPlayerHeat(ctx, width, height, heatmap) {

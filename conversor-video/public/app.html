@@ -464,7 +464,7 @@
 
       <section class="analysis-insights" aria-label="Detalhes da análise">
         <div class="analysis-tabs" role="tablist" aria-label="Detalhes da análise">
-          <button type="button" class="analysis-tab active" id="analysisTabHeatmap" role="tab" aria-selected="true" aria-controls="analysisHeatmapPanel">Mapa da bola</button>
+          <button type="button" class="analysis-tab active" id="analysisTabHeatmap" role="tab" aria-selected="true" aria-controls="analysisHeatmapPanel">Mapa</button>
           <button type="button" class="analysis-tab" id="analysisTabPlayers" role="tab" aria-selected="false" aria-controls="analysisPlayersPanel">Jogadores</button>
         </div>
 
@@ -478,9 +478,20 @@
           </div>
         </div>
         <div class="analysis-heatmap-body">
-          <div class="analysis-heatmap-pitch">
-            <canvas id="ballHeatmapCanvas" width="720" height="420" role="img" aria-label="Mapa de calor das posições observadas da bola no campo"></canvas>
-            <p class="analysis-heatmap-empty" id="ballHeatmapEmpty">Aguardando bola no terço visível do campo.</p>
+          <div class="analysis-map-stack">
+            <div>
+              <p class="analysis-map-caption">Mapa 2D
+                <span class="analysis-map-legend"><i class="team-0"></i> Team 0 <i class="team-1"></i> Team 1 <i class="ball"></i> Bola</span>
+              </p>
+              <div class="analysis-heatmap-pitch">
+                <canvas id="pitchRadarCanvas" width="720" height="420" role="img" aria-label="Mapa 2D dos jogadores e da bola no terço calibrado da grande área"></canvas>
+                <p class="analysis-heatmap-empty" id="pitchRadarEmpty">Aguardando a grande área visível.</p>
+              </div>
+            </div>
+            <div class="analysis-heatmap-pitch">
+              <canvas id="ballHeatmapCanvas" width="720" height="420" role="img" aria-label="Mapa de calor das posições observadas da bola no campo"></canvas>
+              <p class="analysis-heatmap-empty" id="ballHeatmapEmpty">Aguardando bola no terço visível do campo.</p>
+            </div>
           </div>
           <div class="analysis-heatmap-stats">
             <article>
