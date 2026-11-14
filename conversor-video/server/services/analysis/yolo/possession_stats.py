@@ -1,11 +1,21 @@
 """Count frames already confirmed by PossessionEngine, split by team.
 
-This does not decide possession. It tallies the team on each snapshot.
-A gap with no possessor stays empty until the pass detector appends a
-confirmed pass for the same team. That one event moves the open gap once.
+This does not decide who has the ball. It only tallies the team already
+on each snapshot. An open gap stays empty until one of two closings:
+
+- the same team is confirmed again and the gap lasts at most
+  SAME_TEAM_GAP_FILL_SECONDS;
+- a confirmed pass of that same team closes the gap, including a flight
+  longer than that window.
+
+A different team, a longer gap with no pass, and a gap still open when
+the clip ends stay without a possessor. The move happens once.
 """
 
 from __future__ import annotations
+
+
+SAME_TEAM_GAP_FILL_SECONDS = 1.0
 
 
 class PossessionTeamAccumulator:
@@ -40,16 +50,24 @@ class PossessionTeamAccumulator:
                 self._open_frames += 1
             return self.as_dict()
 
-        if (
-            self._open_frames
-            and confirmed_pass_team == self._open_team
-            and confirmed_pass_team in {"Team 0", "Team 1"}
-        ):
-            self._reassign(confirmed_pass_team, self._open_frames)
+        assignee = self._gap_assignee(team, confirmed_pass_team)
+        if assignee is not None:
+            self._reassign(assignee, self._open_frames)
         self._open_team = None
         self._open_frames = 0
         self._last_team = team
         return self.as_dict()
+
+    def _gap_assignee(self, closing_team, confirmed_pass_team):
+        if self._open_frames <= 0 or self._open_team not in {"Team 0", "Team 1"}:
+            return None
+        if confirmed_pass_team == self._open_team:
+            return self._open_team
+        if closing_team != self._open_team:
+            return None
+        if (self._open_frames / self.fps) > SAME_TEAM_GAP_FILL_SECONDS:
+            return None
+        return self._open_team
 
     def _take_new_pass_team(self, pass_events):
         events = list(pass_events or [])
