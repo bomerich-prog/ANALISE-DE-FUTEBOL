@@ -24,6 +24,9 @@ from pitch_map import (  # noqa: E402
     paint_patch,
     penalty_corners,
     replacement_verdict,
+    side_from_corner,
+    _line_ends,
+    _line_frame,
     scale_is_stable,
     visible_bounds,
     _width_terms,
@@ -174,6 +177,118 @@ def test_uneven_corners_move_the_width_and_keep_the_arc_scale():
         penalty_corners(drifting, drift_matrix, True, 7.0) is None,
         "a line that keeps going is not a corner",
     )
+
+
+def _paint_ridge(frame, start, end, value=155):
+    cv2.line(
+        frame,
+        tuple(np.round(start).astype(int)),
+        tuple(np.round(end).astype(int)),
+        (value, value, value),
+        3,
+    )
+
+
+def test_the_side_ridge_sets_the_width_and_keeps_the_depth():
+    mask, matrix, _foot, _along = _uneven_penalty()
+    found = penalty_corners(mask, matrix, True, 7.0)
+    _foot, along, perp = _line_frame(matrix, True, SoccerPitchConfiguration())
+    theta = np.radians(40.0)
+    direction = np.cos(theta) * along + np.sin(theta) * perp
+    direction = direction / np.linalg.norm(direction)
+    corner = np.asarray(found["corner_low"], dtype=np.float64)
+    frame = np.full((750, 1338, 3), 100, np.uint8)
+    grass = np.full((750, 1338), 255, np.uint8)
+    _paint_ridge(frame, corner, corner + direction * 210.0)
+    board = np.round(corner + direction * 260.0).astype(int)
+    cv2.circle(frame, tuple(board), 28, (230, 230, 230), -1)
+    cv2.circle(grass, tuple(board), 28, 0, -1)
+    pitch_map = VisiblePitchMap()
+    pitch_map.matrix = matrix
+    pitch_map.transformer = ViewTransformer.from_matrix(matrix)
+    pitch_map.positive_x = True
+    pitch_map.region = "penalty"
+    pitch_map.scale = 7.0
+    pitch_map.toward_goal_cm = 400.0
+    pitch_map.grass = grass
+    decision = pitch_map._publish(pitch_map._decision(True, False, "accepted"), mask, frame)
+    assert_true(decision["side_lines"] is not None and len(decision["side_lines"]) == 2, "one painted side is copied to the other corner")
+    traced = decision["side_lines"][0]
+    copied = decision["side_lines"][1]
+    traced_dir = np.array(traced[1]) - np.array(traced[0])
+    copied_dir = np.array(copied[1]) - np.array(copied[0])
+    traced_dir = traced_dir / np.linalg.norm(traced_dir)
+    copied_dir = copied_dir / np.linalg.norm(copied_dir)
+    assert_true(float(np.dot(traced_dir, direction)) > 0.99, "the ink follows the painted side")
+    assert_true(float(np.dot(copied_dir, traced_dir)) > 0.99, "the other side keeps that same angle")
+    assert_true(
+        float(np.linalg.norm(np.array(traced[1]) - board)) > 20.0,
+        "the ink stops before the boards",
+    )
+    on_side = corner + direction * 100.0
+    through_middle = _foot + direction * 120.0
+    mapped_side = pitch_map.project(np.array([on_side], dtype=np.float32))
+    mapped_middle = pitch_map.project(np.array([through_middle], dtype=np.float32))
+    raw_middle = pitch_map.transformer.transform_points(np.array([through_middle], dtype=np.float32))[0]
+    assert_true(mapped_side[0] is not None, "a player on the side stays on the map")
+    assert_close(mapped_side[0][1], 1484.0, "he takes the corner's width, not the perpendicular", tolerance=40.0)
+    assert_close(mapped_middle[0][1], 3500.0, "the middle of the 16.5 m line stays the middle", tolerance=40.0)
+    assert_close(mapped_middle[0][0], float(raw_middle[0]), "the depth stays the arc scale", tolerance=0.5)
+
+
+def test_a_board_is_not_a_side_and_one_corner_draws_one_side():
+    mask, matrix, _foot, _along = _uneven_penalty()
+    boards = np.full((750, 1338, 3), 230, np.uint8)
+    grass = np.zeros((750, 1338), np.uint8)
+    assert_true(
+        side_from_corner(boards, grass, np.array([500.0, 300.0]), np.array([1.0, 0.0]), np.array([0.0, 1.0]), np.array([400.0, 300.0]))
+        is None,
+        "the advertising is not a side line",
+    )
+    pitch_map = VisiblePitchMap()
+    pitch_map.matrix = matrix
+    pitch_map.transformer = ViewTransformer.from_matrix(matrix)
+    pitch_map.positive_x = True
+    pitch_map.region = "penalty"
+    pitch_map.scale = 7.0
+    pitch_map.grass = grass
+    decision = pitch_map._publish(pitch_map._decision(True, False, "accepted"), mask, boards)
+    assert_true(decision["corners"] is not None, "the two corners still set the width")
+    assert_true(decision["side_lines"] is None, "no side is invented on the boards")
+
+    foot = np.array([700.0, 400.0])
+    along = np.array([0.95, 0.31])
+    along = along / np.linalg.norm(along)
+    perp = np.array([-along[1], along[0]])
+    single = _affine_matrix(foot, along, perp, 1.0 / 4.0, 10350.0, 7000.0, True)
+    single_mask = np.zeros((750, 1338), dtype=np.uint8)
+    for station in range(-360, -20, 2):
+        point = foot + along * float(station)
+        cv2.circle(single_mask, (int(round(point[0])), int(round(point[1]))), 2, 255, -1)
+    ends = _line_ends(single_mask, single, True, 4.0)
+    assert_true(ends is not None and ends["corner_low"] is not None and ends["corner_high"] is None, "one end off the picture leaves the other")
+    theta = np.radians(40.0)
+    direction = np.cos(theta) * ends["along"] + np.sin(theta) * ends["perp"]
+    direction = direction / np.linalg.norm(direction)
+    picture = np.full((750, 1338, 3), 100, np.uint8)
+    live_grass = np.full((750, 1338), 255, np.uint8)
+    _paint_ridge(picture, ends["corner_low"], ends["corner_low"] + direction * 180.0)
+    alone = VisiblePitchMap()
+    alone.matrix = single
+    alone.transformer = ViewTransformer.from_matrix(single)
+    alone.positive_x = True
+    alone.region = "penalty"
+    alone.scale = 4.0
+    alone.grass = live_grass
+    one = alone._publish(alone._decision(True, False, "accepted"), single_mask, picture)
+    assert_true(one["corners"] is None, "one corner does not move the width")
+    assert_equal(one["side_anchor"], "low", "the visible side is the far one")
+    assert_true(one["side_lines"] is not None and len(one["side_lines"]) == 1, "only that side is drawn")
+    sample = ends["corner_low"] + direction * 40.0
+    mapped = alone.project(np.array([sample], dtype=np.float32))
+    raw = alone.transformer.transform_points(np.array([sample], dtype=np.float32))[0]
+    assert_true(mapped[0] is not None, "the player stays on the affine map")
+    assert_close(mapped[0][1], float(raw[1]), "his width stays affine when the other corner is hidden", tolerance=0.5)
 
 
 def test_a_line_cut_by_the_frame_is_not_a_corner():
@@ -440,6 +555,8 @@ def main():
     test_marker_colours_follow_the_team()
     test_the_centre_circle_publishes_the_middle()
     test_uneven_corners_move_the_width_and_keep_the_arc_scale()
+    test_the_side_ridge_sets_the_width_and_keeps_the_depth()
+    test_a_board_is_not_a_side_and_one_corner_draws_one_side()
     test_a_line_cut_by_the_frame_is_not_a_corner()
     test_the_measured_strip_does_not_erase_the_visible_third()
     test_spatial_metrics_use_only_mapped_players()

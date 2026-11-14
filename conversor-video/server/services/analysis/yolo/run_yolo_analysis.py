@@ -4653,6 +4653,8 @@ def analyze(args):
                 corners=map_decision.get("corners"),
                 corner_perp=map_decision.get("corner_perp"),
                 side_px=map_decision.get("side_px"),
+                side_lines=map_decision.get("side_lines"),
+                side_anchor=map_decision.get("side_anchor"),
             )
             if debug_frame is not None:
                 draw_visible_penalty(
@@ -4664,6 +4666,8 @@ def analyze(args):
                     corners=map_decision.get("corners"),
                     corner_perp=map_decision.get("corner_perp"),
                     side_px=map_decision.get("side_px"),
+                    side_lines=map_decision.get("side_lines"),
+                    side_anchor=map_decision.get("side_anchor"),
                 )
 
         render_bounding_boxes_stage_start = time.perf_counter()
