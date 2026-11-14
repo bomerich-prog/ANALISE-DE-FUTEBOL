@@ -11,18 +11,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server/services/an
 
 from ball_heatmap import BallHeatmapAccumulator  # noqa: E402
 from pitch_homography import fit_broadcast_penalty  # noqa: E402
+from pitch_homography import _affine_matrix  # noqa: E402
 from pitch_map import (  # noqa: E402
     LINE_MOVE_PX,
     VisiblePitchMap,
     box_matches_visible_paint,
+    field_y_from_line,
     front_image_point,
     inside_measured,
     inside_visible,
     marker_bgr,
     paint_patch,
+    penalty_corners,
     replacement_verdict,
     scale_is_stable,
     visible_bounds,
+    _width_terms,
 )
 from possession import _player_distance  # noqa: E402
 from roboflow_soccer_config import SoccerPitchConfiguration  # noqa: E402
@@ -122,6 +126,72 @@ def _centre_circle_mask():
     cv2.line(mask, (400, 180), (400, 680), 255, 5)
     cv2.circle(mask, (400, 430), 120, 255, 5)
     return mask
+
+
+def _uneven_penalty(continue_past=False):
+    """A 16.5 m line whose far half is shorter in pixels than its near half."""
+    foot = np.array([640.0, 340.0])
+    along = np.array([0.88, 0.47])
+    along = along / np.linalg.norm(along)
+    perp = np.array([-along[1], along[0]])
+    matrix = _affine_matrix(foot, along, perp, 1.0 / 7.0, 10350.0, 7000.0, True)
+    mask = np.zeros((750, 1338), dtype=np.uint8)
+    for station in list(range(-216, -20, 2)) + list(range(20, 150, 2)) + list(range(214, 392, 2)):
+        point = foot + along * float(station)
+        cv2.circle(mask, (int(round(point[0])), int(round(point[1]))), 2, 255, -1)
+    if continue_past:
+        for station in range(-270, -218):
+            point = foot + along * float(station) + perp * 16.0
+            cv2.circle(mask, (int(round(point[0])), int(round(point[1]))), 1, 255, -1)
+    return mask, matrix, foot, along
+
+
+def test_uneven_corners_move_the_width_and_keep_the_arc_scale():
+    terms = _width_terms(-216.0, 392.0, 3500.0)
+    assert_close(field_y_from_line(0.0, terms, 3500.0), 3500.0, "the arc stays the middle of the box", tolerance=1.0)
+    assert_close(field_y_from_line(-216.0, terms, 3500.0), 1484.0, "the far corner is 20.16 m off centre", tolerance=1.0)
+    assert_close(field_y_from_line(392.0, terms, 3500.0), 5516.0, "the near corner is 20.16 m off centre", tolerance=1.0)
+    mask, matrix, foot, along = _uneven_penalty()
+    found = penalty_corners(mask, matrix, True, 7.0)
+    assert_true(found is not None, "the two ends of the line are the corners")
+    assert_close(found["t_low"], -216.0, "the short side is the far corner", tolerance=12.0)
+    assert_close(found["t_high"], 392.0, "the long side is the near corner", tolerance=12.0)
+    pitch_map = VisiblePitchMap()
+    pitch_map.matrix = matrix
+    pitch_map.transformer = ViewTransformer.from_matrix(matrix)
+    pitch_map.positive_x = True
+    pitch_map.region = "penalty"
+    pitch_map.scale = 7.0
+    pitch_map.toward_goal_cm = 400.0
+    decision = pitch_map._publish(pitch_map._decision(True, False, "accepted"), mask)
+    assert_true(decision["corners"] is not None, "the drawing uses the two corners")
+    far = foot + along * found["t_low"]
+    mapped = pitch_map.project(np.array([far], dtype=np.float32))
+    assert_true(mapped[0] is not None, "a player on the far corner stays on the map")
+    assert_close(mapped[0][1], 1484.0, "that player is on the corner, not 5 m inside the box", tolerance=80.0)
+    drifting, drift_matrix, _foot, _along = _uneven_penalty(continue_past=True)
+    assert_true(
+        penalty_corners(drifting, drift_matrix, True, 7.0) is None,
+        "a line that keeps going is not a corner",
+    )
+
+
+def test_a_line_cut_by_the_frame_is_not_a_corner():
+    foot = np.array([900.0, 500.0])
+    along = np.array([0.95, 0.31])
+    along = along / np.linalg.norm(along)
+    perp = np.array([-along[1], along[0]])
+    matrix = _affine_matrix(foot, along, perp, 1.0 / 4.0, 10350.0, 7000.0, True)
+    mask = np.zeros((750, 1338), dtype=np.uint8)
+    for station in range(-400, 900, 2):
+        point = foot + along * float(station)
+        x, y = int(round(point[0])), int(round(point[1]))
+        if 0 <= x < mask.shape[1] and 0 <= y < mask.shape[0]:
+            cv2.circle(mask, (x, y), 2, 255, -1)
+    assert_true(
+        penalty_corners(mask, matrix, True, 4.0) is None,
+        "the picture edge is not a painted corner",
+    )
 
 
 def test_the_measured_strip_does_not_erase_the_visible_third():
@@ -369,6 +439,8 @@ def main():
     test_projection_drops_the_far_half()
     test_marker_colours_follow_the_team()
     test_the_centre_circle_publishes_the_middle()
+    test_uneven_corners_move_the_width_and_keep_the_arc_scale()
+    test_a_line_cut_by_the_frame_is_not_a_corner()
     test_the_measured_strip_does_not_erase_the_visible_third()
     test_spatial_metrics_use_only_mapped_players()
     test_a_box_in_the_stands_is_not_published()

@@ -1,7 +1,9 @@
 """Project the visible penalty third, and nothing past it.
 
 The fit uses the painted 16.5 m line and the 9.15 m arc, which fixes the scale
-at the penalty spot 5.5 m behind that line. Coordinates are published inside
+at the penalty spot 5.5 m behind that line. When the two ends of that line are
+on the paint, the width follows those corners, so the far half and the near
+half can have different pixel lengths. Coordinates are published inside
 the 35 m third of the goal the calibration is looking at. The grass probe
 accepts or rejects that calibration. It does not erase a player or the ball
 who already land inside the third. A short gap keeps the last good matrix,
@@ -55,6 +57,14 @@ PROBE_STEP_CM = 50.0
 MAX_GOAL_DEPTH_CM = 1650.0
 MAX_ARC_DEPTH_CM = 500.0
 CROWD_BAND = 0.18
+# The painted arc meets the 16.5 m line 7.31 m either side of the spot.
+# The corners are further out, where that line actually ends.
+_ARC_MEET_CM = float(np.sqrt(915.0**2 - 550.0**2))
+_BOX_HALF_CM = 2016.0
+_CORNER_MIN_CM = 1200.0
+_CORNER_MAX_CM = 3000.0
+# A stop on the picture edge is the frame cutting the line, not a painted corner.
+_CORNER_EDGE_PX = 16.0
 
 
 def scale_is_stable(previous, new, ratio=SCALE_JUMP_RATIO):
@@ -387,6 +397,143 @@ def centre_on_paint(matrix, grass_mask, white_mask, pitch=None):
     return _classify_pixel(center[0], center[1], grass_mask) == "grass"
 
 
+def _line_frame(matrix, positive_x, pitch):
+    """Image foot of the 16.5 m line, plus the width axis and the direction to the goal."""
+    front = _front_x(bool(positive_x), pitch)
+    sign = _goal_sign(bool(positive_x))
+    image = _project_field(
+        matrix,
+        [(front, float(pitch.width) / 2.0), (front, float(pitch.width) / 2.0 + 100.0), (front + sign * 100.0, float(pitch.width) / 2.0)],
+    )
+    if image is None:
+        return None
+    foot = image[0]
+    along = image[1] - foot
+    perp = image[2] - foot
+    along_norm = float(np.linalg.norm(along))
+    perp_norm = float(np.linalg.norm(perp))
+    if along_norm < 1e-6 or perp_norm < 1e-6:
+        return None
+    return foot, along / along_norm, perp / perp_norm
+
+
+def _width_terms(t_low, t_high, center):
+    """1D homography along the 16.5 m line. t=0 is the arc, the two t's are the corners.
+
+    Field y is (a t + center) / (c t + 1). Equal pixel halves leave c at 0 and
+    this is the old scale. A compressed far side gets a different c.
+    """
+    if t_low >= -40.0 or t_high <= 40.0:
+        return None
+    product = 2.0 * float(t_low) * float(t_high)
+    if abs(product) < 1e-6:
+        return None
+    slope = -(_BOX_HALF_CM) / float(t_low)
+    curve = -(float(t_low) + float(t_high)) / product
+    pole = None if abs(curve) < 1e-8 else -1.0 / curve
+    if pole is not None and t_low < pole < t_high:
+        return None
+    tilt = (center - _BOX_HALF_CM) * curve + slope
+    for station in (float(t_low), 0.0, float(t_high)):
+        if curve * station + 1.0 <= 0.35:
+            return None
+    return float(tilt), float(curve)
+
+
+def field_y_from_line(t_px, terms, center):
+    """Field y, in centimetres, of a pixel offset along the 16.5 m line."""
+    if terms is None:
+        return None
+    tilt, curve = terms
+    denom = curve * float(t_px) + 1.0
+    if denom <= 0.35:
+        return None
+    return (tilt * float(t_px) + float(center)) / denom
+
+
+def penalty_corners(paint, matrix, positive_x, cm_per_px, pitch=None):
+    """The two ends of the painted 16.5 m line, or None.
+
+    Each end has to be a real stop, one on each side of the arc, and a
+    plausible 20.16 m at the arc's scale. A line that merely drifts out of
+    the band is not a corner, and the caller keeps the single scale.
+    """
+    if paint is None or matrix is None or cm_per_px is None or cm_per_px <= 0:
+        return None
+    pitch = pitch or SoccerPitchConfiguration()
+    frame = _line_frame(matrix, positive_x, pitch)
+    if frame is None:
+        return None
+    foot, along, perp = frame
+    ys, xs = np.where(paint > 0)
+    if len(xs) < 40:
+        return None
+    delta = np.stack([xs, ys], axis=1).astype(np.float64) - foot
+    tee = delta @ along
+    ess = delta @ perp
+    step = 8
+    stations = np.arange(-520, 521, step)
+    lit = np.array(
+        [
+            int(np.sum((np.abs(tee - station) <= step) & (np.abs(ess) <= 7.0))) >= 12
+            for station in stations
+        ]
+    )
+    start = int(round((_ARC_MEET_CM / float(cm_per_px) + 24.0) / step))
+
+    def walk(sign):
+        index = len(stations) // 2 + sign * start
+        last = None
+        gap = 0
+        while 0 <= index < len(stations):
+            if lit[index]:
+                last = float(stations[index])
+                gap = 0
+            else:
+                gap += 1
+                if gap > 10:
+                    break
+            index += sign
+        return last
+
+    def stopped(station):
+        corner = foot + along * float(station)
+        height, width = paint.shape[:2]
+        inside = (
+            _CORNER_EDGE_PX <= corner[0] < width - _CORNER_EDGE_PX
+            and _CORNER_EDGE_PX <= corner[1] < height - _CORNER_EDGE_PX
+        )
+        if not inside:
+            return False
+        sign = 1.0 if station > 0.0 else -1.0
+        beyond = ((tee - station) * sign > 0.0) & ((tee - station) * sign < 48.0)
+        on_line = int(np.sum(beyond & (np.abs(ess) <= 8.0)))
+        drifted = int(np.sum(beyond & (np.abs(ess) > 8.0) & (np.abs(ess) <= 24.0)))
+        return on_line < 15 and drifted < 30
+
+    t_low, t_high = walk(-1), walk(1)
+    if t_low is None or t_high is None:
+        return None
+    for station in (t_low, t_high):
+        reached = abs(station) * float(cm_per_px)
+        if not (_CORNER_MIN_CM <= reached <= _CORNER_MAX_CM) or not stopped(station):
+            return None
+    center = float(pitch.width) / 2.0
+    terms = _width_terms(t_low, t_high, center)
+    if terms is None:
+        return None
+    return {
+        "t_low": float(t_low),
+        "t_high": float(t_high),
+        "terms": terms,
+        "foot": foot,
+        "along": along,
+        "perp": perp,
+        "corner_low": foot + along * float(t_low),
+        "corner_high": foot + along * float(t_high),
+    }
+
+
 def draw_visible_penalty(
     frame,
     matrix,
@@ -394,6 +541,9 @@ def draw_visible_penalty(
     color=(0, 220, 255),
     toward_goal_cm=None,
     toward_arc_cm=None,
+    corners=None,
+    corner_perp=None,
+    side_px=None,
 ):
     """Draw the 16.5 m line, the arc, and only the depth that stays out of the stands."""
     if frame is None or matrix is None:
@@ -421,9 +571,20 @@ def draw_visible_penalty(
         outside = (front - x) if positive_x else (x - front)
         if 0.0 < outside <= arc_limit + 50.0:
             arc.append((x, y))
-    _polyline(frame, inverse, np.array(front_line, dtype=np.float32), color)
-    _polyline(frame, inverse, np.array(near_side, dtype=np.float32), color)
-    _polyline(frame, inverse, np.array(far_side, dtype=np.float32), color)
+    if corners is not None and corner_perp is not None and side_px is not None and len(corners) == 2:
+        perp = np.asarray(corner_perp, dtype=np.float64)
+        if isinstance(side_px, (tuple, list)) and len(side_px) == 2:
+            reaches = [max(0.0, float(value)) for value in side_px]
+        else:
+            reaches = [max(0.0, float(side_px)), max(0.0, float(side_px))]
+        _image_segment(frame, corners[0], corners[1], color)
+        for corner, reach in zip(corners, reaches):
+            if reach > 1.0:
+                _image_segment(frame, corner, np.asarray(corner, dtype=np.float64) + perp * reach, color)
+    else:
+        _polyline(frame, inverse, np.array(front_line, dtype=np.float32), color)
+        _polyline(frame, inverse, np.array(near_side, dtype=np.float32), color)
+        _polyline(frame, inverse, np.array(far_side, dtype=np.float32), color)
     if len(arc) >= 2:
         _polyline(frame, inverse, np.array(arc, dtype=np.float32), color)
 
@@ -446,6 +607,25 @@ def draw_visible_centre(frame, matrix, color=(0, 220, 255)):
     ]
     _polyline(frame, inverse, np.array(line, dtype=np.float32), color)
     _polyline(frame, inverse, np.array(circle, dtype=np.float32), color)
+
+
+def _image_segment(frame, start, end, color):
+    """Draw one image segment, stopping where it enters the stands."""
+    height, width = frame.shape[:2]
+    start = np.asarray(start, dtype=np.float64)
+    end = np.asarray(end, dtype=np.float64)
+    run = []
+    for step in np.linspace(0.0, 1.0, 16):
+        point = start + (end - start) * float(step)
+        safe = 0 <= point[0] < width and CROWD_BAND * height <= point[1] < height
+        if safe:
+            run.append((int(round(point[0])), int(round(point[1]))))
+            continue
+        if len(run) >= 2:
+            cv2.polylines(frame, [np.array(run, dtype=np.int32)], False, color, 2, cv2.LINE_AA)
+        run = []
+    if len(run) >= 2:
+        cv2.polylines(frame, [np.array(run, dtype=np.int32)], False, color, 2, cv2.LINE_AA)
 
 
 def _polyline(frame, inverse, field_points, color):
@@ -490,6 +670,13 @@ class VisiblePitchMap:
         self.toward_goal_cm = None
         self.toward_arc_cm = None
         self.grass = None
+        self.corner_low = None
+        self.corner_high = None
+        self.corner_perp = None
+        self.side_px = None
+        self.width_terms = None
+        self._corner_t = None
+        self._corner_matrix_id = None
         self.accepted_frames = 0
         self.held_frames = 0
         self.rejected_frames = 0
@@ -550,18 +737,18 @@ class VisiblePitchMap:
                     self.reasons[verdict] += 1
                     report = None
         if report is not None:
-            return self._accept(report, grass_mask, fresh_view=fresh_view)
+            return self._publish(self._accept(report, grass_mask, fresh_view=fresh_view), white_line_mask)
         if coherent:
             self.held_frames += 1
             self.hold_left = self.hold_frames
             self.reasons["held"] += 1
-            return self._decision(True, True, "held")
+            return self._publish(self._decision(True, True, "held"), white_line_mask)
         # A few bad frames keep the last good matrix. The counter does not refill.
         if self.matrix is not None and self.hold_left > 0:
             self.hold_left -= 1
             self.held_frames += 1
             self.reasons["bridge"] += 1
-            return self._decision(True, True, "held")
+            return self._publish(self._decision(True, True, "held"), white_line_mask)
         self._drop()
         self.rejected_frames += 1
         self.reasons["no_visible_penalty"] += 1
@@ -580,7 +767,13 @@ class VisiblePitchMap:
             return []
         transformed = self.transformer.transform_points(array.reshape(-1, 2))
         mapped = []
+        center = float(self.pitch.width) / 2.0
         for (image_x, image_y), (x, y) in zip(array.reshape(-1, 2), transformed):
+            if self.width_terms is not None and self.scale:
+                offset = (float(y) - center) / float(self.scale)
+                corrected = field_y_from_line(offset, self.width_terms, center)
+                if corrected is not None:
+                    y = corrected
             if not inside_visible(
                 float(x),
                 float(y),
@@ -684,7 +877,105 @@ class VisiblePitchMap:
         self.toward_goal_cm = None
         self.toward_arc_cm = None
         self.grass = None
+        self.corner_low = None
+        self.corner_high = None
+        self.corner_perp = None
+        self.side_px = None
+        self.width_terms = None
+        self._corner_t = None
+        self._corner_matrix_id = None
         self.hold_left = 0
+
+    def _grass_reach(self, corner, perp, cap):
+        """How far the side stays on the grass, never past the probed depth."""
+        if cap <= 0.0 or self.grass is None:
+            return cap
+        height, width = self.grass.shape[:2]
+        last = 0.0
+        missed = 0
+        travelled = 0.0
+        while travelled <= cap:
+            point = np.asarray(corner, dtype=np.float64) + perp * travelled
+            x = int(round(float(point[0])))
+            y = int(round(float(point[1])))
+            if not (0 <= x < width and 0 <= y < height):
+                break
+            if self.grass[y, x] > 0:
+                last = travelled
+                missed = 0
+            else:
+                missed += 1
+                if missed >= 4 and travelled > 12.0:
+                    break
+            travelled += 2.0
+        return last
+
+    def _apply_corners(self, found):
+        self.width_terms = found["terms"]
+        self.corner_perp = found["perp"]
+        self.corner_low = found["corner_low"]
+        self.corner_high = found["corner_high"]
+        cap = float(self.toward_goal_cm) / float(self.scale) if self.toward_goal_cm and self.scale else 0.0
+        perp = found["perp"]
+        self.side_px = (
+            self._grass_reach(found["corner_low"], perp, cap),
+            self._grass_reach(found["corner_high"], perp, cap),
+        )
+
+    def _refresh_corners(self, white_line_mask):
+        """Measure the two corners on this frame. A miss keeps the last pair of this matrix."""
+        self.corner_low = None
+        self.corner_high = None
+        self.corner_perp = None
+        self.side_px = None
+        self.width_terms = None
+        if self.matrix is None or self.positive_x is None or self.region == "centre" or not self.scale:
+            self._corner_t = None
+            self._corner_matrix_id = None
+            return
+        paint = _clean_paint(white_line_mask)
+        found = penalty_corners(paint, self.matrix, self.positive_x, self.scale, self.pitch)
+        matrix_id = id(self.matrix)
+        if found is not None:
+            self._corner_t = (found["t_low"], found["t_high"])
+            self._corner_matrix_id = matrix_id
+            self._apply_corners(found)
+            return
+        if self._corner_t is None or self._corner_matrix_id != matrix_id:
+            return
+        frame = _line_frame(self.matrix, self.positive_x, self.pitch)
+        if frame is None:
+            return
+        foot, along, perp = frame
+        t_low, t_high = self._corner_t
+        terms = _width_terms(t_low, t_high, float(self.pitch.width) / 2.0)
+        if terms is None:
+            return
+        self._apply_corners(
+            {
+                "terms": terms,
+                "perp": perp,
+                "corner_low": foot + along * t_low,
+                "corner_high": foot + along * t_high,
+            }
+        )
+
+    def _publish(self, decision, white_line_mask):
+        self._refresh_corners(white_line_mask)
+        if self.corner_low is None or self.corner_high is None or self.corner_perp is None:
+            return decision
+        decision["corners"] = (
+            (float(self.corner_low[0]), float(self.corner_low[1])),
+            (float(self.corner_high[0]), float(self.corner_high[1])),
+        )
+        decision["corner_perp"] = (float(self.corner_perp[0]), float(self.corner_perp[1]))
+        if self.side_px is None:
+            decision["side_px"] = None
+        elif isinstance(self.side_px, tuple):
+            decision["side_px"] = tuple(float(value) for value in self.side_px)
+        else:
+            decision["side_px"] = float(self.side_px)
+        return decision
 
     def _decision(self, accepted, held, reason):
         return {
@@ -706,4 +997,7 @@ class VisiblePitchMap:
                 if self.positive_x is False
                 else None
             ),
+            "corners": None,
+            "corner_perp": None,
+            "side_px": None,
         }

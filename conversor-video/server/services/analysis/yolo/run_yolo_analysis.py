@@ -4650,6 +4650,9 @@ def analyze(args):
                 map_decision["positive_x"],
                 toward_goal_cm=map_decision.get("toward_goal_cm"),
                 toward_arc_cm=map_decision.get("toward_arc_cm"),
+                corners=map_decision.get("corners"),
+                corner_perp=map_decision.get("corner_perp"),
+                side_px=map_decision.get("side_px"),
             )
             if debug_frame is not None:
                 draw_visible_penalty(
@@ -4658,6 +4661,9 @@ def analyze(args):
                     map_decision["positive_x"],
                     toward_goal_cm=map_decision.get("toward_goal_cm"),
                     toward_arc_cm=map_decision.get("toward_arc_cm"),
+                    corners=map_decision.get("corners"),
+                    corner_perp=map_decision.get("corner_perp"),
+                    side_px=map_decision.get("side_px"),
                 )
 
         render_bounding_boxes_stage_start = time.perf_counter()
