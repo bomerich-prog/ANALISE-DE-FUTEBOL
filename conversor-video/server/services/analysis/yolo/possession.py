@@ -16,6 +16,12 @@ CONTROL_RADIUS_PX = 90.0
 HOLD_RADIUS_PX = 140.0
 CONTEST_MARGIN_CM = 70.0
 CONTEST_MARGIN_PX = 25.0
+# A player this close has the ball at his feet. Two observed frames are enough
+# to take it from the other team. A marker standing just inside the control
+# radius does not.
+CLEAR_TOUCH_RADIUS_CM = 80.0
+CLEAR_TOUCH_RADIUS_PX = 30.0
+CLEAR_RECLAIM_FRAMES = 2
 # The broadcast camera looks down on the pitch at a shallow angle, so one
 # metre toward or away from it covers far fewer image rows than one metre
 # across the screen. A ball rolling in front of a player's feet is several
@@ -197,6 +203,8 @@ class PossessionEngine:
         # Last observed ball was inside the hold radius. A predicted point must
         # not create that fact, and it must not erase it during a short hole.
         self.observed_hold = False
+        self.fast_reclaim_id = None
+        self.last_team_id = None
 
     def snapshot(self):
         team = TEAM_NAME_BY_ID.get(self.possessor_team_id) if self.possessor_id is not None else None
@@ -253,6 +261,8 @@ class PossessionEngine:
         ):
             self.passing_ball_refusals += 1
 
+        challenger = nearest if nearest is not None and nearest["track_id"] != self.possessor_id else None
+        touch_radius = self._touch_radius((possessor_entry or challenger or closest or {}).get("space") or "pixel")
         if self.possessor_id is not None:
             measured_inside = (
                 allow_new
@@ -264,41 +274,42 @@ class PossessionEngine:
                 and possessor_entry is not None
                 and possessor_entry["distance"] > hold_radius
             )
-            if measured_inside:
-                # The observed ball is still with him. Only this renews the hold.
-                self.observed_hold = True
-                self.no_evidence_count = 0
-                contested = (
-                    nearest is not None
-                    and nearest["track_id"] != self.possessor_id
-                    and nearest["distance"] + contest_margin >= possessor_entry["distance"]
-                )
-                if (
-                    nearest is None
-                    or nearest["track_id"] == self.possessor_id
-                    or contested
-                    or nearest["distance"] > control_radius
-                ):
-                    self._clear_switch()
-                    self._refresh_possessor_team()
+            if measured_inside or measured_outside:
+                if measured_inside:
+                    self.observed_hold = True
+                    self.no_evidence_count = 0
+                else:
+                    self.observed_hold = False
+                if self._other_team_takes_the_ball(possessor_entry, challenger, touch_radius, contest_margin):
+                    self._release_for_reclaim(challenger, touch_radius)
                     return self._finish_update(previous_id)
-                self._advance_switch(nearest["track_id"])
-                return self._finish_update(previous_id)
-
-            if measured_outside:
-                # He is on screen and far. A neighbour does not put him back,
-                # and the loss keeps running until he returns or is replaced.
-                self.observed_hold = False
-                if self._offer_switch(nearest, control_radius, previous_id):
+                if self._duel_with_other_team(possessor_entry, challenger, touch_radius, contest_margin):
+                    self._drop_possessor()
                     return self._finish_update(previous_id)
-                self._lose_if_unsupported(clear_switch=False)
+                if self._teammate_has_it(possessor_entry, challenger, control_radius, contest_margin):
+                    if self._offer_switch(challenger, control_radius, previous_id):
+                        return self._finish_update(previous_id)
+                    return self._finish_update(previous_id)
+                if measured_outside:
+                    self._lose_if_unsupported(clear_switch=False)
+                    return self._finish_update(previous_id)
+                self._clear_switch()
+                self._refresh_possessor_team()
                 return self._finish_update(previous_id)
 
             if not allow_new and self.observed_hold and possessor_entry is not None and possessor_entry["distance"] <= hold_radius:
-                # The prediction is still at his feet. It does not open anything
-                # and it does not cancel a switch.
-                self.no_evidence_count = 0
-                self._refresh_possessor_team()
+                # A predicted point keeps a touch only while he is still the
+                # player on that point. It cannot renew a holder the other
+                # team has already passed, and it cannot award a new one.
+                if self._other_team_takes_the_ball(possessor_entry, challenger, touch_radius, contest_margin) or self._duel_with_other_team(possessor_entry, challenger, touch_radius, contest_margin):
+                    self._drop_possessor()
+                    return self._finish_update(previous_id)
+                if challenger is None or challenger["distance"] > control_radius or challenger["distance"] >= possessor_entry["distance"]:
+                    self.no_evidence_count = 0
+                    self._refresh_possessor_team()
+                    return self._finish_update(previous_id)
+                self.observed_hold = False
+                self._lose_if_unsupported(clear_switch=False)
                 return self._finish_update(previous_id)
 
             if not allow_new:
@@ -308,30 +319,51 @@ class PossessionEngine:
                 self._lose_if_unsupported(clear_switch=False)
                 return self._finish_update(previous_id)
 
-            # His box is missing. This is not a measurement that he is far:
-            # a player on the ball may take over, and an empty frame still loses.
-            if self._offer_switch(nearest, control_radius, previous_id):
-                self.no_evidence_count = 0
-                return self._finish_update(previous_id)
+            # His box is missing. A marker inside the wide radius does not
+            # inherit it. Only a player at the ball, or a teammate, can.
             if (
-                nearest is not None
-                and nearest["track_id"] != self.possessor_id
-                and nearest["distance"] <= control_radius
+                allow_new
+                and challenger is not None
+                and self._is_other_team(challenger["track_id"])
+                and challenger["distance"] <= touch_radius
+                and self._lead_is_clear(challenger, ranked, control_radius, contest_margin)
             ):
-                self.no_evidence_count = 0
-                self._refresh_possessor_team()
+                self._release_for_reclaim(challenger, touch_radius)
                 return self._finish_update(previous_id)
-            # Nobody is on the ball and his box is gone. This ends the hold,
-            # so a following predicted point cannot freeze him in place.
+            same_challenger = (
+                challenger
+                if challenger is not None and self._is_same_team(challenger["track_id"])
+                else None
+            )
+            if same_challenger is not None and same_challenger["distance"] <= control_radius:
+                # His box is gone and a teammate is on the ball. The reception
+                # uses the normal switch window, so a pass does not move earlier.
+                self._advance_switch(same_challenger["track_id"])
+                if self.possessor_id != previous_id:
+                    self.observed_hold = True
+                self.no_evidence_count = 0
+                return self._finish_update(previous_id)
             self.observed_hold = False
             self._lose_if_unsupported()
             return self._finish_update(previous_id)
 
-        if allow_new and nearest is not None and nearest["distance"] <= control_radius:
+        if (
+            allow_new
+            and nearest is not None
+            and not nearest.get("passing")
+            and self._can_open(nearest, touch_radius, control_radius)
+            and self._lead_is_clear(nearest, ranked, control_radius, contest_margin)
+        ):
             self.no_evidence_count = 0
-            self._advance_confirm(nearest["track_id"])
+            needed = self.confirm_frames
+            if self.fast_reclaim_id == nearest["track_id"] and nearest["distance"] <= touch_radius:
+                needed = CLEAR_RECLAIM_FRAMES
+            self._advance_confirm(nearest["track_id"], needed)
+            if self.possessor_id is not None:
+                self.fast_reclaim_id = None
             return self._finish_update(previous_id)
 
+        self.fast_reclaim_id = None
         self._reset_pending()
         self._lose_if_unsupported()
         return self._finish_update(previous_id)
@@ -386,13 +418,96 @@ class PossessionEngine:
             return 0.0
         return pixel_ground_distance(end[1], end[2], start[1], start[2]) / frames
 
-    def _advance_confirm(self, track_id):
+    def _touch_radius(self, space):
+        if space == "field":
+            return CLEAR_TOUCH_RADIUS_CM
+        return CLEAR_TOUCH_RADIUS_PX
+
+    def _team_id(self, track_id):
+        return self.last_team_by_track.get(track_id)
+
+    def _is_other_team(self, track_id):
+        if self.possessor_team_id is None:
+            return True
+        other = self._team_id(track_id)
+        if other is None:
+            return False
+        return other != self.possessor_team_id
+
+    def _is_same_team(self, track_id):
+        if self.possessor_team_id is None:
+            return False
+        return self._team_id(track_id) == self.possessor_team_id
+
+    def _other_team_takes_the_ball(self, holder, challenger, touch_radius, contest_margin):
+        # Only a player at the ball can take it. A marker inside the wide
+        # control radius is not a change of possession.
+        if challenger is None or challenger.get("passing") or challenger["distance"] > touch_radius:
+            return False
+        if not self._is_other_team(challenger["track_id"]):
+            return False
+        return holder["distance"] - challenger["distance"] >= contest_margin
+
+    def _duel_with_other_team(self, holder, challenger, touch_radius, contest_margin):
+        if challenger is None or challenger.get("passing") or challenger["distance"] > touch_radius:
+            return False
+        if not self._is_other_team(challenger["track_id"]):
+            return False
+        lead = holder["distance"] - challenger["distance"]
+        return 0 < lead < contest_margin
+
+    def _can_open(self, nearest, touch_radius, control_radius):
+        """The other team has to reach the ball. The same team may receive it."""
+        if nearest["distance"] > control_radius:
+            return False
+        if nearest["distance"] <= touch_radius:
+            return True
+        team = self._team_id(nearest["track_id"])
+        if self.last_team_id is None or team is None or team == self.last_team_id:
+            return True
+        return False
+
+    def _teammate_has_it(self, holder, challenger, control_radius, contest_margin):
+        if challenger is None or challenger.get("passing") or challenger["distance"] > control_radius:
+            return False
+        if not self._is_same_team(challenger["track_id"]):
+            return False
+        return holder["distance"] - challenger["distance"] >= contest_margin
+
+    def _lead_is_clear(self, leader, ranked, control_radius, contest_margin):
+        leader_team = self._team_id(leader["track_id"])
+        for item in ranked:
+            if item["track_id"] == leader["track_id"] or item.get("passing"):
+                continue
+            if item["distance"] > control_radius:
+                continue
+            other_team = self._team_id(item["track_id"])
+            if leader_team is not None and other_team == leader_team:
+                continue
+            if leader_team is not None and other_team is None:
+                continue
+            return leader["distance"] + contest_margin <= item["distance"]
+        return True
+
+    def _release_for_reclaim(self, challenger, touch_radius):
+        self._drop_possessor()
+        if (
+            challenger is not None
+            and not challenger.get("passing")
+            and challenger["distance"] <= touch_radius
+        ):
+            self.fast_reclaim_id = challenger["track_id"]
+            self.pending_id = challenger["track_id"]
+            self.pending_count = 1
+
+    def _advance_confirm(self, track_id, frames_needed=None):
+        needed = self.confirm_frames if frames_needed is None else int(frames_needed)
         if self.pending_id == track_id:
             self.pending_count += 1
         else:
             self.pending_id = track_id
             self.pending_count = 1
-        if self.pending_count >= self.confirm_frames:
+        if self.pending_count >= needed:
             self._set_possessor(track_id)
             self.confirmed_gains += 1
             self._reset_pending()
@@ -443,6 +558,8 @@ class PossessionEngine:
             self._drop_possessor()
 
     def _drop_possessor(self):
+        if self.possessor_team_id is not None:
+            self.last_team_id = self.possessor_team_id
         self.possessor_id = None
         self.possessor_team_id = None
         self.observed_hold = False
@@ -450,6 +567,7 @@ class PossessionEngine:
         self.no_evidence_count = 0
         self._clear_switch()
         self._reset_pending()
+        self.fast_reclaim_id = None
 
     def _set_possessor(self, track_id):
         self.possessor_id = track_id

@@ -63,14 +63,16 @@ def test_memory_holds_but_does_not_open_possession():
 def test_does_not_flicker_between_nearby_players():
     engine = PossessionEngine()
     a = player(1, 0, 100, 100)
-    b = player(2, 1, 130, 100)
+    far = player(2, 1, 400, 100)
     for _ in range(POSSESSION_CONFIRM_FRAMES):
-        engine.update([a, b], ball("observed", field_x=105, field_y=100))
+        engine.update([a, far], ball("observed", field_x=105, field_y=100))
     assert_equal(engine.snapshot().current_possessor_track_id, 1, "A confirmed")
+    b = player(2, 1, 130, 100)
 
     for _ in range(POSSESSION_SWITCH_FRAMES):
         snapshot = engine.update([a, b], ball("observed", field_x=118, field_y=100))
-        assert_equal(snapshot.current_possessor_track_id, 1, "close contest should keep A")
+        assert_equal(snapshot.current_possessor_track_id, None, "a short lead is a duel, not a new owner")
+        assert_equal(snapshot.current_possession_team, None, "neither team keeps the duel")
 
 
 def test_short_hole_does_not_erase_a_pending_confirmation():
@@ -156,7 +158,7 @@ def test_a_fast_ball_sixty_pixels_away_opens_no_possession():
 
 def test_a_far_holder_is_not_renewed_by_a_neighbour_or_a_predicted_ball():
     engine = PossessionEngine()
-    holder = player(13, None, None, None, x=950, y=280)
+    holder = player(13, 0, None, None, x=950, y=280)
     other = player(19, 1, None, None, x=735, y=340)
     close = ball("observed", field_x=None, field_y=None, x=980, y=285)
     for _ in range(POSSESSION_CONFIRM_FRAMES):
@@ -164,26 +166,17 @@ def test_a_far_holder_is_not_renewed_by_a_neighbour_or_a_predicted_ball():
     assert_equal(engine.snapshot().current_possessor_track_id, 13, "13 earned the ball")
 
     at_the_other = ball("observed", field_x=None, field_y=None, x=746, y=337)
-    for _ in range(3):
-        snapshot = engine.update([holder, other], at_the_other)
-    assert_equal(snapshot.current_possessor_track_id, 13, "three frames do not finish the switch")
-    assert_equal(engine.no_evidence_count, 3, "the neighbour does not renew the far holder")
-    assert_equal(engine.switch_id, 19, "19 is the player on the ball")
-    assert_equal(engine.switch_count, 3, "the switch has started")
+    snapshot = engine.update([holder, other], at_the_other)
+    assert_equal(snapshot.current_possessor_track_id, None, "13 loses the ball the frame 19 is on it")
+    assert_equal(engine.pending_id, 19, "19 has one frame at his feet")
+    snapshot = engine.update([holder, other], at_the_other)
+    assert_equal(snapshot.current_possessor_track_id, 19, "a clear touch takes the ball on the second frame")
+    assert_equal(snapshot.current_possession_team, "Team 1", "19 keeps his team")
 
     ghost = ball("predicted", field_x=None, field_y=None, x=960, y=285)
     snapshot = engine.update([holder, other], ghost)
-    assert_equal(snapshot.current_possessor_track_id, 13, "a predicted ball does not hand it back")
-    assert_equal(engine.no_evidence_count, 4, "the predicted frame keeps the loss running")
-    assert_equal(engine.switch_count, 3, "the predicted frame does not erase the switch")
-
-    for _ in range(POSSESSION_LOSE_FRAMES - 4):
-        snapshot = engine.update([holder, other], at_the_other)
-    assert_equal(snapshot.current_possessor_track_id, None, "13 has lost the ball")
-    for _ in range(POSSESSION_CONFIRM_FRAMES):
-        snapshot = engine.update([holder, other], at_the_other)
-    assert_equal(snapshot.current_possessor_track_id, 19, "19 takes the ball by the normal confirmation")
-    assert_equal(snapshot.current_possession_team, "Team 1", "19 keeps his team")
+    assert_equal(snapshot.current_possessor_track_id, 19, "one predicted frame does not give the ball back to 13")
+    assert_equal(snapshot.current_possession_team, "Team 1", "19 keeps the team he just took")
 
 
 def test_predicted_ball_still_covers_a_short_hole_at_his_feet():
@@ -211,12 +204,46 @@ def test_switch_requires_consecutive_clear_leader():
         engine.update([a, b], ball("observed", field_x=100, field_y=100))
     assert_equal(engine.snapshot().current_possession_team, "Team 0", "start team 0")
 
-    for _ in range(POSSESSION_SWITCH_FRAMES - 1):
-        snapshot = engine.update([a, b], ball("observed", field_x=800, field_y=100))
-        assert_equal(snapshot.current_possessor_track_id, 11, "switch still pending")
     snapshot = engine.update([a, b], ball("observed", field_x=800, field_y=100))
-    assert_equal(snapshot.current_possessor_track_id, 12, "switched to B")
+    assert_equal(snapshot.current_possessor_track_id, None, "11 is no longer the owner")
+    snapshot = engine.update([a, b], ball("observed", field_x=800, field_y=100))
+    assert_equal(snapshot.current_possessor_track_id, 12, "12 is on the ball for a second frame")
     assert_equal(snapshot.current_possession_team, "Team 1", "team became team 1")
+
+
+def test_a_marker_does_not_inherit_a_missing_possessor():
+    engine = PossessionEngine()
+    holder = player(6, 1, None, None, x=400, y=300)
+    marker = player(16, 0, None, None, x=450, y=300)
+    close = ball("observed", field_x=None, field_y=None, x=400, y=300)
+    for _ in range(POSSESSION_CONFIRM_FRAMES):
+        engine.update([holder, marker], close)
+    assert_equal(engine.snapshot().current_possessor_track_id, 6, "6 has the ball")
+
+    still_there = ball("observed", field_x=None, field_y=None, x=400, y=300)
+    for index in range(POSSESSION_LOSE_FRAMES):
+        snapshot = engine.update([marker], still_there)
+        assert_equal(snapshot.current_possessor_track_id != 16, True, "16 at about 50 px does not inherit")
+        if index < POSSESSION_LOSE_FRAMES - 1:
+            assert_equal(snapshot.current_possessor_track_id, 6, "the missing holder waits out the lose window")
+        else:
+            assert_equal(snapshot.current_possessor_track_id, None, "the missing holder is released")
+    assert_equal(engine.snapshot().current_possession_team, None, "team 0 did not receive the ball")
+
+
+def test_predicted_ball_does_not_keep_a_holder_the_other_team_has_passed():
+    engine = PossessionEngine()
+    holder = player(11, 0, None, None, x=200, y=200)
+    other = player(19, 1, None, None, x=120, y=200)
+    for _ in range(POSSESSION_CONFIRM_FRAMES):
+        engine.update([holder, other], ball("observed", field_x=None, field_y=None, x=200, y=200))
+    assert_equal(engine.snapshot().current_possessor_track_id, 11, "11 confirmed")
+    snapshot = engine.update(
+        [holder, other],
+        ball("predicted", field_x=None, field_y=None, x=120, y=200),
+    )
+    assert_equal(snapshot.current_possessor_track_id, None, "the prediction is at 19, not at 11")
+    assert_equal(snapshot.current_possession_team, None, "team 0 is not renewed")
 
 
 if __name__ == "__main__":
@@ -230,6 +257,8 @@ if __name__ == "__main__":
     test_a_far_holder_is_not_renewed_by_a_neighbour_or_a_predicted_ball()
     test_predicted_ball_still_covers_a_short_hole_at_his_feet()
     test_switch_requires_consecutive_clear_leader()
+    test_a_marker_does_not_inherit_a_missing_possessor()
+    test_predicted_ball_does_not_keep_a_holder_the_other_team_has_passed()
     test_a_fast_ball_is_taken_only_by_the_player_it_reaches()
     test_a_fast_ball_sixty_pixels_away_opens_no_possession()
     print("possession engine tests passed")
