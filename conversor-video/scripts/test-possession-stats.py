@@ -6,7 +6,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server/services/analysis/yolo"))
 
-from possession_stats import PossessionTeamAccumulator  # noqa: E402
+from possession_stats import (  # noqa: E402
+    GAP_EDGE_SECONDS,
+    LONG_GAP_SECONDS,
+    PossessionTeamAccumulator,
+)
 
 
 def assert_equal(actual, expected, label):
@@ -97,6 +101,43 @@ def test_a_later_pass_does_not_reclaim_an_earlier_gap():
     assert_equal(report["frames_without_possessor"], 10, "the earlier conduction gap stays empty")
 
 
+def test_a_long_same_team_gap_keeps_only_its_edges():
+    fps = 10
+    edge = int(round(fps * GAP_EDGE_SECONDS))
+    gap = int(fps * LONG_GAP_SECONDS) + edge
+    stats = PossessionTeamAccumulator(fps=fps)
+    stats.observe("Team 1")
+    for _ in range(gap):
+        stats.observe(None)
+    report = stats.observe("Team 1")
+    assert_equal(report["frames_reassigned_team_1"], edge * 2, "only the two edges move")
+    assert_equal(report["frames_without_possessor"], gap - edge * 2, "the middle stays empty")
+    assert_equal(report["frames_team_1"], 2 + edge * 2, "the edges join the confirmed frames")
+    assert_equal(report["frames_reassigned_team_0"], 0, "the other team receives nothing")
+    assert_equal(report["frames_total"], gap + 2, "no frame was counted twice")
+
+
+def test_a_long_gap_that_ends_with_the_other_team_stays_empty():
+    stats = PossessionTeamAccumulator(fps=10)
+    stats.observe("Team 1")
+    for _ in range(16):
+        stats.observe(None)
+    report = stats.observe("Team 0")
+    assert_equal(report["frames_reassigned_team_0"], 0, "the new team does not inherit the gap")
+    assert_equal(report["frames_reassigned_team_1"], 0, "the old team does not keep the edges")
+    assert_equal(report["frames_without_possessor"], 16, "a change of team leaves the gap empty")
+
+
+def test_a_pass_still_closes_a_long_gap():
+    stats = PossessionTeamAccumulator(fps=10)
+    stats.observe("Team 0")
+    for _ in range(16):
+        stats.observe(None)
+    report = stats.observe("Team 0", [{"type": "pass", "team": "Team 0"}])
+    assert_equal(report["frames_reassigned_team_0"], 16, "a confirmed pass still moves the whole flight")
+    assert_equal(report["frames_without_possessor"], 0, "the pass left nothing empty")
+
+
 def test_video_that_ends_open_keeps_the_gap_empty():
     stats = PossessionTeamAccumulator(fps=30)
     stats.observe("Team 0")
@@ -121,6 +162,9 @@ if __name__ == "__main__":
     test_same_team_pass_reassigns_the_open_interval_once()
     test_conduction_turnover_and_unconfirmed_keep_the_gap_empty()
     test_a_later_pass_does_not_reclaim_an_earlier_gap()
+    test_a_long_same_team_gap_keeps_only_its_edges()
+    test_a_long_gap_that_ends_with_the_other_team_stays_empty()
+    test_a_pass_still_closes_a_long_gap()
     test_video_that_ends_open_keeps_the_gap_empty()
     test_missing_fps_still_counts_frames()
     print("possession stats tests passed")
