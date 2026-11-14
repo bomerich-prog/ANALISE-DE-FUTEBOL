@@ -42,7 +42,7 @@ from roboflow_ball import BallTracker
 from roboflow_soccer_config import SoccerPitchConfiguration
 from roboflow_team import TeamClassifier, TeamTrackLock, crops_form_two_teams, reject_training_crop
 from pitch_homography import PitchHomographyGate, draw_projected_pitch
-from pitch_map import VisiblePitchMap, draw_visible_penalty
+from pitch_map import VisiblePitchMap, draw_visible_centre, draw_visible_penalty
 from roboflow_view import ViewTransformer
 from spatial_metrics import SpatialMetrics
 
@@ -4639,7 +4639,11 @@ def analyze(args):
             _draw_homography_debug(output_frame, homography_decision)
             if debug_frame is not None:
                 _draw_homography_debug(debug_frame, homography_decision)
-        if map_decision.get("matrix") is not None and map_decision.get("positive_x") is not None:
+        if map_decision.get("matrix") is not None and map_decision.get("region") == "centre":
+            draw_visible_centre(output_frame, map_decision["matrix"])
+            if debug_frame is not None:
+                draw_visible_centre(debug_frame, map_decision["matrix"])
+        elif map_decision.get("matrix") is not None and map_decision.get("positive_x") is not None:
             draw_visible_penalty(
                 output_frame,
                 map_decision["matrix"],

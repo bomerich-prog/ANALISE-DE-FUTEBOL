@@ -18,6 +18,7 @@ from pitch_map import (  # noqa: E402
     front_image_point,
     inside_measured,
     inside_visible,
+    marker_bgr,
     paint_patch,
     replacement_verdict,
     scale_is_stable,
@@ -92,6 +93,35 @@ def test_heatmap_reads_the_map_channel():
     report = heatmap.as_dict()
     assert_equal(report["cells"][0][0], 1, "map_x wins over a field coordinate")
     assert_equal(report["observed_points"], 1, "the map point is counted")
+
+
+def test_marker_colours_follow_the_team():
+    assert_equal(marker_bgr("player", 0), (255, 64, 0), "team 0 is blue")
+    assert_equal(marker_bgr("player", 1), (0, 0, 255), "team 1 is red")
+    assert_equal(marker_bgr("goalkeeper", 0)[0], 255, "a goalkeeper keeps the team colour")
+    assert_equal(marker_bgr("referee"), (0, 255, 255), "the referee is yellow")
+    assert_equal(marker_bgr("ball"), (0, 140, 255), "the ball is orange")
+    assert_equal(marker_bgr("player", None), (180, 180, 180), "a player without a team stays neutral")
+
+
+def test_the_centre_circle_publishes_the_middle():
+    pitch_map = VisiblePitchMap()
+    decision = pitch_map.update(_centre_circle_mask())
+    assert_true(decision["accepted"] and decision["region"] == "centre", "the open camera locks the middle")
+    near = pitch_map.project(np.array([[520.0, 430.0]], dtype=np.float32))
+    assert_true(near[0] is not None, "a player beside the circle stays on the map")
+    assert_true(3000.0 <= near[0][0] <= 9000.0, "that player is in the middle 60 m")
+    blank = np.zeros((750, 1338), dtype=np.uint8)
+    for _ in range(15):
+        assert_true(pitch_map.update(blank)["accepted"], "a short gap keeps the centre")
+    assert_true(not pitch_map.update(blank)["accepted"], "the centre bridge ends")
+
+
+def _centre_circle_mask():
+    mask = np.zeros((750, 1338), dtype=np.uint8)
+    cv2.line(mask, (400, 180), (400, 680), 255, 5)
+    cv2.circle(mask, (400, 430), 120, 255, 5)
+    return mask
 
 
 def test_the_measured_strip_does_not_erase_the_visible_third():
@@ -337,6 +367,8 @@ def main():
     test_map_coordinates_do_not_change_possession_distance()
     test_heatmap_reads_the_map_channel()
     test_projection_drops_the_far_half()
+    test_marker_colours_follow_the_team()
+    test_the_centre_circle_publishes_the_middle()
     test_the_measured_strip_does_not_erase_the_visible_third()
     test_spatial_metrics_use_only_mapped_players()
     test_a_box_in_the_stands_is_not_published()

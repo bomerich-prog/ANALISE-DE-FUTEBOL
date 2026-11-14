@@ -12,7 +12,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server/services/an
 from pitch_homography import (  # noqa: E402
     PitchHomographyGate,
     _affine_matrix,
+    _goal_mouth_contradicts,
     _side_matches_image,
+    fit_broadcast_centre,
     fit_broadcast_penalty,
     line_support,
 )
@@ -214,6 +216,68 @@ def _penalty_mask(shift, width=1920, height=1080):
     return mask
 
 
+def test_posts_on_the_goal_side_do_not_veto_perspective():
+    # The posts are far past the affine goal, but still on its side of the line.
+    width = 1338.0
+    center = np.array([700.0, 300.0])
+    gap = 80.0
+    toward_goal = np.array([1.0, 0.0])
+    posts = (
+        (1000.0, 1000.0, 200.0, 280.0, width),
+        (1110.0, 1110.0, 200.0, 280.0, width),
+    )
+    assert_true(
+        not _goal_mouth_contradicts(posts, center, gap, toward_goal, True),
+        "posts beyond the affine goal still belong to that penalty",
+    )
+    away_from_goal = np.array([-1.0, 0.0])
+    assert_true(
+        _goal_mouth_contradicts(posts, center, gap, away_from_goal, True),
+        "posts on the arc side of the line are not this goal",
+    )
+
+
+def _shallow_penalty_mask():
+    """A 16.5 m line lying at about 10 degrees, which the old 16 degree gate dropped."""
+    mask = np.zeros((750, 1338), dtype=np.uint8)
+    start = np.array([180.0, 430.0])
+    end = np.array([980.0, 570.0])
+    direction = end - start
+    direction = direction / np.linalg.norm(direction)
+    perp = np.array([-direction[1], direction[0]])
+    gap = 110.0
+    center = (start + end) / 2.0 + perp * gap
+    radius = gap * 9.15 / 5.5
+    cv2.line(mask, tuple(np.round(start).astype(int)), tuple(np.round(end).astype(int)), 255, 5)
+    base = np.arctan2(-perp[1], -perp[0])
+    points = []
+    for degrees in np.linspace(-50, 50, 70):
+        angle = base + np.deg2rad(degrees)
+        points.append(center + radius * np.array([np.cos(angle), np.sin(angle)]))
+    cv2.polylines(mask, [np.round(np.array(points)).astype(np.int32)], False, 255, 5)
+    return mask
+
+
+def test_a_shallow_penalty_line_is_still_the_box():
+    fit = fit_broadcast_penalty(_shallow_penalty_mask(), SoccerPitchConfiguration(), frame=None)
+    assert_true(fit is not None and fit["region"] == "penalty", "a 10 degree line can still be the 16.5 m line")
+
+
+def _centre_mask():
+    mask = np.zeros((750, 1338), dtype=np.uint8)
+    cv2.line(mask, (400, 180), (400, 680), 255, 5)
+    cv2.circle(mask, (400, 430), 120, 255, 5)
+    return mask
+
+
+def test_the_centre_circle_is_not_a_penalty():
+    pitch = SoccerPitchConfiguration()
+    centre = fit_broadcast_centre(_centre_mask(), pitch, frame=None)
+    assert_true(centre is not None and centre["region"] == "centre", "the halfway line and the circle publish the middle")
+    assert_true(fit_broadcast_penalty(_centre_mask(), pitch, frame=None) is None, "that circle is not a penalty arc")
+    assert_true(fit_broadcast_centre(_penalty_mask((0.0, 0.0)), pitch, frame=None) is None, "a penalty arc is not the centre circle")
+
+
 def test_a_right_hand_penalty_is_published_on_the_right():
     pitch = SoccerPitchConfiguration()
     left = fit_broadcast_penalty(_penalty_mask((0.0, 0.0)), pitch, frame=None)
@@ -233,6 +297,9 @@ def main():
     test_hold_expires()
     test_four_points_do_not_register_the_pitch()
     test_a_goal_that_steps_back_past_the_line_is_the_other_end()
+    test_posts_on_the_goal_side_do_not_veto_perspective()
+    test_a_shallow_penalty_line_is_still_the_box()
+    test_the_centre_circle_is_not_a_penalty()
     test_a_line_on_the_right_cannot_be_the_left_goal()
     test_a_right_hand_penalty_is_published_on_the_right()
     print("pitch homography gate tests passed")

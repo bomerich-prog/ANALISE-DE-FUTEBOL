@@ -19,12 +19,20 @@ import numpy as np
 from pitch_homography import (
     _painted_arc_distance,
     _clean_paint,
+    fit_broadcast_centre,
     fit_broadcast_penalty,
 )
 from roboflow_soccer_config import SoccerPitchConfiguration
 from roboflow_view import ViewTransformer
 
 VISIBLE_THIRD_CM = 3500.0
+# The centre circle fixes the scale. Publish 30 m each side of halfway,
+# which is the grass a midfield camera actually shows.
+CENTRE_HALF_CM = 3000.0
+TEAM_MARKER_BGR = {0: (255, 64, 0), 1: (0, 0, 255)}
+BALL_MARKER_BGR = (0, 140, 255)
+REFEREE_MARKER_BGR = (0, 255, 255)
+NEUTRAL_MARKER_BGR = (180, 180, 180)
 EDGE_TOLERANCE_CM = 100.0
 HOLD_FRAMES = 15
 # While the current arc still sits on the paint, a fit that moves the same
@@ -106,15 +114,36 @@ def replacement_verdict(same_side, scale_ok, shift_cm, line_move_px, coherent, s
     return "scale_jump"
 
 
-def visible_bounds(positive_x, pitch=None):
-    """Field rectangle, in centimetres, of the goal third the camera can see."""
+def visible_bounds(positive_x, pitch=None, region="penalty"):
+    """Field rectangle, in centimetres, of the grass this calibration can see."""
     pitch = pitch or SoccerPitchConfiguration()
     length = float(pitch.length)
     width = float(pitch.width)
+    if region == "centre":
+        half = min(CENTRE_HALF_CM, length / 2.0)
+        return length / 2.0 - half, length / 2.0 + half, 0.0, width
     third = min(VISIBLE_THIRD_CM, length)
     if positive_x:
         return length - third, length, 0.0, width
     return 0.0, third, 0.0, width
+
+
+def marker_bgr(role, team_id=None):
+    """Colour of one dot on the 2D map. Team 0 is blue and team 1 is red."""
+    name = str(role or "").strip().lower()
+    if name == "ball":
+        return BALL_MARKER_BGR
+    if name == "referee":
+        return REFEREE_MARKER_BGR
+    if team_id in TEAM_MARKER_BGR:
+        return TEAM_MARKER_BGR[int(team_id)]
+    try:
+        team = int(team_id)
+    except (TypeError, ValueError):
+        team = None
+    if team in TEAM_MARKER_BGR:
+        return TEAM_MARKER_BGR[team]
+    return NEUTRAL_MARKER_BGR
 
 
 def _project_field(matrix, points):
@@ -306,11 +335,56 @@ def inside_measured(x, y, positive_x, toward_goal_cm, toward_arc_cm, pitch=None,
     return -delta <= float(toward_arc_cm) + tolerance
 
 
-def inside_visible(x, y, positive_x, pitch=None, tolerance=EDGE_TOLERANCE_CM):
+def inside_visible(x, y, positive_x, pitch=None, tolerance=EDGE_TOLERANCE_CM, region="penalty"):
     if not np.isfinite(x) or not np.isfinite(y):
         return False
-    x0, x1, y0, y1 = visible_bounds(positive_x, pitch)
+    x0, x1, y0, y1 = visible_bounds(positive_x, pitch, region)
     return (x0 - tolerance) <= float(x) <= (x1 + tolerance) and (y0 - tolerance) <= float(y) <= (y1 + tolerance)
+
+
+def centre_on_paint(matrix, grass_mask, white_mask, pitch=None):
+    """True when the centre circle and the halfway line still sit on the paint."""
+    if matrix is None:
+        return False
+    pitch = pitch or SoccerPitchConfiguration()
+    length = float(pitch.length)
+    width = float(pitch.width)
+    circle = [
+        (
+            length / 2.0 + 915.0 * np.cos(theta),
+            width / 2.0 + 915.0 * np.sin(theta),
+        )
+        for theta in np.linspace(0, 2 * np.pi, 36, endpoint=False)
+    ]
+    projected = _project_field(matrix, circle)
+    if projected is None or white_mask is None:
+        return False
+    height, frame_width = white_mask.shape[:2]
+    distance = cv2.distanceTransform(cv2.bitwise_not(white_mask), cv2.DIST_L2, 3)
+    samples = []
+    for x, y in projected:
+        if np.isfinite(x) and np.isfinite(y) and 0 <= x < frame_width and 0 <= y < height:
+            samples.append(float(distance[int(y), int(x)]))
+    if len(samples) < 16 or float(np.median(samples)) > ARC_MAX_DISTANCE_PX:
+        return False
+    line = [(length / 2.0, 800.0 + 5400.0 * step) for step in np.linspace(0, 1, 16)]
+    line_points = _project_field(matrix, line)
+    if line_points is None:
+        return False
+    on_frame = [
+        (float(x), float(y))
+        for x, y in line_points
+        if np.isfinite(x) and np.isfinite(y) and 0 <= x < frame_width and 0 <= y < height
+    ]
+    if len(on_frame) < 6:
+        return False
+    white_hits = sum(distance[int(y), int(x)] <= 6 for x, y in on_frame)
+    if white_hits / len(on_frame) < 0.35:
+        return False
+    if grass_mask is None:
+        return True
+    center = _project_one(matrix, (length / 2.0, width / 2.0))
+    return _classify_pixel(center[0], center[1], grass_mask) == "grass"
 
 
 def draw_visible_penalty(
@@ -354,6 +428,26 @@ def draw_visible_penalty(
         _polyline(frame, inverse, np.array(arc, dtype=np.float32), color)
 
 
+def draw_visible_centre(frame, matrix, color=(0, 220, 255)):
+    """Draw the halfway line and the centre circle, and nothing in the stands."""
+    if frame is None or matrix is None:
+        return
+    try:
+        inverse = np.linalg.inv(np.asarray(matrix, dtype=np.float64)).astype(np.float32)
+    except np.linalg.LinAlgError:
+        return
+    pitch = SoccerPitchConfiguration()
+    length = float(pitch.length)
+    width = float(pitch.width)
+    line = [(length / 2.0, width * step) for step in np.linspace(0, 1, 24)]
+    circle = [
+        (length / 2.0 + 915.0 * np.cos(theta), width / 2.0 + 915.0 * np.sin(theta))
+        for theta in np.linspace(0, 2 * np.pi, 36, endpoint=False)
+    ]
+    _polyline(frame, inverse, np.array(line, dtype=np.float32), color)
+    _polyline(frame, inverse, np.array(circle, dtype=np.float32), color)
+
+
 def _polyline(frame, inverse, field_points, color):
     projected = cv2.perspectiveTransform(field_points.reshape(-1, 1, 2), inverse).reshape(-1, 2)
     height, width = frame.shape[:2]
@@ -389,6 +483,7 @@ class VisiblePitchMap:
         self.matrix = None
         self.transformer = None
         self.positive_x = None
+        self.region = None
         self.scale = None
         self.hold_left = 0
         self.generation = 0
@@ -415,25 +510,45 @@ class VisiblePitchMap:
             else:
                 report["toward_goal_cm"] = patch["toward_goal_cm"]
                 report["toward_arc_cm"] = patch["toward_arc_cm"]
+        if report is None:
+            centre = fit_broadcast_centre(white_line_mask, self.pitch, frame)
+            if centre is not None and not (SANE_CM_MIN <= float(centre["cm_per_px"]) <= SANE_CM_MAX):
+                self.reasons["absurd"] += 1
+                centre = None
+            if centre is not None and centre_on_paint(centre["matrix"], grass_mask, white_line_mask, self.pitch):
+                report = centre
+            elif centre is not None:
+                self.reasons["off_pitch"] += 1
         coherent = self._geometry_holds(white_line_mask, grass_mask)
         fresh_view = False
         if report is not None and self.matrix is not None:
-            same_side = bool(report["positive_x"]) == bool(self.positive_x)
-            scale_ok = scale_is_stable(self.scale, report["cm_per_px"])
-            shift = field_shift_cm(self.matrix, report["matrix"])
-            verdict = replacement_verdict(
-                same_side,
-                scale_ok,
-                shift,
-                self._front_move_px(report),
-                coherent,
-            )
-            if verdict == "camera_move":
-                fresh_view = True
-                self.reasons["camera_move"] += 1
-            elif verdict != "nudge":
-                self.reasons[verdict] += 1
-                report = None
+            report_region = report.get("region") or "penalty"
+            if report_region != (self.region or "penalty"):
+                # A living calibration keeps its region. Once it has left the
+                # paint, the other view may take over.
+                if coherent:
+                    self.reasons["region_held"] += 1
+                    report = None
+                else:
+                    fresh_view = True
+                    self.reasons["camera_move"] += 1
+            else:
+                same_side = bool(report["positive_x"]) == bool(self.positive_x)
+                scale_ok = scale_is_stable(self.scale, report["cm_per_px"])
+                shift = field_shift_cm(self.matrix, report["matrix"])
+                verdict = replacement_verdict(
+                    same_side,
+                    scale_ok,
+                    shift,
+                    self._front_move_px(report),
+                    coherent,
+                )
+                if verdict == "camera_move":
+                    fresh_view = True
+                    self.reasons["camera_move"] += 1
+                elif verdict != "nudge":
+                    self.reasons[verdict] += 1
+                    report = None
         if report is not None:
             return self._accept(report, grass_mask, fresh_view=fresh_view)
         if coherent:
@@ -466,7 +581,13 @@ class VisiblePitchMap:
         transformed = self.transformer.transform_points(array.reshape(-1, 2))
         mapped = []
         for (image_x, image_y), (x, y) in zip(array.reshape(-1, 2), transformed):
-            if not inside_visible(float(x), float(y), self.positive_x, self.pitch):
+            if not inside_visible(
+                float(x),
+                float(y),
+                self.positive_x,
+                self.pitch,
+                region=self.region or "penalty",
+            ):
                 mapped.append(None)
                 continue
             if self.grass is not None and _classify_pixel(float(image_x), float(image_y), self.grass) != "grass":
@@ -477,7 +598,9 @@ class VisiblePitchMap:
 
     def metrics(self):
         goal_end = None
-        if self.positive_x is True:
+        if self.region == "centre":
+            goal_end = "centre"
+        elif self.positive_x is True:
             goal_end = "high_x"
         elif self.positive_x is False:
             goal_end = "low_x"
@@ -510,6 +633,7 @@ class VisiblePitchMap:
         self.matrix = report["matrix"]
         self.transformer = ViewTransformer.from_matrix(self.matrix)
         self.positive_x = bool(report["positive_x"])
+        self.region = report.get("region") or "penalty"
         self.scale = scale
         self.toward_goal_cm = report.get("toward_goal_cm")
         self.toward_arc_cm = report.get("toward_arc_cm")
@@ -530,6 +654,8 @@ class VisiblePitchMap:
         """True when the current arc still lands on this frame. The hold counter is ignored."""
         if self.matrix is None or self.positive_x is None:
             return False
+        if self.region == "centre":
+            return centre_on_paint(self.matrix, grass_mask, white_line_mask, self.pitch)
         if grass_mask is not None:
             patch = paint_patch(self.matrix, self.positive_x, grass_mask, white_line_mask, self.pitch)
             if patch is None:
@@ -553,6 +679,7 @@ class VisiblePitchMap:
         self.matrix = None
         self.transformer = None
         self.positive_x = None
+        self.region = None
         self.scale = None
         self.toward_goal_cm = None
         self.toward_arc_cm = None
@@ -569,5 +696,14 @@ class VisiblePitchMap:
             "toward_goal_cm": self.toward_goal_cm,
             "toward_arc_cm": self.toward_arc_cm,
             "generation": self.generation if accepted else None,
-            "goal_end": "high_x" if self.positive_x else "low_x" if self.positive_x is False else None,
+            "region": self.region if accepted else None,
+            "goal_end": (
+                "centre"
+                if self.region == "centre"
+                else "high_x"
+                if self.positive_x
+                else "low_x"
+                if self.positive_x is False
+                else None
+            ),
         }

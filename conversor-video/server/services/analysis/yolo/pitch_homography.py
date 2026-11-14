@@ -39,6 +39,10 @@ _PENALTY_DEPTH_CM = 1650.0
 _SPOT_FROM_GOAL_CM = 1100.0
 _ARC_RADIUS_CM = 915.0
 _SPOT_FROM_FRONT_CM = _PENALTY_DEPTH_CM - _SPOT_FROM_GOAL_CM
+# A side-on camera lays the 16.5 m line down toward 12 degrees. Steeper than
+# this is the halfway line, which belongs to the centre-circle fit.
+_MIN_PENALTY_ANGLE = 8.0
+_MAX_PENALTY_ANGLE = 55.0
 
 
 def _clean_paint(white_line_mask):
@@ -102,7 +106,7 @@ def _penalty_lines(paint):
     families = []
     for segment in _line_segments(paint):
         length, angle, x1, y1, x2, y2 = segment
-        if length < 80 or not (16 <= abs(angle) <= 55):
+        if length < 80 or not (_MIN_PENALTY_ANGLE <= abs(angle) <= _MAX_PENALTY_ANGLE):
             continue
         if min(y1, y2) < paint.shape[0] * 0.28:
             continue
@@ -297,15 +301,17 @@ def _goal_post_groups(frame):
 
 
 def _goal_mouth_contradicts(post_groups, center, gap, perp, positive_x):
-    """True when the goal posts are visible and the arc does not face them.
+    """True when the posts sit on the wrong side of the 16.5 m line.
 
-    The arc fixes the scale: the spot is 5.5m behind the line, so the 7.32m
-    goal has a known width in pixels and its centre is 11m past the spot.
-    A centre-circle cap can satisfy the same arc test, but the real posts
-    then sit well away from that predicted centre.
+    The spot is on the goal's side of that line, so the posts have to be too.
+    A broadcast lens then stretches the goal well past the constant-scale
+    prediction. That extra distance is perspective, not a mirrored field.
+    Posts on the arc's side of the line are another mark, and the fit is refused.
     """
     if not post_groups or gap < 40:
         return False
+    direction = np.asarray(perp, dtype=np.float64)
+    foot = np.asarray(center, dtype=np.float64) - direction * float(gap)
     groups = []
     for x, midpoint_x, y0, y1, width in post_groups:
         # The scoreboard sits on the left. Posts are searched on the goal's side.
@@ -315,8 +321,7 @@ def _goal_mouth_contradicts(post_groups, center, gap, perp, positive_x):
             continue
         groups.append((midpoint_x, y0, y1))
     expect = _GOAL_WIDTH_CM * gap / _SPOT_FROM_FRONT_CM
-    goal_x = float(center[0] + perp[0] * (2.0 * gap))
-    nearest = None
+    saw_wrong_side = False
     for i in range(len(groups)):
         for j in range(i + 1, len(groups)):
             separation = abs(groups[i][0] - groups[j][0])
@@ -325,11 +330,18 @@ def _goal_mouth_contradicts(post_groups, center, gap, perp, positive_x):
             overlap = min(groups[i][2], groups[j][2]) - max(groups[i][1], groups[j][1])
             if overlap < 10:
                 continue
-            midpoint = 0.5 * (groups[i][0] + groups[j][0])
-            error = abs(midpoint - goal_x)
-            if nearest is None or error < nearest:
-                nearest = error
-    return nearest is not None and nearest > 2.2 * expect
+            midpoint = np.array(
+                [
+                    0.5 * (groups[i][0] + groups[j][0]),
+                    0.5 * (max(groups[i][1], groups[j][1]) + min(groups[i][2], groups[j][2])),
+                ],
+                dtype=np.float64,
+            )
+            # Positive means the posts are on the goal's side of the line.
+            if float(np.dot(midpoint - foot, direction)) >= 0.0:
+                return False
+            saw_wrong_side = True
+    return saw_wrong_side
 
 
 def _side_matches_image(matrix, positive_x, width):
@@ -417,6 +429,137 @@ def fit_broadcast_penalty(white_line_mask, pitch, frame=None):
         "positive_x": positive_x,
         "cm_per_px": _SPOT_FROM_FRONT_CM / gap,
         "front_x_cm": front_x,
+        "region": "penalty",
+    }
+
+
+def _halfway_lines(paint):
+    """Long edges steep or flat enough to be the halfway line, longest first."""
+    families = []
+    height = paint.shape[0]
+    for length, angle, x1, y1, x2, y2 in _line_segments(paint):
+        if length < 90 or not (abs(angle) >= 70.0 or abs(angle) <= 12.0):
+            continue
+        if min(y1, y2) < height * 0.18:
+            continue
+        midpoint = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0], np.float64)
+        placed = False
+        for family in families:
+            if abs(angle - family[0][1]) >= 10:
+                continue
+            _, _, ax, ay, bx, by = family[0]
+            family_direction = np.array([bx - ax, by - ay], np.float64)
+            family_norm = float(np.linalg.norm(family_direction))
+            if family_norm < 1e-6:
+                continue
+            family_direction /= family_norm
+            delta = midpoint - np.array([ax, ay], np.float64)
+            offset = abs(float(delta[0] * family_direction[1] - delta[1] * family_direction[0]))
+            if offset < 16:
+                family.append((length, angle, x1, y1, x2, y2))
+                placed = True
+                break
+        if not placed:
+            families.append([(length, angle, x1, y1, x2, y2)])
+    lines = []
+    for family in families:
+        total = sum(item[0] for item in family)
+        if total < 200:
+            continue
+        fitted = _family_line(family)
+        if fitted is None:
+            continue
+        lines.append((total, fitted[0], fitted[1]))
+    lines.sort(key=lambda item: item[0], reverse=True)
+    return [(origin, direction) for _total, origin, direction in lines]
+
+
+def _circle_on_halfway_line(paint, origin, direction):
+    """A centre circle whose centre lies on this line, or None.
+
+    The penalty arc sits 5.5 m off its line. The centre circle is cut by the
+    halfway line, so its centre is on that line and more than half of it is painted.
+    """
+    height, width = paint.shape
+    distance = cv2.distanceTransform(cv2.bitwise_not(paint), cv2.DIST_L2, 3)
+    best = None
+    for along in range(-420, 421, 16):
+        center = origin + direction * float(along)
+        if not (20 <= center[0] < width - 20 and height * 0.20 <= center[1] <= height * 0.88):
+            continue
+        for radius in range(70, 251, 8):
+            close_angles = []
+            inside = 0
+            for step in range(48):
+                theta = 2.0 * np.pi * step / 48.0
+                point = center + radius * np.array([np.cos(theta), np.sin(theta)])
+                if not (0 <= point[0] < width and height * 0.16 <= point[1] < height * 0.92):
+                    continue
+                inside += 1
+                if distance[int(point[1]), int(point[0])] <= 6.0:
+                    close_angles.append(theta)
+            if inside < 18 or len(close_angles) / inside < 0.55:
+                continue
+            angles = np.sort(np.array(close_angles))
+            gaps = np.diff(angles)
+            wrap = angles[0] + 2.0 * np.pi - angles[-1]
+            span = 2.0 * np.pi - max(float(gaps.max()) if len(gaps) else 0.0, float(wrap))
+            if span < np.radians(160):
+                continue
+            cover = len(close_angles) / inside
+            rank = (-cover, -len(close_angles))
+            if best is None or rank < best[0]:
+                best = (rank, center, float(radius), cover)
+    if best is None:
+        return None
+    _rank, center, radius, cover = best
+    return center, radius, cover
+
+
+def fit_broadcast_centre(white_line_mask, pitch, frame=None):
+    """Image-to-field matrix from the halfway line and the centre circle.
+
+    Used when the penalty has left the picture. Image-right is the high-x
+    half, which is where a camera that has panned off the right goal still
+    looks. Returns None when that circle is not on the paint.
+    """
+    del frame
+    paint = _clean_paint(white_line_mask)
+    if paint is None or pitch is None:
+        return None
+    best = None
+    for origin, direction in _halfway_lines(paint):
+        found = _circle_on_halfway_line(paint, origin, direction)
+        if found is None:
+            continue
+        center, radius, cover = found
+        cm_per_px = _ARC_RADIUS_CM / radius
+        if not (2.0 <= cm_per_px <= 25.0):
+            continue
+        perp = np.array([-direction[1], direction[0]], dtype=np.float64)
+        if perp[0] < 0.0 or (abs(perp[0]) < 1e-6 and perp[1] < 0.0):
+            perp = -perp
+        matrix = _affine_matrix(
+            center,
+            direction,
+            perp,
+            1.0 / cm_per_px,
+            float(pitch.length) / 2.0,
+            float(pitch.width),
+            True,
+        )
+        rank = (-cover, cm_per_px)
+        if best is None or rank < best[0]:
+            best = (rank, matrix, cm_per_px)
+    if best is None:
+        return None
+    _rank, matrix, cm_per_px = best
+    return {
+        "matrix": matrix,
+        "positive_x": True,
+        "cm_per_px": float(cm_per_px),
+        "front_x_cm": float(pitch.length) / 2.0,
+        "region": "centre",
     }
 
 
