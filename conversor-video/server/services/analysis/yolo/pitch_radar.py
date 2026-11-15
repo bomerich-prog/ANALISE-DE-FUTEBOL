@@ -120,6 +120,137 @@ class RadarSmoother:
         return point
 
 
+# A lost player keeps his dot this many frames, as long as the tracker keeps his ID.
+RADAR_HOLD_FRAMES = 60
+# A new ID this close to a lost dot of the same team is the same player.
+_RELINK_BASE_CM = 300.0
+_RELINK_CM_PER_FRAME = 30.0
+_RELINK_MAX_CM = 1500.0
+_RELINK_CLEAR_RATIO = 1.3
+
+
+def _role_group(role):
+    return "Referee" if role == "Referee" else "Player"
+
+
+class RadarMemory:
+    """Players on the radar, kept on their last spot while the detector misses them.
+
+    Each dot is a slot. A track ID owns its slot while it is seen. A missed
+    player keeps his dot where he was last mapped, for up to hold_frames.
+    When the tracker gives a lost player a new ID, the new ID takes over the
+    lost dot if it appears close to it, on the same team, and no other lost
+    dot is about as close. Only the drawing uses this: possession, passes and
+    the contest read the tracker as before.
+    """
+
+    def __init__(self, hold_frames=RADAR_HOLD_FRAMES):
+        self.hold_frames = int(hold_frames)
+        self._slots = {}
+        self._slot_of_track = {}
+        self._next_slot = 0
+        self.held_dots = 0
+        self.relinked_ids = 0
+
+    def update(self, frame_number, players):
+        """All dots of this frame: the players seen now and the lost ones still held.
+
+        players: dicts with x, y, role, team_id, track_id (track_id may be None).
+        """
+        seen = []
+        loose = []
+        fresh = []
+        for player in players:
+            track = player.get("track_id")
+            if track is None:
+                loose.append(dict(player))
+                continue
+            slot = self._slot_of_track.get(track)
+            if slot is not None and slot in self._slots and self._slots[slot]["track_id"] == track:
+                seen.append((slot, player))
+            else:
+                fresh.append(player)
+        taken = {slot for slot, _player in seen}
+        for slot, player in seen:
+            self._store(slot, player, frame_number)
+        for player, slot in self._relink(fresh, taken, frame_number):
+            if slot is None:
+                slot = self._next_slot
+                self._next_slot += 1
+            else:
+                self.relinked_ids += 1
+            self._slot_of_track[player["track_id"]] = slot
+            taken.add(slot)
+            self._store(slot, player, frame_number)
+        self._expire(frame_number)
+        dots = []
+        for slot, entry in self._slots.items():
+            dot = dict(entry["player"])
+            dot["tracker_id"] = entry["track_id"]
+            dot["track_id"] = entry["label"]
+            dot["slot"] = slot
+            dot["held"] = slot not in taken
+            if dot["held"]:
+                self.held_dots += 1
+            dots.append(dot)
+        return dots + loose
+
+    def _store(self, slot, player, frame_number):
+        # The dot keeps the number it was first drawn with, even after a new tracker ID.
+        label = self._slots[slot]["label"] if slot in self._slots else player["track_id"]
+        self._slots[slot] = {
+            "player": dict(player),
+            "track_id": player["track_id"],
+            "label": label,
+            "frame": frame_number,
+        }
+
+    def _relink(self, fresh, taken, frame_number):
+        """Each new ID with the lost dot it continues, or None. Nearest pairs first."""
+        lost = [
+            slot
+            for slot, entry in self._slots.items()
+            if slot not in taken and entry["frame"] < frame_number
+        ]
+        options = []
+        for index, player in enumerate(fresh):
+            near = []
+            for slot in lost:
+                entry = self._slots[slot]
+                old = entry["player"]
+                if _role_group(old.get("role")) != _role_group(player.get("role")):
+                    continue
+                if old.get("team_id") != player.get("team_id"):
+                    continue
+                gap = frame_number - entry["frame"]
+                reach = min(_RELINK_BASE_CM + _RELINK_CM_PER_FRAME * gap, _RELINK_MAX_CM)
+                distance = float(np.hypot(player["x"] - old["x"], player["y"] - old["y"]))
+                if distance <= reach:
+                    near.append((distance, slot))
+            near.sort()
+            if not near:
+                continue
+            # Two lost dots about as close: no guess.
+            if len(near) > 1 and near[1][0] <= near[0][0] * _RELINK_CLEAR_RATIO + 50.0:
+                continue
+            options.append((near[0][0], index, near[0][1]))
+        chosen = {}
+        used = set()
+        for _distance, index, slot in sorted(options):
+            if index in chosen or slot in used:
+                continue
+            chosen[index] = slot
+            used.add(slot)
+        return [(player, chosen.get(index)) for index, player in enumerate(fresh)]
+
+    def _expire(self, frame_number):
+        for slot in [s for s, entry in self._slots.items() if frame_number - entry["frame"] > self.hold_frames]:
+            track = self._slots[slot]["track_id"]
+            del self._slots[slot]
+            if self._slot_of_track.get(track) == slot:
+                del self._slot_of_track[track]
+
+
 def _layout(frame_shape, width_share=0.30, margin_px=16):
     """Pixel box of the radar in the bottom-right corner, and centimetres per pixel."""
     height, width = frame_shape[:2]

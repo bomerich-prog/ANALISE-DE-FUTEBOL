@@ -33,7 +33,7 @@ from pitch_map import (  # noqa: E402
     _width_terms,
 )
 from pitch_centre import fit_centre_on_ink  # noqa: E402
-from pitch_radar import RADAR_LENGTH_CM, RADAR_WIDTH_CM, draw_radar, to_radar  # noqa: E402
+from pitch_radar import RADAR_LENGTH_CM, RADAR_WIDTH_CM, RadarMemory, draw_radar, to_radar  # noqa: E402
 from possession import _player_distance  # noqa: E402
 from roboflow_soccer_config import SoccerPitchConfiguration  # noqa: E402
 from roboflow_view import ViewTransformer  # noqa: E402
@@ -849,6 +849,49 @@ def test_the_camera_on_the_halfway_line_follows_a_pan():
     assert_true(error(matrix) < 0.5 * error(fit), "the camera beats the skewed fit on the far side")
 
 
+def _dot(track, x, y, team=0, role="Player"):
+    return {"x": x, "y": y, "role": role, "team_id": team, "track_id": track}
+
+
+def test_a_missed_player_keeps_his_dot_on_his_last_spot():
+    memory = RadarMemory(hold_frames=60)
+    memory.update(0, [_dot(7, 3000.0, 2000.0), _dot(8, 6000.0, 4000.0, team=1)])
+    held = memory.update(1, [_dot(8, 6050.0, 4000.0, team=1)])
+    assert_true(len(held) == 2, "the missed player is still on the radar")
+    seven = [dot for dot in held if dot["track_id"] == 7][0]
+    assert_true((seven["x"], seven["y"]) == (3000.0, 2000.0) and seven["held"], "his dot stays where he was last seen")
+    back = memory.update(5, [_dot(7, 3400.0, 2100.0), _dot(8, 6100.0, 4000.0, team=1)])
+    seven = [dot for dot in back if dot["track_id"] == 7][0]
+    assert_true((seven["x"], seven["y"]) == (3400.0, 2100.0) and not seven["held"], "the dot moves when he is seen again")
+    for frame in range(6, 66):
+        dots = memory.update(frame, [_dot(8, 6100.0, 4000.0, team=1)])
+    assert_true(len(dots) == 2, "the dot is held for the 60 frames")
+    dots = memory.update(66, [_dot(8, 6100.0, 4000.0, team=1)])
+    assert_true(len(dots) == 1, "after 60 frames without him the dot goes")
+
+
+def test_a_new_id_near_a_lost_dot_continues_it():
+    memory = RadarMemory(hold_frames=60)
+    memory.update(0, [_dot(7, 3000.0, 2000.0), _dot(9, 8000.0, 2000.0), _dot(8, 3300.0, 2000.0, team=1)])
+    memory.update(1, [_dot(9, 8000.0, 2000.0), _dot(8, 3300.0, 2000.0, team=1)])
+    dots = memory.update(4, [_dot(21, 3150.0, 2050.0), _dot(9, 8000.0, 2000.0), _dot(8, 3300.0, 2000.0, team=1)])
+    assert_true(len(dots) == 3, "the new ID takes over the lost dot: no double")
+    assert_true(memory.relinked_ids == 1, "one ID relinked")
+    assert_true(7 in [dot["track_id"] for dot in dots], "the dot keeps the player's first number")
+    # Another lost dot of the other team nearby is never taken.
+    memory.update(5, [_dot(21, 3150.0, 2050.0), _dot(9, 8000.0, 2000.0)])
+    dots = memory.update(6, [_dot(21, 3150.0, 2050.0), _dot(9, 8000.0, 2000.0), _dot(30, 3320.0, 2000.0, team=0)])
+    assert_true(len(dots) == 4, "a new ID of the other team keeps its own dot")
+
+
+def test_two_lost_dots_about_as_close_are_not_guessed():
+    memory = RadarMemory(hold_frames=60)
+    memory.update(0, [_dot(1, 3000.0, 2000.0), _dot(2, 3400.0, 2000.0)])
+    memory.update(1, [])
+    dots = memory.update(2, [_dot(5, 3200.0, 2000.0)])
+    assert_true(len(dots) == 3 and memory.relinked_ids == 0, "an ambiguous new ID gets its own dot")
+
+
 def main():
     cv2.setRNGSeed(0)
     test_scale_jump_is_rejected_and_the_third_is_35_m()
@@ -880,6 +923,9 @@ def main():
     test_a_short_gap_keeps_the_last_matrix_then_drops_it()
     test_replacement_refuses_a_mirror_and_allows_a_far_camera()
     test_the_camera_on_the_halfway_line_follows_a_pan()
+    test_a_missed_player_keeps_his_dot_on_his_last_spot()
+    test_a_new_id_near_a_lost_dot_continues_it()
+    test_two_lost_dots_about_as_close_are_not_guessed()
     print("pitch map tests passed")
 
 

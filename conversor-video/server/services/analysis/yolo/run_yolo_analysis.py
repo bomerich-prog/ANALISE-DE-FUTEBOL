@@ -43,7 +43,7 @@ from roboflow_soccer_config import SoccerPitchConfiguration
 from roboflow_team import TeamClassifier, TeamTrackLock, crops_form_two_teams, reject_training_crop
 from pitch_homography import PitchHomographyGate, draw_projected_pitch
 from pitch_map import VisiblePitchMap, draw_visible_centre, draw_visible_penalty
-from pitch_radar import RadarSmoother, TeamColours, draw_radar
+from pitch_radar import RadarMemory, RadarSmoother, TeamColours, draw_radar
 from roboflow_view import ViewTransformer
 from spatial_metrics import SpatialMetrics
 
@@ -646,8 +646,11 @@ def assign_map_coordinates(detections, pitch_map, anchor_getter):
         detection["map_y"] = float(point[1])
 
 
-def radar_frame(pitch_map, smoother, frame_number, people, ball, frame_shape):
-    """Players and ball of this frame on the radar, from the same map matrix."""
+def radar_frame(pitch_map, smoother, frame_number, people, ball, frame_shape, memory=None):
+    """Players and ball of this frame on the radar, from the same map matrix.
+
+    With a memory, a player the detector misses keeps his dot on his last spot.
+    """
     players = []
     if pitch_map is None or pitch_map.transformer is None:
         return players, None, None
@@ -672,6 +675,8 @@ def radar_frame(pitch_map, smoother, frame_number, people, ball, frame_shape):
         mapped = pitch_map.radar_points(np.array([detection_center(ball["box"])], dtype=np.float32))
         if mapped and mapped[0] is not None:
             ball_point = smoother.smooth("ball", frame_number, mapped[0])
+    if memory is not None:
+        players = memory.update(frame_number, players)
     return players, ball_point, pitch_map.radar_view(frame_shape)
 
 
@@ -3282,6 +3287,8 @@ def analyze(args):
     ball_heatmap = BallHeatmapAccumulator(pitch=SOCCER_PITCH_CONFIGURATION)
     visible_pitch_map = VisiblePitchMap(pitch=SOCCER_PITCH_CONFIGURATION)
     radar_smoother = RadarSmoother()
+    # The radar holds a lost player as long as ByteTrack keeps his ID (its buffer scales with fps).
+    radar_memory = RadarMemory(hold_frames=max(1, int(float(fps) / 30.0 * BYTE_TRACK_LOST_TRACK_BUFFER)))
     radar_team_colours = TeamColours()
     spatial_metrics = SpatialMetrics(fps=fps)
     pitch_homography_gate = PitchHomographyGate(pitch=SOCCER_PITCH_CONFIGURATION)
@@ -4791,6 +4798,7 @@ def analyze(args):
                 + [("Referee", detection) for detection in accepted_referee_detections],
                 ball_detections[0] if ball_detections else None,
                 output_frame.shape,
+                radar_memory,
             )
             team_colours = radar_team_colours.colours()
             draw_radar(output_frame, radar_players, radar_ball, radar_view, team_colours)
