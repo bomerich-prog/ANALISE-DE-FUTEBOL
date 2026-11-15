@@ -3,9 +3,12 @@
 The fit uses the painted 16.5 m line and the 9.15 m arc, which fixes the scale
 at the penalty spot 5.5 m behind that line. When the two ends of that line are
 on the paint, the width follows those corners, so the far half and the near
-half can have different pixel lengths. A side is the thin painted ridge that
-leaves a corner toward the goal, and a player's width is where a line parallel
-to that ridge meets the 16.5 m line. The arc scale is left alone. Coordinates
+half can have different pixel lengths. A side is the thin painted line that
+leaves a corner toward the goal. It ends where it meets the goal line, the
+point where three painted lines leave together, or at the picture edge when
+the goal line is not in the picture. A side with no paint in the picture takes
+the other side's angle. A player's width is where a line parallel to the side
+meets the 16.5 m line. The arc scale is left alone. Coordinates
 are published inside the 35 m third of the goal the calibration is looking at.
 The grass probe accepts or rejects that calibration. It does not erase a player
 or the ball who already land inside the third. A short gap keeps the last good
@@ -566,158 +569,360 @@ def _gray_image(frame):
     return image.astype(np.float32)
 
 
-def _sample_gray(gray, x, y):
-    height, width = gray.shape[:2]
-    xi = int(round(float(x)))
-    yi = int(round(float(y)))
-    if not (0 <= xi < width and 0 <= yi < height):
+_INK_STEP = 2.0
+_SIDE_MIN_PX = 100.0
+_SIDE_MIN_LIT = 0.8
+_SIDE_OPEN_PX = 150.0
+_SIDE_OPEN_LIT = 0.9
+
+
+def line_ink(frame, grass, white_mask=None):
+    """Thin bright marks on the grass. A far line is too faint for the white mask.
+
+    The darkest channel is low on grass and high on paint. A top-hat keeps
+    what is narrower than a line and drops shirts, boards and mowing stripes.
+    """
+    image = np.asarray(frame)
+    if image.ndim != 3 or grass is None:
         return None
-    return float(gray[yi, xi])
+    low = np.min(image, axis=2)
+    top = cv2.morphologyEx(
+        low, cv2.MORPH_TOPHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    )
+    near = cv2.dilate(grass, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+    ink = ((top >= 14) & (near > 0)).astype(np.uint8) * 255
+    core = (cv2.distanceTransform(ink, cv2.DIST_L2, 3) >= 4.0).astype(np.uint8) * 255
+    blobs = cv2.dilate(core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
+    ink = cv2.bitwise_and(ink, cv2.bitwise_not(blobs))
+    if white_mask is not None:
+        ink = cv2.bitwise_or(ink, white_mask)
+    ink[: int(ink.shape[0] * CROWD_BAND), :] = 0
+    return ink
 
 
-def _leaves_pitch(gray, grass, x, y):
-    """True on the stands, the boards, or a pixel that is not grass."""
-    height, width = gray.shape[:2]
-    xi = int(round(float(x)))
-    yi = int(round(float(y)))
-    if not (1 <= xi < width - 1 and 1 <= yi < height - 1):
-        return True
-    if yi < height * CROWD_BAND:
-        return True
-    if grass is not None and int(grass[yi, xi]) == 0:
-        return True
-    if float(gray[yi, xi]) >= 180.0:
-        return True
-    above = gray[max(0, yi - 16): max(0, yi - 4), xi]
-    if above.size and float(np.mean(above >= 185.0)) > 0.45:
-        return True
-    return False
+def _unit(vector):
+    vector = np.asarray(vector, dtype=np.float64)
+    norm = float(np.linalg.norm(vector))
+    return vector / norm if norm > 1e-9 else vector
 
 
-def _ridge_contrast(gray, x, y, normal):
-    center = _sample_gray(gray, x, y)
-    if center is None or center >= 180.0:
-        return None
-    left = _sample_gray(gray, x + normal[0] * 5.0, y + normal[1] * 5.0)
-    right = _sample_gray(gray, x - normal[0] * 5.0, y - normal[1] * 5.0)
-    if left is None or right is None:
-        return None
-    return center - max(left, right)
+def _lit(ink, points):
+    """Which sample points sit on the ink, and which are inside the picture."""
+    height, width = ink.shape[:2]
+    xs = np.rint(points[..., 0]).astype(np.int64)
+    ys = np.rint(points[..., 1]).astype(np.int64)
+    inside = (xs >= 0) & (xs < width) & (ys >= 0) & (ys < height)
+    lit = np.zeros(xs.shape, dtype=bool)
+    lit[inside] = ink[ys[inside], xs[inside]] > 0
+    return lit, inside
 
 
-def _angle_between(first, second):
-    cross = float(first[0] * second[1] - first[1] * second[0])
-    dot = float(np.dot(first, second))
-    return abs(float(np.degrees(np.arctan2(cross, dot))))
+def _runs(lit, inside, gap):
+    """Each ray's painted run from its start. A long hole or the picture edge ends it."""
+    count = lit.shape[-1]
+    index = np.arange(count)
+    lit = lit & inside
+    last_lit = np.maximum.accumulate(np.where(lit, index, -1), axis=-1)
+    broken = ((index - last_lit) > gap) | (~inside)
+    stop = np.where(broken.any(axis=-1), broken.argmax(axis=-1), count)
+    before = np.clip(stop - 1, 0, count - 1)
+    last = np.take_along_axis(last_lit, before[..., None], axis=-1)[..., 0]
+    last = np.where(stop == 0, -1, last)
+    total = np.cumsum(lit, axis=-1)
+    painted = np.take_along_axis(total, np.clip(last, 0, count - 1)[..., None], axis=-1)[..., 0]
+    painted = np.where(last >= 0, painted, 0)
+    left_picture = np.take_along_axis(~inside, np.clip(stop, 0, count - 1)[..., None], axis=-1)[..., 0]
+    left_picture = left_picture & (stop < count)
+    return last, painted, left_picture
 
 
-def _walk_side(gray, grass, origin, direction, perp, foot):
-    """Follow one fixed direction along the thin ridge. The boards stop it."""
+def _ray_runs(ink, origins, directions, step=_INK_STEP, reach=900.0, gap_px=36.0, skip=8.0):
+    """Painted length and painted share of every ray, origins by directions."""
+    distance = np.arange(skip, reach, step)
+    points = (
+        origins[:, None, None, :]
+        + directions[None, :, None, :] * distance[None, None, :, None]
+    )
+    lit, inside = _lit(ink, points)
+    last, painted, left_picture = _runs(lit, inside, int(gap_px / step))
+    length = np.where(last >= 0, distance[np.clip(last, 0, len(distance) - 1)], 0.0)
+    share = np.where(last >= 0, painted / np.maximum(last + 1, 1), 0.0)
+    return length, share, left_picture
+
+
+def _ray_run(ink, origin, direction, **options):
+    length, share, left_picture = _ray_runs(
+        ink,
+        np.asarray(origin, dtype=np.float64)[None, :],
+        np.asarray(direction, dtype=np.float64)[None, :],
+        **options,
+    )
+    return float(length[0, 0]), float(share[0, 0]), bool(left_picture[0, 0])
+
+
+def _fit_ink_line(ink, origin, direction, start, stop, band):
+    """Least squares on the ink beside a ray. The ray itself when there is too little."""
+    ys, xs = np.where(ink > 0)
+    delta = np.stack([xs, ys], axis=1).astype(np.float64) - origin
     normal = np.array([-direction[1], direction[0]], dtype=np.float64)
-    pos = np.asarray(origin, dtype=np.float64)
-    hits = []
-    gap = 0
-    for _ in range(240):
-        found = None
-        for offset in range(-14, 15, 2):
-            cand = pos + direction * 4.0 + normal * float(offset)
-            if _leaves_pitch(gray, grass, cand[0], cand[1]):
-                continue
-            if abs(float(np.dot(cand - foot, perp))) < 8.0:
-                continue
-            score = _ridge_contrast(gray, cand[0], cand[1], normal)
-            if score is None or score < 6.0:
-                continue
-            if found is None or score > found[0]:
-                found = (score, cand)
-        if found is None:
-            gap += 1
-            if gap > 14:
-                break
-            pos = pos + direction * 4.0
+    forward = delta @ direction
+    keep = (forward >= start) & (forward <= stop) & (np.abs(delta @ normal) <= band)
+    if int(np.count_nonzero(keep)) < 20:
+        return origin, direction
+    points = (delta[keep] + origin).astype(np.float32)
+    vx, vy, x0, y0 = cv2.fitLine(points, cv2.DIST_HUBER, 0, 0.01, 0.01).reshape(-1)
+    fitted = _unit([float(vx), float(vy)])
+    if float(fitted @ direction) < 0.0:
+        fitted = -fitted
+    return np.array([float(x0), float(y0)], dtype=np.float64), fitted
+
+
+def _meet(first_point, first_direction, second_point, second_direction):
+    """Distance along the first line to where it meets the second, or None."""
+    try:
+        solved = np.linalg.solve(
+            np.column_stack([first_direction, -np.asarray(second_direction)]),
+            np.asarray(second_point, dtype=np.float64) - first_point,
+        )
+    except np.linalg.LinAlgError:
+        return None
+    return float(solved[0])
+
+
+def painted_front_line(ink, foot, along, half=650.0, reach=36.0, turn=5.0):
+    """The painted 16.5 m line beside the calibrated one.
+
+    A held matrix lags the camera by a few pixels. The sides have to leave the
+    paint, so the line is searched again a few pixels and degrees around it.
+    """
+    ys, xs = np.where(ink > 0)
+    delta = np.stack([xs, ys], axis=1).astype(np.float64) - foot
+    normal = np.array([-along[1], along[0]], dtype=np.float64)
+    wide = reach + half * float(np.tan(np.radians(turn)))
+    delta = delta[(np.abs(delta @ along) <= half) & (np.abs(delta @ normal) <= wide)]
+    if len(delta) < 80:
+        return foot, along
+    base = float(np.degrees(np.arctan2(along[1], along[0])))
+    best = None
+    for turned in np.arange(-turn, turn + 0.01, 0.5):
+        angle = np.radians(base + turned)
+        direction = np.array([np.cos(angle), np.sin(angle)], dtype=np.float64)
+        across = np.array([-direction[1], direction[0]], dtype=np.float64)
+        bins = np.bincount(
+            np.clip(np.rint(delta @ across + 200.0).astype(np.int64), 0, 400), minlength=401
+        )
+        bins = bins[:-2] + bins[1:-1] + bins[2:]
+        low = int(200 - reach)
+        peak = int(np.argmax(bins[low: int(200 + reach)])) + low
+        if best is None or bins[peak] > best[0]:
+            best = (int(bins[peak]), direction, across, float(peak + 1 - 200.0))
+    votes, direction, across, offset = best
+    if votes < 80:
+        return foot, along
+    keep = np.abs(delta @ across - offset) <= 3.0
+    if int(np.count_nonzero(keep)) < 60:
+        return foot, along
+    points = (delta[keep] + foot).astype(np.float32)
+    vx, vy, x0, y0 = cv2.fitLine(points, cv2.DIST_HUBER, 0, 0.01, 0.01).reshape(-1)
+    fitted = _unit([float(vx), float(vy)])
+    if float(fitted @ along) < 0.0:
+        fitted = -fitted
+    origin = np.array([float(x0), float(y0)], dtype=np.float64)
+    return origin + fitted * float((foot - origin) @ fitted), fitted
+
+
+def _side_fan(along, perp, step):
+    """Directions that leave the 16.5 m line toward the goal."""
+    fan = []
+    for degree in np.arange(-180.0, 180.0, step):
+        direction = np.array(
+            [np.cos(np.radians(degree)), np.sin(np.radians(degree))], dtype=np.float64
+        )
+        if float(direction @ perp) < 0.12:
             continue
-        gap = 0
-        pos = found[1]
-        hits.append(pos.copy())
-    if len(hits) < 12:
-        return None
-    # A late jump onto the board edge leaves the straight ridge. Drop it.
-    end = hits[-1]
-    for point in reversed(hits):
-        offset = float(np.dot(point - origin, normal))
-        if abs(offset) <= 12.0:
-            end = point
+        if abs(float(direction[0] * along[1] - direction[1] * along[0])) < np.sin(np.radians(14.0)):
+            continue
+        fan.append(direction)
+    return np.array(fan, dtype=np.float64)
+
+
+def side_from_line(ink, wide, foot, along, perp, sign, start_px):
+    """The painted side that leaves the 16.5 m line on one side of the arc.
+
+    Every painted station of the line is a possible corner, and the corner is
+    where the longest thin line leaves toward the goal. The touchline never
+    touches the 16.5 m line, and a player on it is a short blob.
+    """
+    height, width = wide.shape[:2]
+    distance = np.arange(float(start_px), 1500.0, _INK_STEP)
+    points = foot[None, :] + sign * distance[:, None] * along[None, :]
+    lit, inside = _lit(wide, points)
+    painted = np.cumsum(lit & inside)
+    stations = []
+    for index in range(0, len(distance), 3):
+        point = points[index]
+        if not (12.0 <= point[0] < width - 12.0 and 12.0 <= point[1] < height - 12.0):
             break
-    length = float(np.linalg.norm(end - origin))
-    if length < 80.0:
+        if index >= 10 and painted[index] / (index + 1.0) < 0.6:
+            continue
+        stations.append(sign * float(distance[index]))
+    fan = _side_fan(along, perp, 2.0)
+    if not stations or len(fan) == 0:
         return None
-    height, width = gray.shape[:2]
-    border = bool(end[0] <= 8.0 or end[1] <= 8.0 or end[0] >= width - 9.0 or end[1] >= height - 9.0)
-    outgoing = (end - origin) / length
-    if float(np.dot(outgoing, perp)) < 0.15:
+    stations = np.array(stations, dtype=np.float64)
+    length, share, _left = _ray_runs(
+        wide, foot[None, :] + stations[:, None] * along[None, :], fan, step=4.0
+    )
+    score = np.where((length >= _SIDE_MIN_PX) & (share >= _SIDE_MIN_LIT), length * share, 0.0)
+    if float(score.max()) <= 0.0:
+        return None
+    at, toward = np.unravel_index(int(np.argmax(score)), score.shape)
+    near = stations[at] + np.arange(-6.0, 6.1, 2.0)
+    base = float(np.degrees(np.arctan2(fan[toward][1], fan[toward][0])))
+    close = np.array(
+        [[np.cos(np.radians(a)), np.sin(np.radians(a))] for a in base + np.arange(-2.5, 2.6, 0.5)],
+        dtype=np.float64,
+    )
+    length, share, _left = _ray_runs(wide, foot[None, :] + near[:, None] * along[None, :], close)
+    at, toward = np.unravel_index(int(np.argmax(length * share)), length.shape)
+    origin = foot + along * float(near[at])
+    point, direction = _fit_ink_line(ink, origin, close[toward], 10.0, float(length[at, toward]), 4.0)
+    station = _meet(foot, along, point, direction)
+    if station is None:
+        return None
+    corner = foot + along * station
+    run, lit_share, left_picture = _ray_run(wide, corner, direction)
+    if run < _SIDE_MIN_PX or lit_share < _SIDE_MIN_LIT:
         return None
     return {
-        "origin": np.asarray(origin, dtype=np.float64),
-        "end": end,
-        "direction": outgoing,
-        "border": border,
-        "hits": len(hits),
+        "corner": corner,
+        "station": float(station),
+        "direction": direction,
+        "length": run,
+        "share": lit_share,
+        "border": left_picture,
+        "junction": None,
     }
 
 
-def side_from_corner(frame, grass, origin, along, perp, foot):
-    """The painted side leaving one corner, toward the goal.
+def crossing_lines(ink, foot, along, perp, min_offset=40.0):
+    """Painted lines that run beside the 16.5 m line on the goal side.
 
-    The side is a thin ridge on the grass, a few degrees off horizontal on a
-    broadcast camera. It is not the perpendicular of the 16.5 m line, and it
-    stops where the grass stops. The picture edge is only where the ink stops.
+    The goal line is one of them. Perspective turns it a few degrees off the
+    16.5 m line, so a small fan of angles is voted and each peak is fitted.
     """
-    gray = _gray_image(frame)
-    if gray is None or origin is None or along is None or perp is None or foot is None:
-        return None
-    origin = np.asarray(origin, dtype=np.float64)
-    along = np.asarray(along, dtype=np.float64)
-    perp = np.asarray(perp, dtype=np.float64)
-    foot = np.asarray(foot, dtype=np.float64)
-    ranked = []
-    for degree in range(-180, 180, 2):
-        direction = np.array(
-            [np.cos(np.radians(degree)), np.sin(np.radians(degree))],
-            dtype=np.float64,
+    ys, xs = np.where(ink > 0)
+    delta = np.stack([xs, ys], axis=1).astype(np.float64) - foot
+    delta = delta[(delta @ perp) > min_offset * 0.5]
+    if len(delta) < 50:
+        return []
+    base = float(np.degrees(np.arctan2(along[1], along[0])))
+    peaks = []
+    for turned in np.arange(-22.0, 22.1, 1.0):
+        angle = np.radians(base + turned)
+        direction = np.array([np.cos(angle), np.sin(angle)], dtype=np.float64)
+        across = np.array([-direction[1], direction[0]], dtype=np.float64)
+        if float(across @ perp) < 0.0:
+            across = -across
+        bins = np.bincount(
+            np.clip(np.rint((delta @ across) / 2.0).astype(np.int64), 0, 2000), minlength=2001
         )
-        if float(np.dot(direction, perp)) < 0.25:
+        for peak in np.argsort(bins)[-6:]:
+            if bins[peak] >= 60 and peak * 2.0 >= min_offset:
+                peaks.append((int(bins[peak]), float(peak * 2.0), direction, across))
+    peaks.sort(key=lambda item: -item[0])
+    kept = []
+    for votes, offset, direction, across in peaks:
+        same = any(
+            abs(offset - other[1]) < 14.0 and float(direction @ other[2]) > np.cos(np.radians(6.0))
+            for other in kept
+        )
+        if same:
             continue
-        if _angle_between(direction, along) < 18.0:
+        kept.append((votes, offset, direction, across))
+        if len(kept) >= 8:
+            break
+    lines = []
+    for _votes, offset, direction, across in kept:
+        keep = np.abs(delta @ across - offset) <= 3.0
+        if int(np.count_nonzero(keep)) < 40:
             continue
-        normal = np.array([-direction[1], direction[0]], dtype=np.float64)
-        scores = []
-        for distance in (36.0, 56.0, 80.0, 108.0, 140.0, 172.0):
-            point = origin + direction * distance
-            if _leaves_pitch(gray, grass, point[0], point[1]):
-                break
-            if abs(float(np.dot(point - foot, perp))) < 10.0:
-                continue
-            score = _ridge_contrast(gray, point[0], point[1], normal)
-            if score is None:
-                continue
-            scores.append(score)
-        if len(scores) < 4:
-            continue
-        positive = sum(1 for score in scores if score >= 6.0)
-        median = float(np.median(scores))
-        if positive >= 3 and median >= 4.0:
-            ranked.append((positive, median, direction))
-    if not ranked:
-        return None
-    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        points = (delta[keep] + foot).astype(np.float32)
+        vx, vy, x0, y0 = cv2.fitLine(points, cv2.DIST_HUBER, 0, 0.01, 0.01).reshape(-1)
+        lines.append((np.array([float(x0), float(y0)], dtype=np.float64), _unit([float(vx), float(vy)])))
+    return lines
+
+
+def side_junction(wide, side, lines):
+    """Where the side meets the goal line: three painted lines leave one point.
+
+    The side arrives, and the goal line goes on to both hands. The line of
+    the small box is parallel too, but it is not painted where the side
+    would cross it. The first painted crossing is the goal line.
+    """
     best = None
-    for _positive, _median, direction in ranked[:3]:
-        walked = _walk_side(gray, grass, origin, direction, perp, foot)
-        if walked is None:
+    for point, direction in lines:
+        reach = _meet(side["corner"], side["direction"], point, direction)
+        if reach is None or reach < 60.0 or reach > side["length"] + 30.0:
             continue
-        if best is None or walked["hits"] > best["hits"]:
-            best = walked
-    return best
+        meeting = side["corner"] + side["direction"] * reach
+        one, _share, _left = _ray_run(wide, meeting, direction, reach=200.0, gap_px=14.0, skip=6.0)
+        other, _share, _left = _ray_run(wide, meeting, -direction, reach=200.0, gap_px=14.0, skip=6.0)
+        both_hands = min(one, other) >= 30.0 and one + other >= 100.0
+        if not both_hands and max(one, other) < 140.0:
+            continue
+        if best is None or reach < best[0]:
+            best = (reach, meeting)
+    return None if best is None else best[1]
+
+
+def penalty_sides(frame, grass, foot, along, perp, start_px, white_mask=None):
+    """The painted sides of the penalty area, each from its corner.
+
+    A side that reaches the goal line ends on that junction. A side whose
+    goal line is off the picture runs to the picture edge. A short or broken
+    line is not a side.
+    """
+    ink = line_ink(frame, grass, white_mask)
+    if ink is None or foot is None or along is None or perp is None:
+        return None
+    wide = cv2.dilate(ink, np.ones((5, 5), np.uint8))
+    foot = np.asarray(foot, dtype=np.float64)
+    foot, along = painted_front_line(ink, foot, _unit(along))
+    perp = _unit(np.asarray(perp, dtype=np.float64) - along * float(np.dot(perp, along)))
+    lines = None
+    sides = {}
+    for name, sign in (("low", -1.0), ("high", 1.0)):
+        side = side_from_line(ink, wide, foot, along, perp, sign, start_px)
+        if side is None:
+            continue
+        if lines is None:
+            lines = crossing_lines(ink, foot, along, perp)
+        side["junction"] = side_junction(wide, side, lines)
+        if side["junction"] is None:
+            to_edge = side["border"] and side["length"] >= _SIDE_OPEN_PX
+            open_run = side["length"] >= _SIDE_OPEN_PX and side["share"] >= _SIDE_OPEN_LIT
+            if not (to_edge or open_run):
+                continue
+        sides[name] = side
+    return {"foot": foot, "along": along, "perp": perp, "sides": sides}
+
+
+def _picture_exit(origin, direction, shape):
+    """Where a ray leaves the grass part of the picture."""
+    height, width = shape[:2]
+    reach = []
+    for value, step, low, high in (
+        (float(origin[0]), float(direction[0]), 0.0, width - 1.0),
+        (float(origin[1]), float(direction[1]), CROWD_BAND * height, height - 1.0),
+    ):
+        if abs(step) < 1e-9:
+            continue
+        reach.append(((high if step > 0 else low) - value) / step)
+    reach = [value for value in reach if value > 0.0]
+    if not reach:
+        return np.asarray(origin, dtype=np.float64)
+    return np.asarray(origin, dtype=np.float64) + np.asarray(direction, dtype=np.float64) * min(reach)
 
 
 def _ink_block(gray, grass, x, y):
@@ -782,8 +987,13 @@ def draw_visible_penalty(
     side_px=None,
     side_lines=None,
     side_anchor=None,
+    front_line=None,
 ):
-    """Draw the 16.5 m line, the arc, and the sides that stay on the grass."""
+    """Draw the 16.5 m line, the arc, and the sides that stay on the grass.
+
+    A measured side replaces the projected one: side_anchor names it, low,
+    high or both. front_line is the 16.5 m line cut at a measured corner.
+    """
     if frame is None or matrix is None:
         return
     try:
@@ -796,7 +1006,7 @@ def draw_visible_penalty(
     y1 = (float(pitch.width) + 4032.0) / 2.0
     goal_depth = MAX_GOAL_DEPTH_CM if toward_goal_cm is None else float(toward_goal_cm)
     sign = _goal_sign(bool(positive_x))
-    front_line = [(front, y0 + (y1 - y0) * step) for step in np.linspace(0, 1, 24)]
+    front_points = [(front, y0 + (y1 - y0) * step) for step in np.linspace(0, 1, 24)]
     near_side = [(front + sign * goal_depth * step, y1) for step in np.linspace(0, 1, 16)]
     far_side = [(front + sign * goal_depth * step, y0) for step in np.linspace(0, 1, 16)]
     spot = float(pitch.length) - 1100.0 if positive_x else 1100.0
@@ -829,11 +1039,14 @@ def draw_visible_penalty(
         for start, end in lines:
             _image_segment(frame, start, end, color)
     else:
-        _polyline(frame, inverse, np.array(front_line, dtype=np.float32), color)
-        # One visible corner replaces its own side. The other side stays as it was.
-        if side_anchor != "high":
+        if front_line is not None and len(front_line) == 2:
+            _image_segment(frame, front_line[0], front_line[1], color)
+        else:
+            _polyline(frame, inverse, np.array(front_points, dtype=np.float32), color)
+        # A measured side replaces its own projection. The other side stays as it was.
+        if side_anchor not in ("high", "both"):
             _polyline(frame, inverse, np.array(near_side, dtype=np.float32), color)
-        if side_anchor != "low":
+        if side_anchor not in ("low", "both"):
             _polyline(frame, inverse, np.array(far_side, dtype=np.float32), color)
         for start, end in lines:
             _image_segment(frame, start, end, color)
@@ -867,7 +1080,8 @@ def _image_segment(frame, start, end, color):
     start = np.asarray(start, dtype=np.float64)
     end = np.asarray(end, dtype=np.float64)
     run = []
-    for step in np.linspace(0.0, 1.0, 16):
+    steps = max(16, int(float(np.linalg.norm(end - start)) / 8.0) + 1)
+    for step in np.linspace(0.0, 1.0, steps):
         point = start + (end - start) * float(step)
         safe = 0 <= point[0] < width and CROWD_BAND * height <= point[1] < height
         if safe:
@@ -930,8 +1144,11 @@ class VisiblePitchMap:
         self.side_direction = None
         self.side_lines = None
         self.side_anchor = None
+        self.front_line = None
         self._width_foot = None
         self._width_along = None
+        self._drawn_corners = None
+        self._side_memory = None
         self._corner_t = None
         self._corner_matrix_id = None
         self.accepted_frames = 0
@@ -1142,8 +1359,11 @@ class VisiblePitchMap:
         self.side_direction = None
         self.side_lines = None
         self.side_anchor = None
+        self.front_line = None
         self._width_foot = None
         self._width_along = None
+        self._drawn_corners = None
+        self._side_memory = None
         self._corner_t = None
         self._corner_matrix_id = None
         self.hold_left = 0
@@ -1230,102 +1450,116 @@ class VisiblePitchMap:
             return None
         return self._point_pair(origin, clipped)
 
-    def _seek_side(self, found, frame, name, both):
-        """The side at this corner. A faint line may end past the white mask."""
-        origin = found.get("corner_" + name)
-        station = found.get("t_" + name)
-        if origin is None:
+    def _turn_from(self, along, direction):
+        """Signed angle, in radians, from the 16.5 m line to a side."""
+        return float(
+            np.arctan2(
+                along[0] * direction[1] - along[1] * direction[0],
+                float(np.dot(along, direction)),
+            )
+        )
+
+    def _remembered_direction(self, along):
+        """The last measured side, turned with the 16.5 m line, for a few frames."""
+        if self._side_memory is None:
             return None
+        turn, generation, left = self._side_memory
+        if generation != self.generation or left <= 0:
+            self._side_memory = None
+            return None
+        self._side_memory = (turn, generation, left - 1)
+        cos, sin = float(np.cos(turn)), float(np.sin(turn))
+        return np.array(
+            [along[0] * cos - along[1] * sin, along[0] * sin + along[1] * cos],
+            dtype=np.float64,
+        )
 
-        def accept(point):
-            walked = side_from_corner(
-                frame, self.grass, point, found["along"], found["perp"], found["foot"]
-            )
-            if walked is None:
-                return None
-            segment = self._side_segment(frame, point, walked["end"])
-            if segment is None:
-                return None
-            return {"name": name, "segment": segment, "walked": walked}
+    def _measure_sides(self, found, frame, white_line_mask=None):
+        """Put each side on its paint, from its corner to the goal line.
 
-        found_here = accept(origin)
-        if found_here is not None or both or station is None or not self.scale:
-            return found_here
-        # One corner, and the white mask stopped short of it. Step outward
-        # along the 16.5 m line and keep the longest painted side.
-        sign = -1.0 if name == "low" else 1.0
-        height, width = self.grass.shape[:2]
-        best = None
-        misses = 0
-        for extra in range(4, 161, 4):
-            probe = float(station) + sign * float(extra)
-            reached = abs(probe) * float(self.scale)
-            if reached > _CORNER_MAX_CM:
-                break
-            if reached < _CORNER_MIN_CM:
-                continue
-            point = found["foot"] + found["along"] * probe
-            inside = (
-                _CORNER_EDGE_PX <= point[0] < width - _CORNER_EDGE_PX
-                and _CORNER_EDGE_PX <= point[1] < height - _CORNER_EDGE_PX
-            )
-            if not inside:
-                break
-            found_there = accept(point)
-            if found_there is None:
-                if best is not None:
-                    misses += 1
-                    if misses >= 3:
-                        break
-                continue
-            misses = 0
-            if best is None or self._segment_length(found_there) > self._segment_length(best):
-                best = found_there
-        return best
-
-    def _segment_length(self, item):
-        start, end = item["segment"]
-        return float(np.hypot(end[0] - start[0], end[1] - start[1]))
-
-    def _measure_sides(self, found, frame):
-        """Draw each visible side on its paint. Copy the angle only when one is missing."""
+        The side ends where it meets the goal line. With the goal line off the
+        picture it runs to the picture edge. When only one side is painted in
+        the picture, the other corner takes the same angle and runs to the
+        edge. One corner alone draws one side, and the rest stays projected.
+        """
         self.side_direction = None
         self.side_lines = None
         self.side_anchor = None
+        self.front_line = None
         self._width_foot = None
         self._width_along = None
-        if frame is None or self.grass is None:
+        self._drawn_corners = None
+        if frame is None or self.grass is None or not self.scale:
             return
-        both = found.get("corner_low") is not None and found.get("corner_high") is not None
-        traced = []
-        for name in ("low", "high"):
-            item = self._seek_side(found, frame, name, both)
-            if item is not None:
-                traced.append(item)
-        if not traced:
+        geometry = _line_frame(self.matrix, self.positive_x, self.pitch)
+        if geometry is None:
             return
-        if both and found.get("terms") is not None:
-            closed = [item for item in traced if not item["walked"]["border"]]
-            pool = closed or traced
-            pool.sort(key=lambda item: item["walked"]["hits"], reverse=True)
-            self.side_direction = pool[0]["walked"]["direction"]
+        start_px = _ARC_MEET_CM / float(self.scale) + 24.0
+        measured = penalty_sides(
+            frame, self.grass, geometry[0], geometry[1], geometry[2], start_px, _clean_paint(white_line_mask)
+        )
+        if measured is None:
+            return
+        sides = measured["sides"]
+        along = measured["along"]
+        segments = {}
+        for name, side in sides.items():
+            if side["junction"] is not None:
+                end = side["junction"]
+            elif side["border"]:
+                end = _picture_exit(side["corner"], side["direction"], frame.shape)
+            else:
+                end = side["corner"] + side["direction"] * side["length"]
+            segments[name] = self._point_pair(side["corner"], end)
+        best = None
+        for side in sides.values():
+            rank = (side["junction"] is not None, side["length"])
+            if best is None or rank > best[0]:
+                best = (rank, side["direction"])
+        if best is not None:
+            direction = best[1]
+            self._side_memory = (self._turn_from(along, direction), self.generation, self.hold_frames)
+        else:
+            direction = self._remembered_direction(along)
+        both = found is not None and found.get("terms") is not None
+        if both:
+            if direction is None:
+                return
+            self.side_direction = direction
             self._width_foot = np.asarray(found["foot"], dtype=np.float64)
             self._width_along = np.asarray(found["along"], dtype=np.float64)
-            have = {item["name"] for item in traced}
-            segments = [item["segment"] for item in traced]
+            drawn = {}
+            lines = []
             for name in ("low", "high"):
-                if name in have:
+                if name in segments:
+                    drawn[name] = sides[name]["corner"]
+                    lines.append(segments[name])
+            for name in ("low", "high"):
+                if name in segments:
                     continue
-                origin = found["corner_" + name]
-                far = origin + self.side_direction * 1400.0
-                copied = self._side_segment(frame, origin, far)
+                origin = np.asarray(found["corner_" + name], dtype=np.float64)
+                drawn[name] = origin
+                copied = self._side_segment(
+                    frame, origin, _picture_exit(origin, direction, frame.shape)
+                )
                 if copied is not None:
-                    segments.append(copied)
-            self.side_lines = segments
+                    lines.append(copied)
+            self._drawn_corners = (drawn["low"], drawn["high"])
+            self.side_lines = lines or None
             return
-        if len(traced) == 1 and not both:
-            self.side_anchor = traced[0]["name"]
-            self.side_lines = [traced[0]["segment"]]
+        if not segments:
+            return
+        self.side_anchor = "both" if len(segments) == 2 else next(iter(segments))
+        self.side_lines = [segments[name] for name in ("low", "high") if name in segments]
+        # The 16.5 m line stops at a measured corner and keeps its projected end on the other hand.
+        reach = _BOX_HALF_CM / float(self.scale)
+        ends = []
+        for name, sign in (("low", -1.0), ("high", 1.0)):
+            if name in sides:
+                ends.append(sides[name]["corner"])
+            else:
+                ends.append(measured["foot"] + along * sign * reach)
+        self.front_line = self._point_pair(ends[0], ends[1])
 
     def _refresh_corners(self, white_line_mask, frame=None):
         """Measure the corners and the sides. A missed pair keeps the last one of this matrix."""
@@ -1337,8 +1571,10 @@ class VisiblePitchMap:
         self.side_direction = None
         self.side_lines = None
         self.side_anchor = None
+        self.front_line = None
         self._width_foot = None
         self._width_along = None
+        self._drawn_corners = None
         if self.matrix is None or self.positive_x is None or self.region == "centre" or not self.scale:
             self._corner_t = None
             self._corner_matrix_id = None
@@ -1350,7 +1586,7 @@ class VisiblePitchMap:
             self._corner_t = (found["t_low"], found["t_high"])
             self._corner_matrix_id = matrix_id
             self._apply_corners(found)
-            self._measure_sides(found, frame)
+            self._measure_sides(found, frame, white_line_mask)
             return
         if self._corner_t is not None and self._corner_matrix_id == matrix_id:
             geometry = _line_frame(self.matrix, self.positive_x, self.pitch)
@@ -1368,20 +1604,22 @@ class VisiblePitchMap:
                         "corner_high": foot + along * t_high,
                     }
                     self._apply_corners(restored)
-                    self._measure_sides(restored, frame)
+                    self._measure_sides(restored, frame, white_line_mask)
                     return
-        if found is not None:
-            self._measure_sides(found, frame)
+        self._measure_sides(None, frame, white_line_mask)
 
     def _publish(self, decision, white_line_mask, frame=None):
         self._refresh_corners(white_line_mask, frame)
         decision["side_lines"] = self.side_lines
         decision["side_anchor"] = self.side_anchor
+        decision["front_line"] = self.front_line
         if self.corner_low is None or self.corner_high is None or self.corner_perp is None:
             return decision
+        # The drawing starts each side on its measured corner. The width keeps the line ends.
+        low, high = self._drawn_corners or (self.corner_low, self.corner_high)
         decision["corners"] = (
-            (float(self.corner_low[0]), float(self.corner_low[1])),
-            (float(self.corner_high[0]), float(self.corner_high[1])),
+            (float(low[0]), float(low[1])),
+            (float(high[0]), float(high[1])),
         )
         decision["corner_perp"] = (float(self.corner_perp[0]), float(self.corner_perp[1]))
         if self.side_px is None:
@@ -1417,4 +1655,5 @@ class VisiblePitchMap:
             "side_px": None,
             "side_lines": None,
             "side_anchor": None,
+            "front_line": None,
         }

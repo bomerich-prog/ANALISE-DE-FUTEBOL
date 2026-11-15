@@ -4655,6 +4655,7 @@ def analyze(args):
                 side_px=map_decision.get("side_px"),
                 side_lines=map_decision.get("side_lines"),
                 side_anchor=map_decision.get("side_anchor"),
+                front_line=map_decision.get("front_line"),
             )
             if debug_frame is not None:
                 draw_visible_penalty(
@@ -4668,6 +4669,7 @@ def analyze(args):
                     side_px=map_decision.get("side_px"),
                     side_lines=map_decision.get("side_lines"),
                     side_anchor=map_decision.get("side_anchor"),
+                    front_line=map_decision.get("front_line"),
                 )
 
         render_bounding_boxes_stage_start = time.perf_counter()

@@ -23,8 +23,8 @@ from pitch_map import (  # noqa: E402
     marker_bgr,
     paint_patch,
     penalty_corners,
+    penalty_sides,
     replacement_verdict,
-    side_from_corner,
     _line_ends,
     _line_frame,
     scale_is_stable,
@@ -240,11 +240,10 @@ def test_a_board_is_not_a_side_and_one_corner_draws_one_side():
     mask, matrix, _foot, _along = _uneven_penalty()
     boards = np.full((750, 1338, 3), 230, np.uint8)
     grass = np.zeros((750, 1338), np.uint8)
-    assert_true(
-        side_from_corner(boards, grass, np.array([500.0, 300.0]), np.array([1.0, 0.0]), np.array([0.0, 1.0]), np.array([400.0, 300.0]))
-        is None,
-        "the advertising is not a side line",
+    on_boards = penalty_sides(
+        boards, grass, np.array([400.0, 300.0]), np.array([1.0, 0.0]), np.array([0.0, 1.0]), 60.0
     )
+    assert_true(on_boards is not None and not on_boards["sides"], "the advertising is not a side line")
     pitch_map = VisiblePitchMap()
     pitch_map.matrix = matrix
     pitch_map.transformer = ViewTransformer.from_matrix(matrix)
@@ -284,11 +283,96 @@ def test_a_board_is_not_a_side_and_one_corner_draws_one_side():
     assert_true(one["corners"] is None, "one corner does not move the width")
     assert_equal(one["side_anchor"], "low", "the visible side is the far one")
     assert_true(one["side_lines"] is not None and len(one["side_lines"]) == 1, "only that side is drawn")
+    assert_true(one["front_line"] is not None, "the 16.5 m line is cut at the measured corner")
+    assert_true(
+        float(np.linalg.norm(np.array(one["front_line"][0]) - ends["corner_low"])) < 8.0,
+        "the 16.5 m line starts on the corner, not past it",
+    )
     sample = ends["corner_low"] + direction * 40.0
     mapped = alone.project(np.array([sample], dtype=np.float32))
     raw = alone.transformer.transform_points(np.array([sample], dtype=np.float32))[0]
     assert_true(mapped[0] is not None, "the player stays on the affine map")
     assert_close(mapped[0][1], float(raw[1]), "his width stays affine when the other corner is hidden", tolerance=0.5)
+
+
+def _painted_box(goal_line=True, past_corner=True):
+    """A broadcast penalty: 16.5 m line, far side, goal line, touchline and a board."""
+    foot = np.array([640.0, 340.0])
+    along = np.array([0.88, 0.47])
+    along = along / np.linalg.norm(along)
+    perp = np.array([along[1], -along[0]])
+    corner = foot - along * 216.0
+    near = foot + along * 392.0
+    side = np.array([np.cos(np.radians(-5.0)), np.sin(np.radians(-5.0))])
+    goal = np.array([np.cos(np.radians(20.0)), np.sin(np.radians(20.0))])
+    junction = corner + side * 450.0
+    frame = np.full((750, 1338, 3), (60, 120, 70), np.uint8)
+    grass = np.full((750, 1338), 255, np.uint8)
+    _paint_ridge(frame, corner, near, 200)
+    _paint_ridge(frame, corner, junction, 170)
+    if goal_line:
+        _paint_ridge(frame, junction - goal * 320.0, junction + goal * 420.0, 170)
+        # The side's direction runs on into a board. The ink has to stop on the junction.
+        _paint_ridge(frame, junction + side * 12.0, junction + side * 70.0, 170)
+    # The touchline is longer than the side and never touches the 16.5 m line.
+    _paint_ridge(frame, corner - along * 190.0 - side * 300.0, corner - along * 190.0 + side * 700.0, 170)
+    if past_corner:
+        # A player stands on the line past the corner.
+        cv2.circle(frame, tuple(np.round(corner - along * 70.0).astype(int)), 9, (235, 235, 235), -1)
+    return frame, grass, foot, along, perp, corner, near, side, junction
+
+
+def test_the_side_ends_where_it_meets_the_goal_line():
+    frame, grass, foot, along, perp, corner, near, side, junction = _painted_box()
+    # The calibrated line lags the paint by a few pixels, as a held matrix does.
+    measured = penalty_sides(frame, grass, foot + perp * 9.0, along, perp, 120.0)
+    assert_true(measured is not None and "low" in measured["sides"], "the far side is found from the paint")
+    far = measured["sides"]["low"]
+    assert_true(float(np.linalg.norm(far["corner"] - corner)) < 6.0, "the corner is where the side leaves, not the player past it")
+    assert_true(float(np.dot(far["direction"], side)) > 0.999, "the side follows its paint, not the touchline")
+    assert_true(far["junction"] is not None, "the side ends on the goal line")
+    assert_true(float(np.linalg.norm(far["junction"] - junction)) < 6.0, "the end is the point where the three lines meet")
+    assert_true("high" not in measured["sides"], "the near side has no paint in this picture")
+
+    open_frame, _grass, _foot, _along, _perp, corner, _near, side, _junction = _painted_box(goal_line=False)
+    _paint_ridge(open_frame, corner, corner + side * 1200.0, 170)
+    to_edge = penalty_sides(open_frame, grass, foot, along, perp, 120.0)["sides"]["low"]
+    assert_true(to_edge["junction"] is None and to_edge["border"], "without the goal line the side runs to the picture edge")
+
+
+def test_the_other_corner_copies_the_angle_to_the_picture_edge():
+    frame, grass, foot, along, perp, corner, near, side, junction = _painted_box()
+    mask, _matrix, _foot, _along = _uneven_penalty()
+    # Same 16.5 m line as the mask, with the goal on the painted side's hand.
+    matrix = _affine_matrix(foot, along, perp, 1.0 / 7.0, 10350.0, 7000.0, True)
+    pitch_map = VisiblePitchMap()
+    pitch_map.matrix = matrix
+    pitch_map.transformer = ViewTransformer.from_matrix(matrix)
+    pitch_map.positive_x = True
+    pitch_map.region = "penalty"
+    pitch_map.scale = 7.0
+    pitch_map.toward_goal_cm = 400.0
+    pitch_map.grass = grass
+    decision = pitch_map._publish(pitch_map._decision(True, False, "accepted"), mask, frame)
+    assert_true(decision["side_lines"] is not None and len(decision["side_lines"]) == 2, "both sides are drawn")
+    measured, copied = decision["side_lines"]
+    assert_true(float(np.linalg.norm(np.array(measured[1]) - junction)) < 6.0, "the far side stops on the junction")
+    assert_true(float(np.linalg.norm(np.array(copied[0]) - near)) < 14.0, "the copy starts on the near corner")
+    copied_dir = np.array(copied[1]) - np.array(copied[0])
+    copied_dir = copied_dir / np.linalg.norm(copied_dir)
+    assert_true(float(np.dot(copied_dir, side)) > 0.999, "the near side takes the far side's angle")
+    assert_true(copied[1][0] > 1330.0, "and runs to the end of the picture")
+    assert_true(
+        float(np.linalg.norm(np.array(decision["corners"][0]) - corner)) < 6.0,
+        "the 16.5 m line is drawn from the measured corner",
+    )
+    # A frame with no readable side keeps the last angle for a moment.
+    blank = np.full((750, 1338, 3), (60, 120, 70), np.uint8)
+    held = pitch_map._publish(pitch_map._decision(True, True, "held"), mask, blank)
+    assert_true(held["side_lines"] is not None and len(held["side_lines"]) == 2, "a missed frame keeps both sides")
+    held_dir = np.array(held["side_lines"][0][1]) - np.array(held["side_lines"][0][0])
+    held_dir = held_dir / np.linalg.norm(held_dir)
+    assert_true(float(np.dot(held_dir, side)) > 0.995, "and they keep the measured angle, not the perpendicular")
 
 
 def test_a_line_cut_by_the_frame_is_not_a_corner():
@@ -557,6 +641,8 @@ def main():
     test_uneven_corners_move_the_width_and_keep_the_arc_scale()
     test_the_side_ridge_sets_the_width_and_keeps_the_depth()
     test_a_board_is_not_a_side_and_one_corner_draws_one_side()
+    test_the_side_ends_where_it_meets_the_goal_line()
+    test_the_other_corner_copies_the_angle_to_the_picture_edge()
     test_a_line_cut_by_the_frame_is_not_a_corner()
     test_the_measured_strip_does_not_erase_the_visible_third()
     test_spatial_metrics_use_only_mapped_players()
