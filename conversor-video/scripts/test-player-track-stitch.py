@@ -374,6 +374,33 @@ def test_note_team_is_remembered_for_the_next_gap():
     assert_equal(returned, [19], "a team stored after the fact still rejects the other shirt")
 
 
+def test_a_new_track_in_the_other_shirt_does_not_take_a_lost_id():
+    """Reference clip, frame 95: the Spaniard behind an Argentine came back as the Argentine."""
+    import numpy as np
+
+    from run_yolo_analysis import PLAYER_CLASS_ID, new_track_shirts
+
+    class Shirts:
+        def __init__(self, team):
+            self.team = team
+
+        def peek(self, crop):
+            return self.team
+
+    stitch = PlayerTrackStitch()
+    frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+    for number in range(1, 11):
+        stitch.apply(number, [13], [box_at(600 - 2 * number)], hues=[None], teams=[None])
+        stitch.note_team(13, 0)
+    returning = [box_at(578)]
+    shirts = new_track_shirts(frame, [25], returning, [PLAYER_CLASS_ID], stitch, Shirts(1))
+    assert_equal(shirts, [1], "the new track reads as the other team")
+    ids = list(stitch.apply(13, [25], returning, hues=[None], teams=shirts))
+    assert_equal(ids, [25], "the Argentine keeps his own id")
+    known = new_track_shirts(frame, [25], returning, [PLAYER_CLASS_ID], stitch, Shirts(1))
+    assert_equal(known, [None], "a known track is not checked again")
+
+
 if __name__ == "__main__":
     test_gap_along_the_motion_reuses_the_same_id()
     test_same_id_coming_back_is_not_a_stitch()
@@ -397,4 +424,6 @@ if __name__ == "__main__":
     test_close_players_who_do_not_cross_keep_their_ids()
     test_different_shirts_block_a_geometric_swap()
     test_note_team_is_remembered_for_the_next_gap()
+    test_a_new_track_in_the_other_shirt_does_not_take_a_lost_id()
+    test_a_new_track_in_the_other_shirt_does_not_take_a_lost_id()
     print("player track stitch tests passed")

@@ -116,6 +116,13 @@ class PlayerTrackStitch:
         self.expired = 0
         self.stitch_events: List[dict] = []
 
+    def knows(self, track_id) -> bool:
+        """True when this id is already a remembered track, so it will not be stitched."""
+        try:
+            return int(track_id) in self._tracks
+        except (TypeError, ValueError):
+            return False
+
     def note_team(self, track_id, team_id) -> None:
         """Remember a team the classifier already wrote. Unknown teams are ignored."""
         if track_id is None or team_id is None:

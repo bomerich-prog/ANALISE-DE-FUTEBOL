@@ -20,6 +20,7 @@ import numpy as np
 import supervision as sv
 from ultralytics import YOLO
 
+from ball_chain import BallChains, BallReach
 from ball_flight import BallFlightPath
 from ball_heatmap import BallHeatmapAccumulator
 from event_replay import record_event_frame, write_event_record
@@ -669,6 +670,23 @@ def draw_field_debug_overlay(frame, field_contours):
 
 def get_crops(frame, detections):
     return [sv.crop_image(frame, xyxy) for xyxy in detections.xyxy]
+
+
+def new_track_shirts(frame, track_ids, boxes, class_ids, track_stitch, team_classifier):
+    """The shirt of each brand-new outfield track, so a lost id of the other team is not given to it.
+
+    Known tracks and goalkeepers get None: only a new id can be stitched, and a
+    goalkeeper's kit is not one of the two shirts.
+    """
+    teams = []
+    for index, track_id in enumerate(track_ids):
+        class_id = None if class_ids is None or index >= len(class_ids) else int(class_ids[index])
+        if class_id != PLAYER_CLASS_ID or track_stitch.knows(track_id):
+            teams.append(None)
+            continue
+        crop = sv.crop_image(frame, np.array(boxes[index][:4], dtype=np.int32))
+        teams.append(team_classifier.peek(crop))
+    return teams
 
 
 def get_player_crops_from_payload(frame, detections):
@@ -2529,6 +2547,8 @@ def build_performance_profile_report(
             "ball_reacquisitions": int(ball_tracking_metrics.get("ball_reacquisitions", 0)),
             "ball_rejected_open_boxes": int(ball_tracking_metrics.get("ball_rejected_open_boxes", 0)),
             "ball_flight_frames": int(ball_tracking_metrics.get("ball_flight_frames", 0)),
+            "rolling_ball_frames": int(ball_tracking_metrics.get("rolling_ball_frames", 0)),
+            "ball_out_of_reach_boxes": int(ball_tracking_metrics.get("ball_out_of_reach_boxes", 0)),
             "ball_flight_unreachable_boxes": int(ball_tracking_metrics.get("ball_flight_unreachable_boxes", 0)),
             "ball_recovery_examples": list(ball_tracking_metrics.get("ball_recovery_examples", [])),
             "ball_memory_hits": int(ball_tracking_metrics["ball_memory_hits"]),
@@ -3023,6 +3043,8 @@ def analyze(args):
     last_supported_ball_area = None
     ball_unsupported_frames = 0
     ball_flight_path = BallFlightPath()
+    ball_chains = BallChains()
+    ball_reach = BallReach()
     rejected_ball_centers = []
     reacquisition_pending = None
     ball_track_state = BALL_TRACK_LOST
@@ -3038,6 +3060,8 @@ def analyze(args):
         "ball_reacquisitions": 0,
         "ball_rejected_open_boxes": 0,
         "ball_flight_frames": 0,
+        "rolling_ball_frames": 0,
+        "ball_out_of_reach_boxes": 0,
         "ball_flight_unreachable_boxes": 0,
         "ball_track_state": BALL_TRACK_LOST,
         "ball_recovery_examples": [],
@@ -3230,6 +3254,14 @@ def analyze(args):
                 tracked_human_detections.tracker_id,
                 tracked_human_detections.xyxy,
                 frame,
+                teams=new_track_shirts(
+                    frame,
+                    raw_tracker_ids,
+                    tracked_human_detections.xyxy,
+                    tracked_human_detections.class_id,
+                    player_track_stitch,
+                    team_classifier,
+                ),
                 classes=tracked_human_detections.class_id,
             )
         record_profile_stage(
@@ -3682,7 +3714,24 @@ def analyze(args):
             else None
         )
         frames_since_ball = int(ball_frames_without_detection) + 1
-        if not ball_selection_keeps_player_support(
+        # A strong box that keeps rolling across the grass, away from the boots,
+        # is the ball. It wins over a box at a player's feet elsewhere, which is
+        # often that player's boot.
+        ball_chains.update(
+            current_frame_number,
+            ball_detections_after_nms_dicts,
+            lambda candidate: ball_supported_by_player(candidate, support_people),
+            grass_mask,
+        )
+        rolling_ball = ball_chains.rolling_ball(current_frame_number)
+        if rolling_ball is not None and selected_ball_detection is not rolling_ball:
+            if selected_ball_detection is None or ball_supported_by_player(
+                selected_ball_detection,
+                support_people,
+            ):
+                selected_ball_detection = rolling_ball
+                ball_tracking_metrics["rolling_ball_frames"] += 1
+        if selected_ball_detection is not rolling_ball and not ball_selection_keeps_player_support(
             selected_ball_detection,
             predicted_ball_center,
             support_people,
@@ -3804,6 +3853,14 @@ def analyze(args):
                 selected_ball_detection["source"] = "ball-flight"
                 physical_pending_candidate_state = None
                 ball_tracking_metrics["ball_flight_frames"] += 1
+        # No path may publish a box the ball could not have reached since it was last seen.
+        if selected_ball_detection is not None and not ball_reach.allows(
+            current_frame_number,
+            detection_center_np(selected_ball_detection["box"]),
+        ):
+            selected_ball_detection = None
+            physical_pending_candidate_state = None
+            ball_tracking_metrics["ball_out_of_reach_boxes"] += 1
         dedicated_ball_detections = ball_dicts_to_detections(
             [selected_ball_detection] if selected_ball_detection is not None else []
         )
@@ -3849,6 +3906,12 @@ def analyze(args):
             ):
                 reacquisition_pending = None
                 ball_tracking_metrics["ball_flight_unreachable_boxes"] += 1
+            elif reacquisition["used"] and not ball_reach.allows(
+                current_frame_number,
+                detection_center_np(reacquisition["detection"]["box"]),
+            ):
+                reacquisition_pending = None
+                ball_tracking_metrics["ball_out_of_reach_boxes"] += 1
             elif reacquisition["used"]:
                 selected_ball_detection = reacquisition["detection"]
                 selected_ball_detection["source"] = "ball-reacquisition"
@@ -3908,6 +3971,11 @@ def analyze(args):
                 ball_frames_without_detection = 0
             ball_last_valid_detection = selected_ball_detection
             selected_at_player = ball_supported_by_player(selected_ball_detection, support_people)
+            ball_reach.note(
+                current_frame_number,
+                detection_center_np(selected_ball_detection["box"]),
+                selected_at_player,
+            )
             ball_flight_path.note_published(
                 current_frame_number,
                 selected_ball_detection["box"],

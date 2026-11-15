@@ -471,6 +471,18 @@ class TeamClassifier:
         teams = [self._predict_one(crop) for crop in crops]
         return np.array(teams, dtype=np.int32)
 
+    def peek(self, crop: np.ndarray):
+        """The team this torso reads as, or None. Records no vote.
+
+        Used to check a new track before it is given an old track's id.
+        """
+        if crop is None or getattr(crop, "size", 0) == 0:
+            return None
+        counts = (self.vote_count, self.abstain_count)
+        team = self._predict_one(crop)
+        self.vote_count, self.abstain_count = counts
+        return None if team < 0 else int(team)
+
     def _predict_one(self, crop: np.ndarray) -> int:
         measured = measure_torso(crop)
         if measured["abstain"]:
