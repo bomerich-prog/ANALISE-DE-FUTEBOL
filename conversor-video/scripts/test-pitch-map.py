@@ -17,6 +17,7 @@ from pitch_map import (  # noqa: E402
     VisiblePitchMap,
     box_matches_visible_paint,
     field_y_from_line,
+    fit_painted_box,
     front_image_point,
     inside_measured,
     inside_visible,
@@ -375,6 +376,70 @@ def test_the_other_corner_copies_the_angle_to_the_picture_edge():
     assert_true(float(np.dot(held_dir, side)) > 0.995, "and they keep the measured angle, not the perpendicular")
 
 
+
+# Corners of the box as the clip's camera saw them: all inside, and frame 165 zoomed out.
+_WHOLE_BOX_VIEW = [(560.0, 230.0), (1230.0, 640.0), (1120.0, 160.0), (1600.0, 360.0)]
+_FAR_CORNER_VIEW = [(917.0, 279.0), (1606.0, 649.0), (1321.0, 254.0), (2110.0, 524.0)]
+
+
+def _broadcast_box(goal_line=True, view=None):
+    """A penalty area in perspective, painted as thin lines on the grass.
+
+    Returns the frame, a grass mask and the true field-to-image matrix.
+    """
+    pitch = SoccerPitchConfiguration()
+    field = np.array([(10350.0, 1484.0), (10350.0, 5516.0), (12000.0, 1484.0), (12000.0, 5516.0)], np.float32)
+    image = np.array(view or _WHOLE_BOX_VIEW, np.float32)
+    to_image = cv2.getPerspectiveTransform(field, image)
+    frame = np.full((750, 1338, 3), (60, 120, 70), np.uint8)
+    grass = np.full((750, 1338), 255, np.uint8)
+    grass[: int(750 * 0.10)] = 0
+
+    def paint(points):
+        pts = cv2.perspectiveTransform(np.array(points, np.float32).reshape(-1, 1, 2), to_image).reshape(-1, 2)
+        for a, b in zip(pts[:-1], pts[1:]):
+            _paint_ridge(frame, a, b, 180)
+
+    steps = np.linspace(0.0, 1.0, 40)
+    paint([(10350.0, 1484.0 + 4032.0 * t) for t in steps])
+    paint([(10350.0 + 1650.0 * t, 1484.0) for t in steps])
+    paint([(10350.0 + 1650.0 * t, 5516.0) for t in steps])
+    if goal_line:
+        paint([(12000.0, 300.0 + 6400.0 * t) for t in steps])
+    paint([(11450.0, 2584.0 + 1832.0 * t) for t in steps])
+    paint([(11450.0 + 550.0 * t, 2584.0) for t in steps])
+    arc = [
+        (10900.0 - 915.0 * np.cos(a), 3500.0 + 915.0 * np.sin(a))
+        for a in np.linspace(-np.arccos(550.0 / 915.0), np.arccos(550.0 / 915.0), 40)
+    ]
+    paint(arc)
+    return frame, grass, to_image, pitch
+
+
+def test_an_open_camera_reads_the_box_from_its_painted_corners():
+    frame, grass, to_image, pitch = _broadcast_box()
+    report, _measured = fit_painted_box(frame, grass, None, pitch)
+    assert_true(report is not None, "the whole painted box gives a matrix without the arc fit")
+    assert_true(report["positive_x"], "the goal is on the right")
+    checks = np.array([(10350.0, 1484.0), (10350.0, 3500.0), (11450.0, 2584.0), (10900.0 - 915.0, 3500.0)], np.float32)
+    truth = cv2.perspectiveTransform(checks.reshape(-1, 1, 2), to_image).reshape(-1, 2)
+    inverse = np.linalg.inv(report["matrix"])
+    found = cv2.perspectiveTransform(checks.reshape(-1, 1, 2), inverse.astype(np.float32)).reshape(-1, 2)
+    error = float(np.max(np.linalg.norm(found - truth, axis=1)))
+    assert_true(error < 5.0, f"corner, middle, small box and arc land on the paint ({error:.1f} px)")
+
+
+def test_without_the_goal_line_the_arc_closes_the_box():
+    frame, grass, to_image, pitch = _broadcast_box(goal_line=False, view=_FAR_CORNER_VIEW)
+    report, _measured = fit_painted_box(frame, grass, None, pitch)
+    assert_true(report is not None, "one corner and the arc are enough")
+    checks = np.array([(10350.0, 1484.0), (10350.0, 3500.0), (10900.0 - 915.0, 3500.0)], np.float32)
+    truth = cv2.perspectiveTransform(checks.reshape(-1, 1, 2), to_image).reshape(-1, 2)
+    inverse = np.linalg.inv(report["matrix"])
+    found = cv2.perspectiveTransform(checks.reshape(-1, 1, 2), inverse.astype(np.float32)).reshape(-1, 2)
+    error = float(np.max(np.linalg.norm(found - truth, axis=1)))
+    assert_true(error < 6.0, f"the corner, the middle and the arc tip land on the paint ({error:.1f} px)")
+
 def test_a_line_cut_by_the_frame_is_not_a_corner():
     foot = np.array([900.0, 500.0])
     along = np.array([0.95, 0.31])
@@ -643,6 +708,8 @@ def main():
     test_a_board_is_not_a_side_and_one_corner_draws_one_side()
     test_the_side_ends_where_it_meets_the_goal_line()
     test_the_other_corner_copies_the_angle_to_the_picture_edge()
+    test_an_open_camera_reads_the_box_from_its_painted_corners()
+    test_without_the_goal_line_the_arc_closes_the_box()
     test_a_line_cut_by_the_frame_is_not_a_corner()
     test_the_measured_strip_does_not_erase_the_visible_third()
     test_spatial_metrics_use_only_mapped_players()

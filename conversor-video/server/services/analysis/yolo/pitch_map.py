@@ -8,7 +8,13 @@ leaves a corner toward the goal. It ends where it meets the goal line, the
 point where three painted lines leave together, or at the picture edge when
 the goal line is not in the picture. A side with no paint in the picture takes
 the other side's angle. A player's width is where a line parallel to the side
-meets the 16.5 m line. The arc scale is left alone. Coordinates
+meets the 16.5 m line. The arc scale is left alone.
+
+When the arc fit misses and the matrix on screen has left the paint, an open
+camera still shows the box in thin lines. Its four painted corners, or one
+corner and the arc when the goal line is off the picture, give a true
+perspective, checked point by point against the ink. The arc fit takes over
+again as soon as it lands. Coordinates
 are published inside the 35 m third of the goal the calibration is looking at.
 The grass probe accepts or rejects that calibration. It does not erase a player
 or the ball who already land inside the third. A short gap keeps the last good
@@ -24,6 +30,8 @@ import cv2
 import numpy as np
 
 from pitch_homography import (
+    _penalty_lines,
+    _side_matches_image,
     _painted_arc_distance,
     _clean_paint,
     fit_broadcast_centre,
@@ -570,6 +578,7 @@ def _gray_image(frame):
 
 
 _INK_STEP = 2.0
+_BOX_COST_PX = 3.0
 _SIDE_MIN_PX = 100.0
 _SIDE_MIN_LIT = 0.8
 _SIDE_OPEN_PX = 150.0
@@ -758,8 +767,12 @@ def side_from_line(ink, wide, foot, along, perp, sign, start_px):
     points = foot[None, :] + sign * distance[:, None] * along[None, :]
     lit, inside = _lit(wide, points)
     painted = np.cumsum(lit & inside)
+    # The corner is on the paint of the 16.5 m line. Past its end the line
+    # would only cross the touchline, which is longer than any side.
+    last, _count, _left = _runs(lit[None, :], inside[None, :], int(60.0 / _INK_STEP))
+    stop = int(last[0]) + int(12.0 / _INK_STEP)
     stations = []
-    for index in range(0, len(distance), 3):
+    for index in range(0, min(len(distance), stop + 1), 3):
         point = points[index]
         if not (12.0 <= point[0] < width - 12.0 and 12.0 <= point[1] < height - 12.0):
             break
@@ -872,18 +885,19 @@ def side_junction(wide, side, lines):
         if not both_hands and max(one, other) < 140.0:
             continue
         if best is None or reach < best[0]:
-            best = (reach, meeting)
-    return None if best is None else best[1]
+            best = (reach, meeting, direction)
+    return None if best is None else (best[1], best[2])
 
 
-def penalty_sides(frame, grass, foot, along, perp, start_px, white_mask=None):
+def penalty_sides(frame, grass, foot, along, perp, start_px, white_mask=None, ink=None):
     """The painted sides of the penalty area, each from its corner.
 
     A side that reaches the goal line ends on that junction. A side whose
     goal line is off the picture runs to the picture edge. A short or broken
     line is not a side.
     """
-    ink = line_ink(frame, grass, white_mask)
+    if ink is None:
+        ink = line_ink(frame, grass, white_mask)
     if ink is None or foot is None or along is None or perp is None:
         return None
     wide = cv2.dilate(ink, np.ones((5, 5), np.uint8))
@@ -898,7 +912,9 @@ def penalty_sides(frame, grass, foot, along, perp, start_px, white_mask=None):
             continue
         if lines is None:
             lines = crossing_lines(ink, foot, along, perp)
-        side["junction"] = side_junction(wide, side, lines)
+        met = side_junction(wide, side, lines)
+        side["junction"] = None if met is None else met[0]
+        side["goal_line"] = None if met is None else met[1]
         if side["junction"] is None:
             to_edge = side["border"] and side["length"] >= _SIDE_OPEN_PX
             open_run = side["length"] >= _SIDE_OPEN_PX and side["share"] >= _SIDE_OPEN_LIT
@@ -906,6 +922,492 @@ def penalty_sides(frame, grass, foot, along, perp, start_px, white_mask=None):
                 continue
         sides[name] = side
     return {"foot": foot, "along": along, "perp": perp, "sides": sides}
+
+
+def _painted_middle(ink, origin, direction):
+    """Middle of the painted stretch of a line, as a point on it."""
+    ys, xs = np.where(ink > 0)
+    delta = np.stack([xs, ys], axis=1).astype(np.float64) - origin
+    across = np.array([-direction[1], direction[0]], dtype=np.float64)
+    along = (delta @ direction)[np.abs(delta @ across) <= 3.0]
+    if len(along) < 60:
+        return None
+    low, high = np.percentile(along, [5.0, 95.0])
+    return origin + direction * float((low + high) / 2.0)
+
+
+def _line_end(ink, foot, along, sign, gap_px=40.0):
+    """Station where the paint of the 16.5 m line stops inside the picture, or None."""
+    height, width = ink.shape[:2]
+    wide = cv2.dilate(ink, np.ones((5, 5), np.uint8))
+    distance = np.arange(0.0, 1500.0, _INK_STEP)
+    points = foot[None, :] + sign * distance[:, None] * along[None, :]
+    lit, inside = _lit(wide, points)
+    last, painted, left_picture = _runs(lit[None, :], inside[None, :], int(gap_px / _INK_STEP))
+    if int(last[0]) < 30 or bool(left_picture[0]):
+        return None
+    if painted[0] / (last[0] + 1.0) < 0.6:
+        return None
+    end = points[int(last[0])]
+    if not (12.0 <= end[0] < width - 12.0 and 12.0 <= end[1] < height - 12.0):
+        return None
+    return sign * float(distance[int(last[0])])
+
+
+def local_scale(matrix, positive_x, pitch=None):
+    """Centimetres per pixel along the 16.5 m line, at its middle."""
+    pitch = pitch or SoccerPitchConfiguration()
+    front = _front_x(bool(positive_x), pitch)
+    middle = float(pitch.width) / 2.0
+    image = _project_field(matrix, [(front, middle - 200.0), (front, middle + 200.0)])
+    if image is None:
+        return None
+    span = float(np.linalg.norm(image[1] - image[0]))
+    return 400.0 / span if span > 1e-6 else None
+
+
+def _box_template(pitch, positive_x):
+    """Field points of the painted marks around the penalty area, with weights."""
+    width = float(pitch.width)
+    middle = width / 2.0
+    front = _front_x(positive_x, pitch)
+    goal = float(pitch.length) if positive_x else 0.0
+    inward = -_goal_sign(positive_x)
+    spot = goal + inward * 1100.0
+    small = goal + inward * 550.0
+    y0, y1 = middle - _BOX_HALF_CM, middle + _BOX_HALF_CM
+    points = []
+    for angle in np.linspace(-np.pi / 2, np.pi / 2, 40):
+        x = spot + inward * 915.0 * np.cos(angle)
+        y = middle + 915.0 * np.sin(angle)
+        if (x - front) * inward > 20.0:
+            points.append((x, y, 2.0))
+    arc_count = len(points)
+    for step in np.linspace(0.0, 1.0, 14):
+        points.append((front, y0 + (y1 - y0) * step, 1.0))
+        points.append((goal, y0 + (y1 - y0) * step, 0.5))
+        points.append((front + (goal - front) * step, y1, 1.0))
+        points.append((front + (goal - front) * step, y0, 1.0))
+        points.append((small, middle - 916.0 + 1832.0 * step, 1.0))
+    for step in np.linspace(0.0, 1.0, 6):
+        points.append((small + (goal - small) * step, middle - 916.0, 1.0))
+        points.append((small + (goal - small) * step, middle + 916.0, 1.0))
+    array = np.array(points, dtype=np.float64)
+    return array[:, :2], array[:, 2], arc_count
+
+
+def _template_cost(matrix, template, weights, arc_count, distance):
+    """Weighted mean distance, in pixels, from the projected marks to the ink."""
+    try:
+        inverse = np.linalg.inv(matrix)
+    except np.linalg.LinAlgError:
+        return None
+    homogeneous = np.column_stack([template, np.ones(len(template))]) @ inverse.T
+    depth = homogeneous[:, 2]
+    if np.any(np.abs(depth) < 1e-9):
+        return None
+    image = homogeneous[:, :2] / depth[:, None]
+    height, width = distance.shape[:2]
+    inside = (
+        np.isfinite(image).all(axis=1)
+        & (image[:, 0] >= 0) & (image[:, 0] < width)
+        & (image[:, 1] >= height * CROWD_BAND) & (image[:, 1] < height)
+    )
+    if int(np.count_nonzero(inside[:arc_count])) < arc_count // 2 or int(np.count_nonzero(inside)) < 40:
+        return None
+    # A collapsed matrix drops every mark on one painted pixel. The box has to span the picture.
+    spread = np.ptp(image[inside], axis=0)
+    if float(max(spread[0], spread[1])) < 120.0 or float(min(spread[0], spread[1])) < 20.0:
+        return None
+    xs = image[inside, 0].astype(np.int64)
+    ys = image[inside, 1].astype(np.int64)
+    reach = np.minimum(distance[ys, xs], 20.0)
+    total = float(np.sum(weights[inside]))
+    if total <= 0.0:
+        return None
+    return float(np.sum(reach * weights[inside]) / total)
+
+
+def _box_keeps_shape(matrix, positive_x, pitch):
+    """False for a matrix that flattens the box: the arc on the line, or no depth."""
+    width = float(pitch.width)
+    middle = width / 2.0
+    front = _front_x(positive_x, pitch)
+    goal = float(pitch.length) if positive_x else 0.0
+    outward = -_goal_sign(positive_x)
+    points = _project_field(
+        matrix,
+        [
+            (front, middle - _BOX_HALF_CM),
+            (front, middle + _BOX_HALF_CM),
+            (goal, middle - _BOX_HALF_CM),
+            (front + outward * _D_DEPTH_CM, middle),
+            (front, middle),
+        ],
+    )
+    if points is None:
+        return False
+    low, high, goal_low, tip, centre = points
+    # Same handedness as the arc fit: a mirrored box swaps the near and far touchlines.
+    along_x = _project_field(matrix, [(front, middle), (front + 100.0, middle), (front, middle + 100.0)])
+    if along_x is None:
+        return False
+    step_x = along_x[1] - along_x[0]
+    step_y = along_x[2] - along_x[0]
+    if float(step_x[0] * step_y[1] - step_x[1] * step_y[0]) <= 0.0:
+        return False
+    line = high - low
+    length = float(np.linalg.norm(line))
+    if length < 120.0:
+        return False
+    normal = np.array([-line[1], line[0]]) / length
+    tip_out = abs(float((tip - centre) @ normal))
+    depth = abs(float((goal_low - low) @ normal))
+    return tip_out >= 12.0 and depth >= 25.0
+
+
+def box_from_sides(measured, grass, ink, pitch=None):
+    """Image-to-field matrix from the four painted corners of the penalty area.
+
+    One side that ends on the goal line gives two corners: where it leaves
+    the 16.5 m line and where it meets the goal line. The other two lie on
+    those same two lines. When they are painted in the picture they are
+    read. When the camera cuts them off they are the pair that puts the arc,
+    the small box and the rest of the marks back on the paint. The result is
+    a true perspective, and the 16.5 m line and the arc still have to pass
+    the grass probe.
+    """
+    pitch = pitch or SoccerPitchConfiguration()
+    if measured is None:
+        return None
+    sides = measured["sides"]
+    anchor_name = None
+    for name, side in sides.items():
+        if side["junction"] is not None and (
+            anchor_name is None or side["length"] > sides[anchor_name]["length"]
+        ):
+            anchor_name = name
+    if anchor_name is None:
+        return None
+    anchor = sides[anchor_name]
+    other_name = "high" if anchor_name == "low" else "low"
+    sign = 1.0 if anchor_name == "low" else -1.0
+    along = np.asarray(measured["along"], dtype=np.float64) * sign
+    corner = anchor["corner"]
+    meeting = anchor["junction"]
+    goal_direction = np.asarray(anchor["goal_line"], dtype=np.float64)
+    if float(goal_direction @ along) < 0.0:
+        goal_direction = -goal_direction
+    depth_px = float(np.linalg.norm(meeting - corner))
+    if depth_px < 60.0:
+        return None
+    other = sides.get(other_name)
+    station = _line_end(ink, measured["foot"], measured["along"], sign)
+    painted = _painted_reach(ink, corner, along)
+    if other is not None:
+        fronts = [float((other["corner"] - corner) @ along)]
+    elif station is not None:
+        fronts = [float((measured["foot"] + measured["along"] * station - corner) @ along)]
+    else:
+        # The 16.5 m line runs off the picture. The corner is somewhere past the edge.
+        fronts = list(np.geomspace(max(painted, 150.0), max(painted, 150.0) * 5.0, 22))
+    if fronts[0] < 120.0:
+        return None
+    if other is not None and other["junction"] is not None:
+        backs = [float((other["junction"] - meeting) @ goal_direction)]
+    else:
+        backs = None
+    width = float(pitch.width)
+    y_anchor = width / 2.0 - sign * _BOX_HALF_CM
+    y_other = width / 2.0 + sign * _BOX_HALF_CM
+    distance = cv2.distanceTransform(cv2.bitwise_not(ink), cv2.DIST_L2, 3)
+    toward_goal = float((meeting - corner)[0])
+    for positive_x in (toward_goal >= 0.0, toward_goal < 0.0):
+        front = _front_x(positive_x, pitch)
+        goal = float(pitch.length) if positive_x else 0.0
+        field = np.array(
+            [(front, y_anchor), (goal, y_anchor), (front, y_other), (goal, y_other)], dtype=np.float32
+        )
+        template, weights, arc_count = _box_template(pitch, positive_x)
+
+        def solve(front_px, back_px):
+            image = np.array(
+                [corner, meeting, corner + along * front_px, meeting + goal_direction * back_px],
+                dtype=np.float32,
+            )
+            matrix = cv2.getPerspectiveTransform(image, field).astype(np.float64)
+            if not np.isfinite(matrix).all() or not _box_keeps_shape(matrix, positive_x, pitch):
+                return None
+            cost = _template_cost(matrix, template, weights, arc_count, distance)
+            return None if cost is None else (cost, matrix, front_px, back_px)
+
+        best = None
+        for front_px in fronts:
+            ratios = [back / front_px for back in backs] if backs else np.geomspace(0.4, 1.6, 16)
+            for ratio in ratios:
+                found = solve(front_px, front_px * float(ratio))
+                if found is not None and (best is None or found[0] < best[0]):
+                    best = found
+        if best is None:
+            continue
+        for spread in (0.06, 0.02, 0.007):
+            front_steps = [1.0] if len(fronts) == 1 else [1.0 - spread, 1.0, 1.0 + spread]
+            back_steps = [1.0] if backs else [1.0 - spread, 1.0, 1.0 + spread]
+            _cost, _matrix, front_px, back_px = best
+            for front_step in front_steps:
+                for back_step in back_steps:
+                    found = solve(front_px * front_step, back_px * back_step)
+                    if found is not None and found[0] < best[0]:
+                        best = found
+        cost, matrix, front_px, back_px = best
+        if cost > _BOX_COST_PX:
+            continue
+        # The middle of the 16.5 m line has to fall between its two ends.
+        middle = _project_field(matrix, [(front, width / 2.0)])
+        if middle is None:
+            continue
+        share = float((middle[0] - corner) @ along) / front_px
+        if not (0.2 <= share <= 0.8) or not (0.4 <= back_px / front_px <= 2.0):
+            continue
+        if not _side_matches_image(matrix, positive_x, ink.shape[1]):
+            continue
+        if not _box_keeps_shape(matrix, positive_x, pitch):
+            continue
+        # The marks were already checked point by point against the ink. The
+        # grass probe only measures how deep the picture goes.
+        patch = paint_patch(matrix, positive_x, grass, None, pitch)
+        if patch is None:
+            continue
+        scale = local_scale(matrix, positive_x, pitch)
+        if scale is None:
+            continue
+        return {
+            "matrix": matrix,
+            "positive_x": bool(positive_x),
+            "cm_per_px": scale,
+            "region": "penalty",
+            "projective": True,
+            "toward_goal_cm": patch["toward_goal_cm"],
+            "toward_arc_cm": patch["toward_arc_cm"],
+            "area_px": 0.5 * (front_px + back_px) * depth_px,
+            "cost": cost,
+        }
+    return None
+
+
+def _painted_reach(ink, origin, direction, gap_px=40.0):
+    """How far the paint of a line goes on from a point, in pixels."""
+    wide = cv2.dilate(ink, np.ones((5, 5), np.uint8))
+    length, _share, _left = _ray_run(wide, origin, direction, reach=1500.0, gap_px=gap_px, skip=0.0)
+    return length
+
+
+_D_HALF_CM = float(np.sqrt(915.0**2 - 550.0**2))
+_D_DEPTH_CM = 915.0 - 550.0
+
+
+def _painted_d(ink, foot, along, perp):
+    """The penalty arc as it leaves the 16.5 m line: its two ends and its curve.
+
+    The arc is the thin curve on the pitch side of the line that starts and
+    ends on it. Returns (end_low, end_high, curve points), or None.
+    """
+    ys, xs = np.where(ink > 0)
+    delta = np.stack([xs, ys], axis=1).astype(np.float64) - foot
+    out = -(delta @ perp)
+    # Leave the 16.5 m line itself out. The arc keeps going right up to it.
+    keep = (out > 6.0) & (out < 260.0)
+    if int(np.count_nonzero(keep)) < 60:
+        return None
+    band = np.zeros_like(ink)
+    band[ys[keep], xs[keep]] = 255
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(band, connectivity=8)
+    member_of = labels[ys[keep], xs[keep]]
+    kept_out = out[keep]
+    kept_along = (delta @ along)[keep]
+    kept_points = np.stack([xs[keep], ys[keep]], axis=1).astype(np.float64)
+    best = None
+    for index in range(1, count):
+        if stats[index, cv2.CC_STAT_AREA] < 60:
+            continue
+        member = member_of == index
+        piece_out = kept_out[member]
+        piece_along = kept_along[member]
+        touching = piece_out < 16.0
+        if int(np.count_nonzero(touching)) < 4 or float(piece_out.max()) < 25.0:
+            continue
+        low = float(piece_along[touching].min())
+        high = float(piece_along[touching].max())
+        if high - low < 60.0:
+            continue
+        # A curve: the far part of it lies between its two ends on the line.
+        far = piece_out > 0.5 * float(piece_out.max())
+        slack = 0.15 * (high - low)
+        if not np.all((piece_along[far] > low - slack) & (piece_along[far] < high + slack)):
+            continue
+        size = float(stats[index, cv2.CC_STAT_AREA])
+        if best is None or size > best[0]:
+            points = kept_points[member]
+            ends = []
+            for end_along in (low, high):
+                # The arc meets the line almost along it. Carry its last stretch on to the line.
+                near = (piece_out < 40.0) & (np.abs(piece_along - end_along) < 0.35 * (high - low))
+                end = foot + along * end_along
+                if int(np.count_nonzero(near)) >= 12:
+                    vx, vy, x0, y0 = cv2.fitLine(points[near].astype(np.float32), cv2.DIST_HUBER, 0, 0.01, 0.01).reshape(-1)
+                    reach = _meet(foot, along, np.array([x0, y0], dtype=np.float64), np.array([vx, vy], dtype=np.float64))
+                    if reach is not None and abs(reach - end_along) < 40.0:
+                        end = foot + along * reach
+                ends.append(end)
+            best = (size, ends[0], ends[1], points[piece_out > 12.0])
+    if best is None or len(best[3]) < 20:
+        return None
+    return best[1], best[2], best[3]
+
+
+def box_from_arc(measured, grass, ink, pitch=None):
+    """Image-to-field matrix from one corner and the painted arc.
+
+    With the goal line off the picture the box cannot be closed. The arc
+    still is: its ends sit 7.31 m each side of the middle of the 16.5 m line
+    and its tip 3.65 m out. With a corner that is four known points.
+    """
+    pitch = pitch or SoccerPitchConfiguration()
+    if measured is None or not measured["sides"]:
+        return None
+    foot = measured["foot"]
+    along = measured["along"]
+    perp = measured["perp"]
+    arc = _painted_d(ink, foot, along, perp)
+    if arc is None:
+        return None
+    end_low, end_high, curve = arc
+    arc_middle = 0.5 * (float((end_low - foot) @ along) + float((end_high - foot) @ along))
+    width = float(pitch.width)
+    middle = width / 2.0
+    distance = cv2.distanceTransform(cv2.bitwise_not(ink), cv2.DIST_L2, 3)
+    picks = curve[np.linspace(0, len(curve) - 1, min(len(curve), 48)).astype(int)]
+    best = None
+    for name, side in measured["sides"].items():
+        station = float((side["corner"] - foot) @ along)
+        # A real corner is beyond the arc on its own hand.
+        if name == "low" and station > float((end_low - foot) @ along) - 20.0:
+            continue
+        if name == "high" and station < float((end_high - foot) @ along) + 20.0:
+            continue
+        for positive_x in (True, False):
+            front = _front_x(positive_x, pitch)
+            outward = -_goal_sign(positive_x)
+            template, weights, arc_count = _box_template(pitch, positive_x)
+            for low_y in (middle - _D_HALF_CM, middle + _D_HALF_CM):
+                high_y = 2.0 * middle - low_y
+                corner_y = (middle - _BOX_HALF_CM) if low_y < middle else (middle + _BOX_HALF_CM)
+                if name == "high":
+                    corner_y = 2.0 * middle - corner_y
+                ends = np.array([side["corner"], end_low, end_high], dtype=np.float64)
+                field_ends = [(front, corner_y), (front, low_y), (front, high_y), (front + outward * _D_DEPTH_CM, middle)]
+                inward = -outward
+
+                def solve(tip, reach_px, reach_cm):
+                    # Three marks lie on the 16.5 m line. The side adds one point off it.
+                    on_side = side["corner"] + side["direction"] * reach_px
+                    image = np.vstack([ends, [tip], [on_side]]).astype(np.float32)
+                    field = np.array(field_ends + [(front + inward * reach_cm, corner_y)], dtype=np.float32)
+                    matrix, _mask = cv2.findHomography(image, field, 0)
+                    if matrix is None or not np.isfinite(matrix).all():
+                        return None
+                    if not _box_keeps_shape(matrix, positive_x, pitch):
+                        return None
+                    cost = _template_cost(matrix, template, weights, arc_count, distance)
+                    return None if cost is None else (cost, matrix, tip, reach_cm)
+
+                reach_px = min(float(side["length"]), 200.0)
+                found = None
+                for tip in picks[:: max(1, len(picks) // 16)]:
+                    for reach_cm in np.geomspace(250.0, 1650.0, 10):
+                        tried = solve(tip, reach_px, float(reach_cm))
+                        if tried is not None and (found is None or tried[0] < found[0]):
+                            found = tried
+                if found is None:
+                    continue
+                for step in (4.0, 2.0, 1.0):
+                    for dx in (-step, 0.0, step):
+                        for dy in (-step, 0.0, step):
+                            for grow in (1.0 - step / 40.0, 1.0, 1.0 + step / 40.0):
+                                tried = solve(found[2] + np.array([dx, dy]), reach_px, found[3] * grow)
+                                if tried is not None and tried[0] < found[0]:
+                                    found = tried
+                cost, matrix, _tip, _reach = found
+                if cost > _BOX_COST_PX:
+                    continue
+                if not _side_matches_image(matrix, positive_x, ink.shape[1]):
+                    continue
+                if not _box_keeps_shape(matrix, positive_x, pitch):
+                    continue
+                goal_side = _project_field(matrix, [(front - outward * 500.0, middle)])
+                if goal_side is None or float((goal_side[0] - (foot + along * arc_middle)) @ perp) <= 0.0:
+                    continue
+                if best is None or cost < best[0]:
+                    best = (cost, matrix, positive_x)
+    if best is None:
+        return None
+    cost, matrix, positive_x = best
+    patch = paint_patch(matrix, positive_x, grass, None, pitch)
+    scale = local_scale(matrix, positive_x, pitch)
+    if patch is None or scale is None:
+        return None
+    return {
+        "matrix": matrix,
+        "positive_x": bool(positive_x),
+        "cm_per_px": scale,
+        "region": "penalty",
+        "projective": True,
+        "toward_goal_cm": patch["toward_goal_cm"],
+        "toward_arc_cm": patch["toward_arc_cm"],
+        "area_px": 0.0,
+        "cost": cost,
+    }
+
+
+def fit_painted_box(frame, grass, white_mask=None, pitch=None, seed=None, ink=None):
+    """The whole penalty area on the paint, without the arc fit.
+
+    An open camera makes the lines too thin for the white mask and the arc
+    too small for its fit, and the box is all in the picture. The thin marks
+    still show the 16.5 m line, both sides and the goal line. seed is the
+    16.5 m line of the matrix on screen. Without it every long painted line
+    is tried from both hands, and the largest box that holds the arc wins.
+    Returns the report and the measured sides, either of which may be None.
+    """
+    pitch = pitch or SoccerPitchConfiguration()
+    if ink is None:
+        ink = line_ink(frame, grass, white_mask)
+    if ink is None:
+        return None, None
+    if seed is not None:
+        foot, along, perp, start_px = seed
+        measured = penalty_sides(frame, grass, foot, along, perp, start_px, ink=ink)
+        report = box_from_sides(measured, grass, ink, pitch)
+        if report is None:
+            report = box_from_arc(measured, grass, ink, pitch)
+        return report, measured
+    paint = _clean_paint(ink)
+    if paint is None:
+        return None, None
+    best = None
+    for origin, direction in _penalty_lines(paint)[:3]:
+        middle = _painted_middle(ink, origin, direction)
+        if middle is None:
+            continue
+        normal = np.array([-direction[1], direction[0]], dtype=np.float64)
+        for hand in (normal, -normal):
+            measured = penalty_sides(frame, grass, middle, direction, hand, 0.0, ink=ink)
+            report = box_from_sides(measured, grass, ink, pitch)
+            if report is None:
+                report = box_from_arc(measured, grass, ink, pitch)
+            if report is not None and (best is None or (report["area_px"], -report["cost"]) > (best[0]["area_px"], -best[0]["cost"])):
+                best = (report, measured)
+    return best if best is not None else (None, None)
 
 
 def _picture_exit(origin, direction, shape):
@@ -1151,26 +1653,40 @@ class VisiblePitchMap:
         self._side_memory = None
         self._corner_t = None
         self._corner_matrix_id = None
+        self.projective = False
+        self._side_cache = None
+        self._ink_cache = None
         self.accepted_frames = 0
         self.held_frames = 0
         self.rejected_frames = 0
         self.reasons = Counter()
 
     def update(self, white_line_mask, frame=None, grass_mask=None):
+        self._side_cache = None
+        ink = self._ink(white_line_mask, frame, grass_mask)
+        # A matrix read off the thin marks is checked against the thin marks.
+        marks = ink if (self.projective and ink is not None) else white_line_mask
         report = fit_broadcast_penalty(white_line_mask, self.pitch, frame)
         if report is not None and not (SANE_CM_MIN <= float(report["cm_per_px"]) <= SANE_CM_MAX):
             self.reasons["absurd"] += 1
             report = None
         if report is not None and grass_mask is not None:
-            patch = paint_patch(
-                report["matrix"], report["positive_x"], grass_mask, white_line_mask, self.pitch
-            )
+            patch = paint_patch(report["matrix"], report["positive_x"], grass_mask, white_line_mask, self.pitch)
             if patch is None:
                 self.reasons["off_pitch"] += 1
                 report = None
             else:
                 report["toward_goal_cm"] = patch["toward_goal_cm"]
                 report["toward_arc_cm"] = patch["toward_arc_cm"]
+        boxed = False
+        if report is None and ink is not None and not self._geometry_holds(marks, grass_mask):
+            # The arc fit missed and the matrix on screen has left the paint.
+            # An open camera still shows the whole box in thin lines.
+            report = self._box_report(white_line_mask, frame, grass_mask)
+            if report is not None and not (SANE_CM_MIN <= float(report["cm_per_px"]) <= SANE_CM_MAX):
+                self.reasons["absurd"] += 1
+                report = None
+            boxed = report is not None
         if report is None:
             centre = fit_broadcast_centre(white_line_mask, self.pitch, frame)
             if centre is not None and not (SANE_CM_MIN <= float(centre["cm_per_px"]) <= SANE_CM_MAX):
@@ -1180,7 +1696,7 @@ class VisiblePitchMap:
                 report = centre
             elif centre is not None:
                 self.reasons["off_pitch"] += 1
-        coherent = self._geometry_holds(white_line_mask, grass_mask)
+        coherent = self._geometry_holds(marks, grass_mask)
         fresh_view = False
         if report is not None and self.matrix is not None:
             report_region = report.get("region") or "penalty"
@@ -1193,6 +1709,15 @@ class VisiblePitchMap:
                 else:
                     fresh_view = True
                     self.reasons["camera_move"] += 1
+            elif self.projective and not boxed and bool(report["positive_x"]) == bool(self.positive_x):
+                # The box only stands in while the arc fit misses.
+                fresh_view = True
+                self.reasons["arc_back"] += 1
+            elif boxed and bool(report["positive_x"]) == bool(self.positive_x):
+                # The matrix on screen has left the paint and the box was checked
+                # point by point on this frame. A zoom is not a scale jump here.
+                fresh_view = True
+                self.reasons["box_replaces"] += 1
             else:
                 same_side = bool(report["positive_x"]) == bool(self.positive_x)
                 scale_ok = scale_is_stable(self.scale, report["cm_per_px"])
@@ -1211,6 +1736,8 @@ class VisiblePitchMap:
                     self.reasons[verdict] += 1
                     report = None
         if report is not None:
+            if boxed and report.get("projective"):
+                self.reasons["boxed"] += 1
             return self._publish(
                 self._accept(report, grass_mask, fresh_view=fresh_view), white_line_mask, frame
             )
@@ -1280,6 +1807,7 @@ class VisiblePitchMap:
             "frames_without_map": self.rejected_frames,
             "accepted_frames": self.accepted_frames,
             "held_frames": self.held_frames,
+            "boxed_frames": int(self.reasons.get("boxed", 0)),
             "visible_third_cm": VISIBLE_THIRD_CM,
             "penalty_depth_cm": 1650.0,
             "penalty_width_cm": 4032.0,
@@ -1304,6 +1832,7 @@ class VisiblePitchMap:
         self.scale = scale
         self.toward_goal_cm = report.get("toward_goal_cm")
         self.toward_arc_cm = report.get("toward_arc_cm")
+        self.projective = bool(report.get("projective"))
         self.grass = grass_mask
         self.hold_left = self.hold_frames
         self.accepted_frames += 1
@@ -1316,6 +1845,34 @@ class VisiblePitchMap:
         if old is None or new is None:
             return None
         return float(np.hypot(new[0] - old[0], new[1] - old[1]))
+
+    def _ink(self, white_line_mask, frame, grass_mask):
+        """Thin marks of this frame, read once."""
+        if frame is None or grass_mask is None:
+            return None
+        if self._ink_cache is None or self._ink_cache[0] is not frame:
+            self._ink_cache = (frame, line_ink(frame, grass_mask, white_line_mask))
+        return self._ink_cache[1]
+
+    def _box_report(self, white_line_mask, frame, grass_mask):
+        """The four painted corners of the penalty area, when they can be read."""
+        ink = self._ink(white_line_mask, frame, grass_mask)
+        if ink is None:
+            return None
+        seed = None
+        if self.matrix is not None and self.region != "centre" and self.scale:
+            geometry = _line_frame(self.matrix, self.positive_x, self.pitch)
+            if geometry is not None:
+                seed = (geometry[0], geometry[1], geometry[2], _ARC_MEET_CM / float(self.scale) + 24.0)
+        report, measured = fit_painted_box(frame, grass_mask, white_line_mask, self.pitch, seed, ink)
+        if report is None and seed is not None and not self._arc_on_ink(ink, grass_mask):
+            # The matrix on screen has left the paint. Look at every long line again.
+            report, measured = fit_painted_box(frame, grass_mask, white_line_mask, self.pitch, None, ink)
+        self._side_cache = (frame, measured) if measured is not None else None
+        return report
+
+    def _arc_on_ink(self, ink, grass_mask):
+        return paint_patch(self.matrix, self.positive_x, grass_mask, ink, self.pitch) is not None
 
     def _geometry_holds(self, white_line_mask, grass_mask=None):
         """True when the current arc still lands on this frame. The hold counter is ignored."""
@@ -1366,6 +1923,7 @@ class VisiblePitchMap:
         self._side_memory = None
         self._corner_t = None
         self._corner_matrix_id = None
+        self.projective = False
         self.hold_left = 0
 
     def _field_y(self, image_x, image_y, affine_y, center):
@@ -1494,10 +2052,13 @@ class VisiblePitchMap:
         geometry = _line_frame(self.matrix, self.positive_x, self.pitch)
         if geometry is None:
             return
-        start_px = _ARC_MEET_CM / float(self.scale) + 24.0
-        measured = penalty_sides(
-            frame, self.grass, geometry[0], geometry[1], geometry[2], start_px, _clean_paint(white_line_mask)
-        )
+        if self._side_cache is not None and self._side_cache[0] is frame:
+            measured = self._side_cache[1]
+        else:
+            start_px = _ARC_MEET_CM / float(self.scale) + 24.0
+            measured = penalty_sides(
+                frame, self.grass, geometry[0], geometry[1], geometry[2], start_px, _clean_paint(white_line_mask)
+            )
         if measured is None:
             return
         sides = measured["sides"]
@@ -1578,6 +2139,12 @@ class VisiblePitchMap:
         if self.matrix is None or self.positive_x is None or self.region == "centre" or not self.scale:
             self._corner_t = None
             self._corner_matrix_id = None
+            return
+        if self.projective:
+            # A true perspective needs no width correction. The sides are drawn where they are painted.
+            self._corner_t = None
+            self._corner_matrix_id = None
+            self._measure_sides(None, frame, white_line_mask)
             return
         paint = _clean_paint(white_line_mask)
         found = _line_ends(paint, self.matrix, self.positive_x, self.scale, self.pitch)
