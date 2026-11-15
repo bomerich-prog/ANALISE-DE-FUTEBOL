@@ -37,6 +37,7 @@ from pitch_homography import (
     fit_broadcast_centre,
     fit_broadcast_penalty,
 )
+from pitch_centre import centre_holds, fit_centre_on_ink
 from roboflow_soccer_config import SoccerPitchConfiguration
 from roboflow_view import ViewTransformer
 
@@ -1567,7 +1568,8 @@ def draw_visible_centre(frame, matrix, color=(0, 220, 255)):
     pitch = SoccerPitchConfiguration()
     length = float(pitch.length)
     width = float(pitch.width)
-    line = [(length / 2.0, width * step) for step in np.linspace(0, 1, 24)]
+    # The halfway line of a 68 m pitch. A wider template pitch would draw it into the boards.
+    line = [(length / 2.0, width / 2.0 + 3400.0 * (2.0 * step - 1.0)) for step in np.linspace(0, 1, 48)]
     circle = [
         (length / 2.0 + 915.0 * np.cos(theta), width / 2.0 + 915.0 * np.sin(theta))
         for theta in np.linspace(0, 2 * np.pi, 36, endpoint=False)
@@ -1688,6 +1690,9 @@ class VisiblePitchMap:
                 report = None
             boxed = report is not None
         if report is None:
+            report = self._centre_report(white_line_mask, frame, grass_mask, ink, marks)
+            boxed = boxed or (report is not None and report.get("projective"))
+        if report is None:
             centre = fit_broadcast_centre(white_line_mask, self.pitch, frame)
             if centre is not None and not (SANE_CM_MIN <= float(centre["cm_per_px"]) <= SANE_CM_MAX):
                 self.reasons["absurd"] += 1
@@ -1736,7 +1741,9 @@ class VisiblePitchMap:
                     self.reasons[verdict] += 1
                     report = None
         if report is not None:
-            if boxed and report.get("projective"):
+            if report.get("region") == "centre" and report.get("projective"):
+                self.reasons["centre_on_ink"] += 1
+            elif boxed and report.get("projective"):
                 self.reasons["boxed"] += 1
             return self._publish(
                 self._accept(report, grass_mask, fresh_view=fresh_view), white_line_mask, frame
@@ -1808,6 +1815,7 @@ class VisiblePitchMap:
             "accepted_frames": self.accepted_frames,
             "held_frames": self.held_frames,
             "boxed_frames": int(self.reasons.get("boxed", 0)),
+            "centre_on_ink_frames": int(self.reasons.get("centre_on_ink", 0)),
             "visible_third_cm": VISIBLE_THIRD_CM,
             "penalty_depth_cm": 1650.0,
             "penalty_width_cm": 4032.0,
@@ -1854,6 +1862,29 @@ class VisiblePitchMap:
             self._ink_cache = (frame, line_ink(frame, grass_mask, white_line_mask))
         return self._ink_cache[1]
 
+    def _centre_report(self, white_line_mask, frame, grass_mask, ink, marks):
+        """The centre circle and halfway line read off the thin marks, when the penalty fits missed.
+
+        A centre matrix on screen is followed from frame to frame: it is the
+        starting point of the next fit. Otherwise the search only runs once
+        the matrix on screen has left the paint.
+        """
+        if ink is None:
+            return None
+        following = self.region == "centre" and self.projective and self.matrix is not None
+        if not following and self._geometry_holds(marks, grass_mask):
+            return None
+        report = fit_centre_on_ink(
+            frame, grass_mask, white_line_mask, prior=self.matrix if following else None, ink=ink
+        )
+        if report is None:
+            return None
+        # Checked point by point on the ink. A close full-HD camera is under 2 cm per pixel.
+        if report["cm_per_px"] is None or not (0.5 <= float(report["cm_per_px"]) <= SANE_CM_MAX):
+            self.reasons["absurd"] += 1
+            return None
+        return report
+
     def _box_report(self, white_line_mask, frame, grass_mask):
         """The four painted corners of the penalty area, when they can be read."""
         ink = self._ink(white_line_mask, frame, grass_mask)
@@ -1879,6 +1910,8 @@ class VisiblePitchMap:
         if self.matrix is None or self.positive_x is None:
             return False
         if self.region == "centre":
+            if self.projective:
+                return centre_holds(self.matrix, grass_mask, white_line_mask)
             return centre_on_paint(self.matrix, grass_mask, white_line_mask, self.pitch)
         if grass_mask is not None:
             patch = paint_patch(self.matrix, self.positive_x, grass_mask, white_line_mask, self.pitch)

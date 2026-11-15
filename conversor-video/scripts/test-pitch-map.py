@@ -32,6 +32,7 @@ from pitch_map import (  # noqa: E402
     visible_bounds,
     _width_terms,
 )
+from pitch_centre import fit_centre_on_ink  # noqa: E402
 from possession import _player_distance  # noqa: E402
 from roboflow_soccer_config import SoccerPitchConfiguration  # noqa: E402
 from roboflow_view import ViewTransformer  # noqa: E402
@@ -440,6 +441,83 @@ def test_without_the_goal_line_the_arc_closes_the_box():
     error = float(np.max(np.linalg.norm(found - truth, axis=1)))
     assert_true(error < 6.0, f"the corner, the middle and the arc tip land on the paint ({error:.1f} px)")
 
+
+def _broadcast_centre(view):
+    """The centre circle and the halfway line in perspective, painted as thin lines.
+
+    view gives the image of the circle's four ends: top, bottom, left, right.
+    Returns the frame, a grass mask and the true field-to-image matrix.
+    """
+    cardinals = np.array([(6000.0, 2585.0), (6000.0, 4415.0), (5085.0, 3500.0), (6915.0, 3500.0)], np.float32)
+    to_image = cv2.getPerspectiveTransform(cardinals, np.array(view, np.float32))
+    frame = np.full((1080, 1920, 3), (60, 120, 70), np.uint8)
+    grass = np.full((1080, 1920), 255, np.uint8)
+    grass[:110] = 0
+
+    def paint(points):
+        pts = cv2.perspectiveTransform(np.array(points, np.float32).reshape(-1, 1, 2), to_image).reshape(-1, 2)
+        for a, b in zip(pts[:-1], pts[1:]):
+            _paint_ridge(frame, a, b, 185)
+
+    steps = np.linspace(0, 1, 120)
+    # A 105 x 68 m pitch around the centre: every mark the camera could see is painted.
+    paint([(6000.0 + 915.0 * np.cos(a), 3500.0 + 915.0 * np.sin(a)) for a in np.linspace(0, 2 * np.pi, 120)])
+    paint([(6000.0, 100.0 + 6800.0 * t) for t in steps])
+    for y in (100.0, 6900.0):
+        paint([(750.0 + 10500.0 * t, y) for t in steps])
+    for goal, inward in ((750.0, 1.0), (11250.0, -1.0)):
+        front = goal + inward * 1650.0
+        paint([(goal, 100.0 + 6800.0 * t) for t in steps])
+        paint([(front, 1484.0 + 4032.0 * t) for t in steps])
+        for y in (1484.0, 5516.0):
+            paint([(goal + inward * 1650.0 * t, y) for t in steps])
+        small = goal + inward * 550.0
+        paint([(small, 2584.0 + 1832.0 * t) for t in steps])
+        for y in (2584.0, 4416.0):
+            paint([(goal + inward * 550.0 * t, y) for t in steps])
+        spot = goal + inward * 1100.0
+        reach = np.arccos(550.0 / 915.0)
+        paint([(spot + inward * 915.0 * np.cos(a), 3500.0 + 915.0 * np.sin(a)) for a in np.linspace(-reach, reach, 40)])
+    return frame, grass, to_image
+
+
+def _centre_error(report, to_image):
+    checks = np.array([(6000.0, 3500.0), (5085.0, 3500.0), (6915.0, 3500.0), (6000.0, 2585.0), (6000.0, 4415.0)], np.float32)
+    truth = cv2.perspectiveTransform(checks.reshape(-1, 1, 2), to_image).reshape(-1, 2)
+    found = cv2.perspectiveTransform(
+        checks.reshape(-1, 1, 2), np.linalg.inv(report["matrix"]).astype(np.float32)
+    ).reshape(-1, 2)
+    return float(np.max(np.linalg.norm(found - truth, axis=1)))
+
+
+def test_the_centre_circle_is_read_off_the_thin_marks():
+    # The whole circle in the picture, the halfway line through it.
+    frame, grass, to_image = _broadcast_centre([(980.0, 470.0), (960.0, 690.0), (650.0, 575.0), (1300.0, 575.0)])
+    report = fit_centre_on_ink(frame, grass)
+    assert_true(report is not None, "the whole circle and the halfway line give a matrix")
+    assert_true(report["region"] == "centre" and report["projective"], "it is a true perspective of the centre")
+    error = _centre_error(report, to_image)
+    assert_true(error < 6.0, f"the centre and the four ends of the circle land on the paint ({error:.1f} px)")
+    middle = cv2.perspectiveTransform(np.array([[[960.0, 575.0]]], np.float32), report["matrix"].astype(np.float32))[0, 0]
+    assert_true(abs(float(middle[0]) - 6000.0) < 60.0, "the image middle maps to the halfway line")
+
+
+def test_a_circle_cut_by_the_picture_edge_still_gives_the_centre():
+    # The camera has panned: the right half of the circle is off the picture.
+    frame, grass, to_image = _broadcast_centre([(1700.0, 300.0), (1650.0, 520.0), (1290.0, 400.0), (2200.0, 420.0)])
+    report = fit_centre_on_ink(frame, grass)
+    assert_true(report is not None, "the cut circle and the halfway line still give a matrix")
+    error = _centre_error(report, to_image)
+    # The circle is 900 px wide here; 12 px is under 1.5 % of it.
+    assert_true(error < 12.0, f"the cut circle lands on the paint ({error:.1f} px)")
+
+
+def test_grass_without_the_centre_marks_gives_no_centre():
+    frame = np.full((1080, 1920, 3), (60, 120, 70), np.uint8)
+    grass = np.full((1080, 1920), 255, np.uint8)
+    _paint_ridge(frame, (100.0, 300.0), (1800.0, 260.0), 185)
+    assert_true(fit_centre_on_ink(frame, grass) is None, "a lone straight line is not a centre")
+
 def test_a_line_cut_by_the_frame_is_not_a_corner():
     foot = np.array([900.0, 500.0])
     along = np.array([0.95, 0.31])
@@ -710,6 +788,9 @@ def main():
     test_the_other_corner_copies_the_angle_to_the_picture_edge()
     test_an_open_camera_reads_the_box_from_its_painted_corners()
     test_without_the_goal_line_the_arc_closes_the_box()
+    test_the_centre_circle_is_read_off_the_thin_marks()
+    test_a_circle_cut_by_the_picture_edge_still_gives_the_centre()
+    test_grass_without_the_centre_marks_gives_no_centre()
     test_a_line_cut_by_the_frame_is_not_a_corner()
     test_the_measured_strip_does_not_erase_the_visible_third()
     test_spatial_metrics_use_only_mapped_players()
