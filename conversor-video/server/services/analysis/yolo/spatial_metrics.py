@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 
-from ball_heatmap import BallHeatmapAccumulator
+from ball_heatmap import FieldGridHeatmap
 
 
 PLAYER_SPEED_MAX_M_S = 12.0
@@ -84,7 +84,7 @@ class SpatialMetrics:
             parsed = 30.0
         self.fps = parsed if parsed > 0 else 30.0
         self.goal_at_high_x = goal_at_high_x
-        self.player_heatmap = BallHeatmapAccumulator()
+        self.player_heatmap = FieldGridHeatmap()
         self._sums = {
             "Team 0": self._blank_team(),
             "Team 1": self._blank_team(),

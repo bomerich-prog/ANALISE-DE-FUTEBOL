@@ -479,13 +479,14 @@
         </div>
         <div class="analysis-heatmap-body">
           <div class="analysis-heatmap-pitch">
-            <canvas id="ballHeatmapCanvas" width="720" height="420" role="img" aria-label="Mapa de calor das posições observadas da bola no campo"></canvas>
-            <p class="analysis-heatmap-empty" id="ballHeatmapEmpty">Aguardando bola no terço visível do campo.</p>
+            <canvas id="ballHeatmapCanvas" width="720" height="420" role="img" aria-label="Mapa de calor da bola no mapa 2D do campo"></canvas>
+            <p class="analysis-heatmap-empty" id="ballHeatmapEmpty">Aguardando bola no mapa 2D.</p>
           </div>
           <div class="analysis-heatmap-stats">
             <article>
               <span>Bolas no mapa</span>
               <strong id="ballHeatmapObserved">0</strong>
+              <small id="ballHeatmapObservedDetail">Bolas vistas</small>
             </article>
             <article>
               <span>Zona mais usada</span>
@@ -495,7 +496,7 @@
             <article>
               <span>Bola fora do mapa</span>
               <strong id="ballHeatmapNoField">0</strong>
-              <small>Sem mapa do terço visível, ou fora dele</small>
+              <small>Quadros sem mapa 2D, ou bola fora do campo</small>
             </article>
             <article>
               <span>Largura</span>

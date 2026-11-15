@@ -12,6 +12,8 @@ import {
   formatHottestZone,
   formatHottestDetail,
   drawBallHeatmap,
+  isRadarHeatmap,
+  smoothHeat,
 } from '../public/js/ballHeatmap.js';
 
 const require = createRequire(import.meta.url);
@@ -107,5 +109,41 @@ const painted = drawBallHeatmap(fakeContext, 720, 420, finished);
 assert.equal(painted, 2, 'only the two used cells are painted');
 assert.ok(calls.some(([name]) => name === 'strokeRect'), 'pitch lines are drawn');
 assert.equal(drawBallHeatmap(fakeContext, 720, 420, empty), 0, 'nothing is painted before a ball');
+
+// The 2D radar heatmap: one metre per cell on the 105 x 68 m pitch, drawn smooth.
+const radarCells = grid(105, 68);
+radarCells[34][52] = 6;
+radarCells[34][53] = 2;
+radarCells[10][90] = 1;
+const radar = {
+  coordinates: 'radar',
+  columns: 105,
+  rows: 68,
+  field_length_cm: 10500,
+  field_width_cm: 6800,
+  cells: radarCells,
+  observed_points: 9,
+  seen_points: 7,
+  estimated_points: 2,
+  max_cell_count: 6,
+  frames_total: 20,
+  frames_observed_ball: 7,
+  frames_without_field_point: 0,
+  frames_outside_field: 0,
+};
+const bridged = ballHeatmapFromPayload({ ball_heatmap: radar });
+assert.equal(bridged.coordinates, 'radar', 'the bridge keeps the radar grid');
+assert.equal(bridged.estimated_points, 2, 'the bridge keeps the estimated balls');
+const readRadar = readBallHeatmap({ result_json: { ball_heatmap: radar } });
+assert.ok(isRadarHeatmap(readRadar), 'the panel knows the radar grid');
+assert.equal(readRadar.seen_points, 7, 'seen balls survive');
+const smooth = smoothHeat(readRadar);
+assert.ok(smooth[34][52] > smooth[34][50], 'heat is highest on the ball');
+assert.ok(smooth[36][52] > 0, 'and spreads around it');
+assert.equal(smooth[60][10], 0, 'far from every ball the grass stays empty');
+const radarHot = hottestCell(readRadar);
+assert.equal(formatHottestZone(radarHot), '50–55 m', 'the busiest 5 m zone along the pitch');
+const radarPainted = drawBallHeatmap(fakeContext, 720, 420, readRadar);
+assert.ok(radarPainted > 20, 'the smooth heat paints many small cells');
 
 console.log('ball heatmap panel tests passed');

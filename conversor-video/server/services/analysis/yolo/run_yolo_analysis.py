@@ -606,6 +606,14 @@ def assign_map_coordinates(detections, pitch_map, anchor_getter):
         detection["map_y"] = float(point[1])
 
 
+def ball_radar_point(pitch_map, map_decision, ball_detections):
+    """The ball on the 2D map in radar centimetres, the same point the radar draws, or None."""
+    if not ball_detections or not map_decision.get("accepted") or pitch_map.transformer is None:
+        return None
+    mapped = pitch_map.radar_points(np.array([detection_center(ball_detections[0]["box"])], dtype=np.float32))
+    return mapped[0] if mapped else None
+
+
 def radar_frame(pitch_map, smoother, frame_number, people, ball, frame_shape, memory=None):
     """Players and ball of this frame on the radar, from the same map matrix.
 
@@ -3180,7 +3188,7 @@ def analyze(args):
     possession_engine = PossessionEngine()
     possession_team_stats = PossessionTeamAccumulator(fps)
     player_stats = PlayerStatsAccumulator(fps, pitch=SOCCER_PITCH_CONFIGURATION)
-    ball_heatmap = BallHeatmapAccumulator(pitch=SOCCER_PITCH_CONFIGURATION)
+    ball_heatmap = BallHeatmapAccumulator()
     visible_pitch_map = VisiblePitchMap(pitch=SOCCER_PITCH_CONFIGURATION)
     radar_smoother = RadarSmoother()
     # The radar holds a lost player as long as ByteTrack keeps his ID (its buffer scales with fps).
@@ -4514,7 +4522,11 @@ def analyze(args):
                         break
                 if len(homography_examples) >= 8:
                     break
-        ball_heatmap.observe(ball_detections)
+        ball_heatmap.observe(
+            current_frame_number,
+            ball_detections,
+            ball_radar_point(visible_pitch_map, map_decision, ball_detections),
+        )
         record_profile_stage(
             profile_state,
             "homography",
@@ -4971,7 +4983,7 @@ def analyze(args):
             "player_duplicate_iou_threshold": PERSON_DUPLICATE_IOU_THRESHOLD,
             "field_filter": "player/goalkeeper/referee bbox bottom-center foot point must be inside white-line-guided playable-field polygon",
             "labels": "class name and confidence are burned into the annotated video",
-            "field_coordinates": "possession and passes stay in image pixels; map_x and map_y feed only the visible-third heatmap and spatial metrics",
+            "field_coordinates": "possession and passes stay in image pixels; the ball heatmap uses the 2D radar point; map_x and map_y feed only the spatial metrics",
         },
         "tracking": {
             "status": "implemented",

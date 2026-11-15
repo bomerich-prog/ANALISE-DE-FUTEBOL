@@ -9,6 +9,13 @@ const PENALTY_BOX_WIDTH_CM = 4100;
 const GOAL_BOX_LENGTH_CM = 550;
 const GOAL_BOX_WIDTH_CM = 1832;
 const CENTRE_CIRCLE_RADIUS_CM = 915;
+// The 2D radar pitch is a FIFA 105 x 68 m field.
+const RADAR_LENGTH_CM = 10500;
+const FIFA_PENALTY_BOX_LENGTH_CM = 1650;
+const FIFA_PENALTY_BOX_WIDTH_CM = 4032;
+// Each ball spreads its heat over about two metres around it.
+const SMOOTH_SIGMA_M = 2;
+const HOT_ZONE_M = 5;
 
 const LOW_COLOR = [255, 235, 59];
 const MID_COLOR = [255, 152, 0];
@@ -57,6 +64,9 @@ function normalize(source) {
     cells.push(clean);
   }
   return {
+    coordinates: source.coordinates === 'radar' ? 'radar' : 'field',
+    seen_points: count(source.seen_points),
+    estimated_points: count(source.estimated_points),
     columns,
     rows,
     field_length_cm: positive(source.field_length_cm, DEFAULT_LENGTH_CM),
@@ -103,10 +113,35 @@ export function heatColor(intensity) {
   return `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, ${alpha})`;
 }
 
+/** True for the one-metre grid on the 2D radar pitch. */
+export function isRadarHeatmap(heatmap) {
+  return heatmap?.coordinates === 'radar';
+}
+
+/** Sum cells into blocks of `size` x `size`, so a one-metre grid names a 5 m zone. */
+function blocks(heatmap, size) {
+  const columns = Math.ceil(heatmap.columns / size);
+  const rows = Math.ceil(heatmap.rows / size);
+  const cells = Array.from({ length: rows }, () => Array(columns).fill(0));
+  heatmap.cells.forEach((row, rowIndex) => {
+    row.forEach((value, columnIndex) => {
+      cells[Math.floor(rowIndex / size)][Math.floor(columnIndex / size)] += value;
+    });
+  });
+  return { cells, columns, rows, cellLength: (size * heatmap.field_length_cm) / heatmap.columns / 100, cellWidth: (size * heatmap.field_width_cm) / heatmap.rows / 100 };
+}
+
 export function hottestCell(heatmap) {
   if (!heatmap?.observed_points) return null;
+  const grid = isRadarHeatmap(heatmap)
+    ? blocks(heatmap, HOT_ZONE_M)
+    : {
+        cells: heatmap.cells,
+        cellLength: heatmap.field_length_cm / heatmap.columns / 100,
+        cellWidth: heatmap.field_width_cm / heatmap.rows / 100,
+      };
   let best = null;
-  heatmap.cells.forEach((row, rowIndex) => {
+  grid.cells.forEach((row, rowIndex) => {
     row.forEach((value, columnIndex) => {
       if (value > 0 && (!best || value > best.count)) {
         best = { row: rowIndex, column: columnIndex, count: value };
@@ -114,8 +149,8 @@ export function hottestCell(heatmap) {
     });
   });
   if (!best) return null;
-  const cellLength = heatmap.field_length_cm / heatmap.columns / 100;
-  const cellWidth = heatmap.field_width_cm / heatmap.rows / 100;
+  const cellLength = grid.cellLength;
+  const cellWidth = grid.cellWidth;
   return {
     ...best,
     share: (best.count / heatmap.observed_points) * 100,
@@ -141,6 +176,9 @@ export function formatHottestDetail(cell) {
 }
 
 function drawPitchLines(ctx, width, height, heatmap) {
+  const fifa = Math.abs(heatmap.field_length_cm - RADAR_LENGTH_CM) < 1;
+  const penaltyLength = fifa ? FIFA_PENALTY_BOX_LENGTH_CM : PENALTY_BOX_LENGTH_CM;
+  const penaltyWidth = fifa ? FIFA_PENALTY_BOX_WIDTH_CM : PENALTY_BOX_WIDTH_CM;
   const sx = width / heatmap.field_length_cm;
   const sy = height / heatmap.field_width_cm;
   const midY = heatmap.field_width_cm / 2;
@@ -158,7 +196,7 @@ function drawPitchLines(ctx, width, height, heatmap) {
   ctx.stroke();
 
   for (const [boxLength, boxWidth] of [
-    [PENALTY_BOX_LENGTH_CM, PENALTY_BOX_WIDTH_CM],
+    [penaltyLength, penaltyWidth],
     [GOAL_BOX_LENGTH_CM, GOAL_BOX_WIDTH_CM],
   ]) {
     const top = (midY - boxWidth / 2) * sy;
@@ -181,6 +219,12 @@ export function drawBallHeatmap(ctx, width, height, heatmap) {
     ctx.fillRect(index * stripe, 0, stripe, height);
   }
 
+  if (isRadarHeatmap(map)) {
+    const painted = drawSmoothHeat(ctx, width, height, map);
+    drawPitchLines(ctx, width, height, map);
+    return painted;
+  }
+
   const cellWidth = width / map.columns;
   const cellHeight = height / map.rows;
   let painted = 0;
@@ -195,6 +239,117 @@ export function drawBallHeatmap(ctx, width, height, heatmap) {
   });
 
   drawPitchLines(ctx, width, height, map);
+  return painted;
+}
+
+function gaussianKernel(sigma) {
+  const radius = Math.ceil(sigma * 3);
+  const weights = [];
+  for (let offset = -radius; offset <= radius; offset += 1) {
+    weights.push(Math.exp(-(offset * offset) / (2 * sigma * sigma)));
+  }
+  return { radius, weights };
+}
+
+/** The ball counts spread over about two metres around each point, in both directions. */
+export function smoothHeat(heatmap, sigmaCells = SMOOTH_SIGMA_M) {
+  const { rows, columns, cells } = heatmap;
+  const { radius, weights } = gaussianKernel(sigmaCells);
+  const across = Array.from({ length: rows }, () => new Float64Array(columns));
+  for (let row = 0; row < rows; row += 1) {
+    for (let column = 0; column < columns; column += 1) {
+      const value = cells[row][column];
+      if (!value) continue;
+      for (let offset = -radius; offset <= radius; offset += 1) {
+        const target = column + offset;
+        if (target >= 0 && target < columns) across[row][target] += value * weights[offset + radius];
+      }
+    }
+  }
+  const smooth = Array.from({ length: rows }, () => new Float64Array(columns));
+  for (let row = 0; row < rows; row += 1) {
+    for (let column = 0; column < columns; column += 1) {
+      const value = across[row][column];
+      if (!value) continue;
+      for (let offset = -radius; offset <= radius; offset += 1) {
+        const target = row + offset;
+        if (target >= 0 && target < rows) smooth[target][column] += value * weights[offset + radius];
+      }
+    }
+  }
+  return smooth;
+}
+
+function heatRgba(intensity) {
+  const t = Math.max(0, Math.min(1, Number(intensity) || 0));
+  const rgb = t < 0.5 ? mix(LOW_COLOR, MID_COLOR, t / 0.5) : mix(MID_COLOR, HIGH_COLOR, (t - 0.5) / 0.5);
+  return [rgb[0], rgb[1], rgb[2], Math.round(255 * (0.25 + 0.6 * t))];
+}
+
+function smallCanvas(columns, rows) {
+  if (typeof OffscreenCanvas !== 'undefined') return new OffscreenCanvas(columns, rows);
+  if (typeof document !== 'undefined' && document.createElement) {
+    const canvas = document.createElement('canvas');
+    canvas.width = columns;
+    canvas.height = rows;
+    return canvas;
+  }
+  return null;
+}
+
+function drawSmoothHeat(ctx, width, height, map) {
+  if (!map.observed_points) return 0;
+  const smooth = smoothHeat(map);
+  let max = 0;
+  for (const row of smooth) for (const value of row) if (value > max) max = value;
+  if (!max) return 0;
+  // Faint tails under 3% of the peak stay grass.
+  const shareOf = (value) => {
+    const share = value / max;
+    return share < 0.03 ? 0 : Math.sqrt(share);
+  };
+
+  // One pixel per metre, scaled up with smoothing: a continuous stain, no grid.
+  const small = smallCanvas(map.columns, map.rows);
+  const smallCtx = small ? small.getContext('2d') : null;
+  if (smallCtx && typeof ImageData !== 'undefined') {
+    const image = new ImageData(map.columns, map.rows);
+    let painted = 0;
+    smooth.forEach((row, rowIndex) => {
+      row.forEach((value, columnIndex) => {
+        const intensity = shareOf(value);
+        if (!intensity) return;
+        const rgba = heatRgba(intensity);
+        // The rim of the stain fades into the grass instead of stopping at an edge.
+        rgba[3] = Math.round(rgba[3] * Math.min(1, (intensity * intensity) / 0.12));
+        image.data.set(rgba, (rowIndex * map.columns + columnIndex) * 4);
+        painted += 1;
+      });
+    });
+    smallCtx.putImageData(image, 0, 0);
+    ctx.save();
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(small, 0, 0, width, height);
+    ctx.restore();
+    return painted;
+  }
+
+  // Without an off-screen canvas: one rectangle per metre, edge to edge.
+  let painted = 0;
+  smooth.forEach((row, rowIndex) => {
+    const top = Math.round((rowIndex * height) / map.rows);
+    const bottom = Math.round(((rowIndex + 1) * height) / map.rows);
+    row.forEach((value, columnIndex) => {
+      const intensity = shareOf(value);
+      if (!intensity) return;
+      const left = Math.round((columnIndex * width) / map.columns);
+      const right = Math.round(((columnIndex + 1) * width) / map.columns);
+      ctx.fillStyle = heatColor(intensity);
+      ctx.fillRect(left, top, right - left, bottom - top);
+      painted += 1;
+    });
+  });
   return painted;
 }
 

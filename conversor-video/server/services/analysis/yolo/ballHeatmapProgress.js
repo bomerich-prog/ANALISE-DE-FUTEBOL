@@ -21,6 +21,9 @@ function ballHeatmapFromPayload(payload) {
   const fieldLength = Number(heatmap.field_length_cm);
   const fieldWidth = Number(heatmap.field_width_cm);
   return {
+    coordinates: heatmap.coordinates === 'radar' ? 'radar' : 'field',
+    seen_points: count(heatmap.seen_points),
+    estimated_points: count(heatmap.estimated_points),
     columns,
     rows,
     field_length_cm: Number.isFinite(fieldLength) && fieldLength > 0 ? fieldLength : 12000,

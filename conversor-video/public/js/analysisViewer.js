@@ -17,6 +17,7 @@ import {
   hottestCell,
   formatHottestZone,
   formatHottestDetail,
+  isRadarHeatmap,
 } from './ballHeatmap.js';
 import {
   readPlayerStats,
@@ -60,6 +61,7 @@ const possessionBarNoneEl = byId('possessionBarNone');
 const ballHeatmapCanvasEl = byId('ballHeatmapCanvas');
 const ballHeatmapEmptyEl = byId('ballHeatmapEmpty');
 const ballHeatmapObservedEl = byId('ballHeatmapObserved');
+const ballHeatmapObservedDetailEl = byId('ballHeatmapObservedDetail');
 const ballHeatmapHotZoneEl = byId('ballHeatmapHotZone');
 const ballHeatmapHotDetailEl = byId('ballHeatmapHotDetail');
 const ballHeatmapNoFieldEl = byId('ballHeatmapNoField');
@@ -343,9 +345,11 @@ function metricPair(map, key) {
   return `${format(map?.teams?.['Team 0']?.[key])} / ${format(map?.teams?.['Team 1']?.[key])}`;
 }
 
-function renderPitchMap(analysis, ctx) {
+function renderPitchMap(analysis, ctx, overlay = true) {
   const map = readPitchMap(analysis);
-  if (ctx && ballHeatmapCanvasEl) {
+  // The old 12 x 8 grid shows the player heat of the visible third on top. The
+  // 2D radar heatmap covers the whole 105 x 68 m pitch and is drawn alone.
+  if (ctx && ballHeatmapCanvasEl && overlay) {
     drawPlayerHeat(ctx, ballHeatmapCanvasEl.width, ballHeatmapCanvasEl.height, map?.player_heatmap);
     drawVisibleThird(ctx, ballHeatmapCanvasEl.width, ballHeatmapCanvasEl.height, map?.goal_end);
   }
@@ -375,13 +379,19 @@ function renderBallHeatmap(analysis) {
   const ctx = ballHeatmapCanvasEl ? ballHeatmapCanvasEl.getContext('2d') : null;
   if (ctx) {
     drawBallHeatmap(ctx, ballHeatmapCanvasEl.width, ballHeatmapCanvasEl.height, heatmap);
-    renderPitchMap(analysis, ctx);
+    renderPitchMap(analysis, ctx, !isRadarHeatmap(heatmap));
   } else {
     renderPitchMap(analysis, null);
   }
   ballHeatmapEmptyEl?.classList.toggle('hidden', heatmap.observed_points > 0);
   const hottest = hottestCell(heatmap);
   setText(ballHeatmapObservedEl, String(heatmap.observed_points));
+  setText(
+    ballHeatmapObservedDetailEl,
+    isRadarHeatmap(heatmap)
+      ? `${heatmap.seen_points} vistas · ${heatmap.estimated_points} estimadas`
+      : 'Bolas vistas'
+  );
   setText(ballHeatmapHotZoneEl, formatHottestZone(hottest));
   setText(ballHeatmapHotDetailEl, formatHottestDetail(hottest));
   setText(

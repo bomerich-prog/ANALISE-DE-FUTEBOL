@@ -9,7 +9,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server/services/analysis/yolo"))
 
-from ball_heatmap import BallHeatmapAccumulator  # noqa: E402
+from ball_heatmap import FieldGridHeatmap  # noqa: E402
 from pitch_homography import fit_broadcast_penalty  # noqa: E402
 from pitch_homography import _affine_matrix  # noqa: E402
 from pitch_map import (  # noqa: E402
@@ -98,7 +98,7 @@ def test_map_coordinates_do_not_change_possession_distance():
 
 
 def test_heatmap_reads_the_map_channel():
-    heatmap = BallHeatmapAccumulator()
+    heatmap = FieldGridHeatmap()
     heatmap.observe([{"map_x": 500.0, "map_y": 400.0, "field_x": 6100.0, "field_y": 3600.0}])
     report = heatmap.as_dict()
     assert_equal(report["cells"][0][0], 1, "map_x wins over a field coordinate")
