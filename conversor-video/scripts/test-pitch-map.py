@@ -33,6 +33,7 @@ from pitch_map import (  # noqa: E402
     _width_terms,
 )
 from pitch_centre import fit_centre_on_ink  # noqa: E402
+from pitch_radar import RADAR_LENGTH_CM, RADAR_WIDTH_CM, draw_radar, to_radar  # noqa: E402
 from possession import _player_distance  # noqa: E402
 from roboflow_soccer_config import SoccerPitchConfiguration  # noqa: E402
 from roboflow_view import ViewTransformer  # noqa: E402
@@ -518,6 +519,41 @@ def test_grass_without_the_centre_marks_gives_no_centre():
     _paint_ridge(frame, (100.0, 300.0), (1800.0, 260.0), 185)
     assert_true(fit_centre_on_ink(frame, grass) is None, "a lone straight line is not a centre")
 
+
+def test_the_radar_keeps_real_distances_from_the_mark_it_was_read_from():
+    # Centre calibration: the centre spot is the middle of the 105 x 68 m radar.
+    assert_true(to_radar(6000.0, 3500.0, "centre", True) == (RADAR_LENGTH_CM / 2.0, RADAR_WIDTH_CM / 2.0), "centre spot")
+    # Penalty calibration: the goal line is the end of the radar, at either end.
+    x, y = to_radar(12000.0, 3500.0, "penalty", True)
+    assert_true(abs(x - RADAR_LENGTH_CM) < 1e-6 and abs(y - RADAR_WIDTH_CM / 2.0) < 1e-6, "high-x goal")
+    x, _y = to_radar(10350.0, 3500.0, "penalty", True)
+    assert_true(abs(x - (RADAR_LENGTH_CM - 1650.0)) < 1e-6, "16.5 m line stays 16.5 m from the goal")
+    x, _y = to_radar(1650.0, 3500.0, "penalty", False)
+    assert_true(abs(x - 1650.0) < 1e-6, "low-x 16.5 m line")
+
+
+def test_the_radar_puts_a_player_where_the_centre_matrix_sees_him():
+    frame, grass, to_image = _broadcast_centre([(980.0, 470.0), (960.0, 690.0), (650.0, 575.0), (1300.0, 575.0)])
+    report = fit_centre_on_ink(frame, grass)
+    pitch_map = VisiblePitchMap()
+    pitch_map.matrix = report["matrix"]
+    pitch_map.transformer = ViewTransformer.from_matrix(report["matrix"])
+    pitch_map.positive_x = True
+    pitch_map.region = "centre"
+    pitch_map.projective = True
+    pitch_map.grass = grass
+    # A player 10 m into the high-x half and 5 m toward the far touchline.
+    foot = cv2.perspectiveTransform(np.array([[[7000.0, 3000.0]]], np.float32), to_image)[0, 0]
+    radar = pitch_map.radar_points([foot])[0]
+    assert_true(radar is not None, "a player on the grass is on the radar")
+    expect = (RADAR_LENGTH_CM / 2.0 + 1000.0, RADAR_WIDTH_CM / 2.0 - 500.0)
+    miss = float(np.hypot(radar[0] - expect[0], radar[1] - expect[1]))
+    assert_true(miss < 150.0, f"he is 10 m past halfway and 5 m off the middle ({miss:.0f} cm off)")
+    blank = np.zeros((1080, 1920, 3), np.uint8)
+    draw_radar(blank, [{"x": radar[0], "y": radar[1], "role": "Player", "team_id": 0, "track_id": 7}], radar, pitch_map.radar_view(blank.shape))
+    corner = blank[700:, 1300:]
+    assert_true(int(np.count_nonzero(corner)) > 0 and int(np.count_nonzero(blank[:300, :600])) == 0, "drawn in the bottom-right corner only")
+
 def test_a_line_cut_by_the_frame_is_not_a_corner():
     foot = np.array([900.0, 500.0])
     along = np.array([0.95, 0.31])
@@ -791,6 +827,8 @@ def main():
     test_the_centre_circle_is_read_off_the_thin_marks()
     test_a_circle_cut_by_the_picture_edge_still_gives_the_centre()
     test_grass_without_the_centre_marks_gives_no_centre()
+    test_the_radar_keeps_real_distances_from_the_mark_it_was_read_from()
+    test_the_radar_puts_a_player_where_the_centre_matrix_sees_him()
     test_a_line_cut_by_the_frame_is_not_a_corner()
     test_the_measured_strip_does_not_erase_the_visible_third()
     test_spatial_metrics_use_only_mapped_players()

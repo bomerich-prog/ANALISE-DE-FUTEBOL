@@ -38,6 +38,9 @@ from pitch_homography import (
     fit_broadcast_penalty,
 )
 from pitch_centre import centre_holds, fit_centre_on_ink
+from pitch_radar import RADAR_LENGTH_CM, RADAR_WIDTH_CM, on_radar, to_radar
+
+_RADAR_MARGIN_CM = 300.0
 from roboflow_soccer_config import SoccerPitchConfiguration
 from roboflow_view import ViewTransformer
 
@@ -1796,6 +1799,65 @@ class VisiblePitchMap:
                 continue
             mapped.append((float(x), float(y)))
         return mapped
+
+    def radar_points(self, points):
+        """Radar centimetres for image points, or None for each one off the grass or off the pitch.
+
+        The same matrix and width correction as project(), on the whole 105 by
+        68 m pitch instead of the visible third.
+        """
+        if points is None or self.transformer is None or self.positive_x is None:
+            return []
+        array = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+        if array.size == 0:
+            return []
+        transformed = self.transformer.transform_points(array)
+        center = float(self.pitch.width) / 2.0
+        region = self.region or "penalty"
+        mapped = []
+        for (image_x, image_y), (x, y) in zip(array, transformed):
+            if not (np.isfinite(x) and np.isfinite(y)):
+                mapped.append(None)
+                continue
+            corrected = self._field_y(float(image_x), float(image_y), float(y), center)
+            if corrected is not None:
+                y = corrected
+            if self.grass is not None and _classify_pixel(float(image_x), float(image_y), self.grass) != "grass":
+                mapped.append(None)
+                continue
+            radar = to_radar(x, y, region, self.positive_x)
+            mapped.append(radar if on_radar(*radar) else None)
+        return mapped
+
+    def radar_view(self, frame_shape):
+        """The grass the camera sees, as a polygon in radar centimetres, or None."""
+        if self.transformer is None or self.positive_x is None or self.grass is None:
+            return None
+        height, width = frame_shape[:2]
+        has = self.grass > 0
+        top_rows = np.where(has.any(axis=0), has.argmax(axis=0), height - 1)
+        columns = np.linspace(0, width - 1, 25).astype(int)
+        top = [(float(column), float(max(top_rows[column], height * CROWD_BAND))) for column in columns]
+        right_top = top[-1][1]
+        left_top = top[0][1]
+        border = top
+        border += [(width - 1.0, right_top + (height - 1.0 - right_top) * t) for t in np.linspace(0, 1, 8)[1:]]
+        border += [(float(column), height - 1.0) for column in columns[::-1][1:]]
+        border += [(0.0, height - 1.0 + (left_top - height + 1.0) * t) for t in np.linspace(0, 1, 8)[1:-1]]
+        transformed = self.transformer.transform_points(np.array(border, dtype=np.float32))
+        region = self.region or "penalty"
+        outline = []
+        for x, y in transformed:
+            if not (np.isfinite(x) and np.isfinite(y)):
+                return None
+            radar_x, radar_y = to_radar(x, y, region, self.positive_x)
+            outline.append(
+                (
+                    float(np.clip(radar_x, -_RADAR_MARGIN_CM, RADAR_LENGTH_CM + _RADAR_MARGIN_CM)),
+                    float(np.clip(radar_y, -_RADAR_MARGIN_CM, RADAR_WIDTH_CM + _RADAR_MARGIN_CM)),
+                )
+            )
+        return outline
 
     def metrics(self):
         goal_end = None

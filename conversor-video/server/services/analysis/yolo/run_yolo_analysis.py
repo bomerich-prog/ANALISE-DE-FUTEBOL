@@ -43,6 +43,7 @@ from roboflow_soccer_config import SoccerPitchConfiguration
 from roboflow_team import TeamClassifier, TeamTrackLock, crops_form_two_teams, reject_training_crop
 from pitch_homography import PitchHomographyGate, draw_projected_pitch
 from pitch_map import VisiblePitchMap, draw_visible_centre, draw_visible_penalty
+from pitch_radar import RadarSmoother, TeamColours, draw_radar
 from roboflow_view import ViewTransformer
 from spatial_metrics import SpatialMetrics
 
@@ -643,6 +644,35 @@ def assign_map_coordinates(detections, pitch_map, anchor_getter):
             continue
         detection["map_x"] = float(point[0])
         detection["map_y"] = float(point[1])
+
+
+def radar_frame(pitch_map, smoother, frame_number, people, ball, frame_shape):
+    """Players and ball of this frame on the radar, from the same map matrix."""
+    players = []
+    if pitch_map is None or pitch_map.transformer is None:
+        return players, None, None
+    if people:
+        anchors = np.array([detection_foot_point(detection["box"]) for _role, detection in people], dtype=np.float32)
+        for (role, detection), point in zip(people, pitch_map.radar_points(anchors)):
+            if point is None:
+                continue
+            track = detection.get("track_id")
+            point = smoother.smooth(None if track is None else ("p", track), frame_number, point)
+            players.append(
+                {
+                    "x": point[0],
+                    "y": point[1],
+                    "role": role,
+                    "team_id": detection.get("team_id"),
+                    "track_id": track,
+                }
+            )
+    ball_point = None
+    if ball is not None:
+        mapped = pitch_map.radar_points(np.array([detection_center(ball["box"])], dtype=np.float32))
+        if mapped and mapped[0] is not None:
+            ball_point = smoother.smooth("ball", frame_number, mapped[0])
+    return players, ball_point, pitch_map.radar_view(frame_shape)
 
 
 def assign_field_coordinates_to_detections(detections, view_transformer, anchor_getter):
@@ -3251,6 +3281,8 @@ def analyze(args):
     player_stats = PlayerStatsAccumulator(fps, pitch=SOCCER_PITCH_CONFIGURATION)
     ball_heatmap = BallHeatmapAccumulator(pitch=SOCCER_PITCH_CONFIGURATION)
     visible_pitch_map = VisiblePitchMap(pitch=SOCCER_PITCH_CONFIGURATION)
+    radar_smoother = RadarSmoother()
+    radar_team_colours = TeamColours()
     spatial_metrics = SpatialMetrics(fps=fps)
     pitch_homography_gate = PitchHomographyGate(pitch=SOCCER_PITCH_CONFIGURATION)
     pitch_homography_debug = os.getenv("PITCH_HOMOGRAPHY_DEBUG", "").strip().lower() in {"1", "true", "on", "yes"}
@@ -4748,6 +4780,22 @@ def analyze(args):
 
         frames_processed += 1
         max_players_detected = max(max_players_detected, frame_players)
+        if not args.no_radar:
+            radar_team_colours.observe(frame, accepted_player_detections)
+            radar_players, radar_ball, radar_view = radar_frame(
+                visible_pitch_map if map_decision.get("accepted") else None,
+                radar_smoother,
+                current_frame_number,
+                [("Player", detection) for detection in accepted_player_detections]
+                + [("Goalkeeper", detection) for detection in accepted_goalkeeper_detections]
+                + [("Referee", detection) for detection in accepted_referee_detections],
+                ball_detections[0] if ball_detections else None,
+                output_frame.shape,
+            )
+            team_colours = radar_team_colours.colours()
+            draw_radar(output_frame, radar_players, radar_ball, radar_view, team_colours)
+            if debug_frame is not None:
+                draw_radar(debug_frame, radar_players, radar_ball, radar_view, team_colours)
         video_writer_stage_start = time.perf_counter()
         writer.write(output_frame)
         record_profile_stage(
@@ -5265,6 +5313,11 @@ def parse_args():
         help="Confidence threshold for football pitch keypoints",
     )
     parser.add_argument("--debug-frame-dir", default=None, help="Directory for opt-in live debug frames")
+    parser.add_argument(
+        "--no-radar",
+        action="store_true",
+        help="Do not draw the 2D radar of players and ball in the corner of the video",
+    )
     parser.add_argument(
         "--debug-frame-interval",
         type=int,
