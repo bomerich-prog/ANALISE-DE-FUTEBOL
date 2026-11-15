@@ -4,6 +4,7 @@ supervision
 transformers
 umap-learn
 scikit-learn
+scipy
 tqdm
 sentencepiece
 protobuf
