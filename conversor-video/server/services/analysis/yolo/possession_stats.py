@@ -1,11 +1,24 @@
 """Count frames already confirmed by PossessionEngine, split by team.
 
-This does not decide possession. It tallies the team on each snapshot.
-A gap with no possessor stays empty until the pass detector appends a
-confirmed pass for the same team. That one event moves the open gap once.
+This does not decide who has the ball. It tallies the team already on
+each snapshot. A gap with no possessor stays empty until it closes:
+
+- a confirmed pass of the team that opened the gap moves the whole gap;
+- the same team coming back after a long gap, with no pass, moves only
+  the first and last GAP_EDGE_SECONDS;
+- a different team, or a clip that ends while the gap is open, moves
+  nothing.
+
+The middle of a long gap is never given to a team.
 """
 
 from __future__ import annotations
+
+
+# A same-team hole longer than this keeps only its edges. A pass still
+# closes the whole flight, whatever its length.
+LONG_GAP_SECONDS = 1.0
+GAP_EDGE_SECONDS = 0.5
 
 
 class PossessionTeamAccumulator:
@@ -40,16 +53,31 @@ class PossessionTeamAccumulator:
                 self._open_frames += 1
             return self.as_dict()
 
-        if (
-            self._open_frames
-            and confirmed_pass_team == self._open_team
-            and confirmed_pass_team in {"Team 0", "Team 1"}
-        ):
-            self._reassign(confirmed_pass_team, self._open_frames)
+        self._close_open_gap(team, confirmed_pass_team)
         self._open_team = None
         self._open_frames = 0
         self._last_team = team
         return self.as_dict()
+
+    def _close_open_gap(self, closing_team, confirmed_pass_team):
+        if self._open_frames <= 0 or self._open_team not in {"Team 0", "Team 1"}:
+            return
+        if confirmed_pass_team == self._open_team:
+            self._reassign(self._open_team, self._open_frames)
+            return
+        if closing_team != self._open_team:
+            return
+        self._reassign(self._open_team, self._edge_frames(self._open_frames))
+
+    def _edge_frames(self, frames):
+        if frames <= 0:
+            return 0
+        if (frames / self.fps) <= LONG_GAP_SECONDS:
+            return 0
+        edge = max(0, int(round(self.fps * GAP_EDGE_SECONDS)))
+        if edge <= 0 or edge * 2 >= frames:
+            return 0 if edge <= 0 else frames
+        return edge * 2
 
     def _take_new_pass_team(self, pass_events):
         events = list(pass_events or [])
