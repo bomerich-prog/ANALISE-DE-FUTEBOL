@@ -1,11 +1,17 @@
 """Count frames already confirmed by PossessionEngine, split by team.
 
 This does not decide possession. It tallies the team on each snapshot.
-A gap with no possessor stays empty until the pass detector appends a
-confirmed pass for the same team. That one event moves the open gap once.
+A gap with no possessor stays empty until it is closed for the team that
+had the ball: by a confirmed pass for the same team, or by the same player
+taking the ball back after pushing it ahead of himself (a conduction). That
+closing moves the open gap once.
 """
 
 from __future__ import annotations
+
+
+# A ball pushed ahead and taken back by the same player within this time stays his team's.
+CONDUCTION_MAX_GAP_SECONDS = 3.0
 
 
 class PossessionTeamAccumulator:
@@ -20,12 +26,15 @@ class PossessionTeamAccumulator:
         self.frames_without_possessor = 0
         self.frames_reassigned_team_0 = 0
         self.frames_reassigned_team_1 = 0
+        self.conduction_gaps = 0
         self._last_team = None
+        self._last_possessor = None
+        self._open_possessor = None
         self._open_team = None
         self._open_frames = 0
         self._seen_pass_events = 0
 
-    def observe(self, team, pass_events=None):
+    def observe(self, team, pass_events=None, possessor_id=None):
         confirmed_pass_team = self._take_new_pass_team(pass_events)
         if team == "Team 0":
             self.frames_team_0 += 1
@@ -36,6 +45,7 @@ class PossessionTeamAccumulator:
             if self._last_team in {"Team 0", "Team 1"}:
                 if self._open_team is None:
                     self._open_team = self._last_team
+                    self._open_possessor = self._last_possessor
                     self._open_frames = 0
                 self._open_frames += 1
             return self.as_dict()
@@ -46,9 +56,21 @@ class PossessionTeamAccumulator:
             and confirmed_pass_team in {"Team 0", "Team 1"}
         ):
             self._reassign(confirmed_pass_team, self._open_frames)
+        elif (
+            self._open_frames
+            and team == self._open_team
+            and possessor_id is not None
+            and possessor_id == self._open_possessor
+            and self._open_frames <= CONDUCTION_MAX_GAP_SECONDS * self.fps
+        ):
+            # The same player pushed the ball ahead and took it back.
+            self._reassign(team, self._open_frames)
+            self.conduction_gaps += 1
         self._open_team = None
+        self._open_possessor = None
         self._open_frames = 0
         self._last_team = team
+        self._last_possessor = possessor_id
         return self.as_dict()
 
     def _take_new_pass_team(self, pass_events):
@@ -104,4 +126,5 @@ class PossessionTeamAccumulator:
             "percent_without_possessor": percent(self.frames_without_possessor),
             "frames_reassigned_team_0": int(self.frames_reassigned_team_0),
             "frames_reassigned_team_1": int(self.frames_reassigned_team_1),
+            "conduction_gaps_reassigned": int(self.conduction_gaps),
         }

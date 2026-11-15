@@ -156,7 +156,11 @@ def replay_event_record(record):
             players=players,
             ball=ball,
         )
-        team_stats = teams.observe(snapshot.current_possession_team, metrics["events"])
+        team_stats = teams.observe(
+            snapshot.current_possession_team,
+            metrics["events"],
+            snapshot.current_possessor_track_id,
+        )
         timeline.append(
             {
                 "frame": int(frame["frame"]),

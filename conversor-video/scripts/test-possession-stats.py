@@ -115,6 +115,42 @@ def test_missing_fps_still_counts_frames():
     assert_equal(report["seconds_team_1"], round(1 / 30, 3), "fallback fps is 30")
 
 
+def test_a_ball_pushed_ahead_and_taken_back_stays_with_the_team():
+    """Reference clip, 6:30: player 5 pushes the ball ahead and reaches it a second later."""
+    stats = PossessionTeamAccumulator(fps=30)
+    for _ in range(10):
+        stats.observe("Team 0", None, 5)
+    for _ in range(30):
+        during = stats.observe(None, None, None)
+    assert_equal(during["frames_without_possessor"], 30, "while the ball is ahead of him nobody has it")
+    after = stats.observe("Team 0", None, 5)
+    assert_equal(after["frames_without_possessor"], 0, "the gap leaves the empty bucket")
+    assert_equal(after["frames_team_0"], 41, "and goes to his team")
+    assert_equal(after["frames_reassigned_team_0"], 30, "exactly the gap")
+    assert_equal(after["conduction_gaps_reassigned"], 1, "one conduction")
+
+
+def test_a_teammate_or_a_long_gap_is_not_a_conduction():
+    stats = PossessionTeamAccumulator(fps=30)
+    stats.observe("Team 0", None, 5)
+    for _ in range(20):
+        stats.observe(None, None, None)
+    report = stats.observe("Team 0", None, 9)
+    assert_equal(report["frames_without_possessor"], 20, "another player without a pass keeps the gap empty")
+    stats = PossessionTeamAccumulator(fps=30)
+    stats.observe("Team 0", None, 5)
+    for _ in range(120):
+        stats.observe(None, None, None)
+    report = stats.observe("Team 0", None, 5)
+    assert_equal(report["frames_without_possessor"], 120, "four seconds loose is not a push ahead")
+    stats = PossessionTeamAccumulator(fps=30)
+    stats.observe("Team 0", None, 5)
+    for _ in range(20):
+        stats.observe(None, None, None)
+    report = stats.observe("Team 1", None, 5)
+    assert_equal(report["frames_reassigned_team_1"], 0, "a team change is never a conduction")
+
+
 if __name__ == "__main__":
     test_splits_confirmed_teams_and_empty_frames()
     test_unknown_team_stays_without_possessor()
@@ -123,4 +159,6 @@ if __name__ == "__main__":
     test_a_later_pass_does_not_reclaim_an_earlier_gap()
     test_video_that_ends_open_keeps_the_gap_empty()
     test_missing_fps_still_counts_frames()
+    test_a_ball_pushed_ahead_and_taken_back_stays_with_the_team()
+    test_a_teammate_or_a_long_gap_is_not_a_conduction()
     print("possession stats tests passed")

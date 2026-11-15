@@ -4585,6 +4585,7 @@ def analyze(args):
         possession_by_team_live = possession_team_stats.observe(
             possession_snapshot.current_possession_team,
             pass_metrics_live["events"],
+            possession_snapshot.current_possessor_track_id,
         )
         player_stats_live = player_stats.observe(
             list(accepted_player_detections) + list(accepted_goalkeeper_detections),

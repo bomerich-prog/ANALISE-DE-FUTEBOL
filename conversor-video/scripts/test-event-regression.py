@@ -199,21 +199,18 @@ def test_fixture_replays_the_recorded_clip():
         [_event_key(event) for event in recorded_passes["dispute_events"]],
         "disputes",
     )
-    assert_equal(
-        replay["possession_by_team"]["percent_team_0"],
-        record["possession_by_team"]["percent_team_0"],
-        "team 0 possession percent",
-    )
-    assert_equal(
-        replay["possession_by_team"]["percent_team_1"],
-        record["possession_by_team"]["percent_team_1"],
-        "team 1 possession percent",
-    )
+    # The fixture was recorded at 90.3 / 0.0 / 9.7. Player 11 pushes the ball
+    # ahead at frames 90-106 and takes it back himself: that 17-frame gap is now
+    # Team 0's, which gives 94.5 / 0.0 / 5.5. Passes and turnovers are unchanged.
+    assert_equal(record["possession_by_team"]["percent_team_0"], 90.3, "recorded team 0 percent")
+    assert_equal(replay["possession_by_team"]["percent_team_0"], 94.5, "team 0 possession percent")
+    assert_equal(replay["possession_by_team"]["percent_team_1"], 0.0, "team 1 possession percent")
     assert_equal(
         replay["possession_by_team"]["percent_without_possessor"],
-        record["possession_by_team"]["percent_without_possessor"],
+        5.5,
         "open possession percent",
     )
+    assert_equal(replay["possession_by_team"]["conduction_gaps_reassigned"], 1, "one push ahead")
     for event in replay_passes["rejected_events"]:
         if event.get("distance_cm") is not None:
             continue
