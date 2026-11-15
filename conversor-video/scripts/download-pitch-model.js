@@ -11,10 +11,6 @@ const MODELS = [
     url: 'https://drive.google.com/uc?id=17PXFNlx-jI7VjVo_vQnB1sONjRyvoB-q',
   },
   {
-    name: 'football-pitch-detection.pt',
-    url: 'https://drive.google.com/uc?id=1Ma5Kt86tgpdjCTKfum79YMgNnSjcoOyf',
-  },
-  {
     name: 'football-ball-detection.pt',
     url: 'https://drive.google.com/uc?id=1isw4wx-MK9h9LMr36VvIWlJD6ppUvw7V',
   },

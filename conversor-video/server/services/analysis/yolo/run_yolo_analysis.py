@@ -41,10 +41,8 @@ from possession_stats import PossessionTeamAccumulator
 from roboflow_ball import BallTracker
 from roboflow_soccer_config import SoccerPitchConfiguration
 from roboflow_team import TeamClassifier, TeamTrackLock, crops_form_two_teams, reject_training_crop
-from pitch_homography import PitchHomographyGate, draw_projected_pitch
 from pitch_map import VisiblePitchMap, draw_visible_centre, draw_visible_penalty
 from pitch_radar import RadarMemory, RadarSmoother, TeamColours, draw_radar
-from roboflow_view import ViewTransformer
 from spatial_metrics import SpatialMetrics
 
 
@@ -64,9 +62,7 @@ MIN_FIELD_AREA_RATIO = 0.12
 LIVE_DEBUG_FRAME_REPLACE_RETRIES = 6
 LIVE_DEBUG_FRAME_RETRY_BASE_DELAY_SECONDS = 0.03
 PLAYER_MODEL_RELATIVE_PATH = Path("models/football-player-detection.pt")
-PITCH_MODEL_RELATIVE_PATH = Path("models/football-pitch-detection.pt")
 BALL_MODEL_RELATIVE_PATH = Path("models/football-ball-detection.pt")
-PITCH_KEYPOINT_MIN_CONFIDENCE = 0.25
 BALL_TRACKER_BUFFER_SIZE = 20
 BALL_MEMORY_MAX_MISSING_FRAMES = 5
 BALL_TRAJECTORY_HISTORY_SIZE = 6
@@ -173,10 +169,6 @@ BYTE_TRACK_MIN_CONSECUTIVE_FRAMES = 3
 BYTE_TRACK_LOST_TRACK_BUFFER = 60
 BYTE_TRACK_MINIMUM_MATCHING_THRESHOLD = 0.72
 PLAYER_REFEREE_HISTORY_WINDOW = 9
-HOMOGRAPHY_MIN_KEYPOINTS = 4
-PITCH_KEYPOINT_COLOR = (255, 0, 255)
-PITCH_KEYPOINT_OUTLINE_COLOR = (255, 255, 255)
-PITCH_KEYPOINT_RADIUS = 4
 DETECTION_LABEL_BY_CLASS_ID = {
     PLAYER_CLASS_ID: "Player",
     GOALKEEPER_CLASS_ID: "Goalkeeper",
@@ -193,7 +185,6 @@ SOCCER_PITCH_CONFIGURATION = SoccerPitchConfiguration()
 PROFILE_STAGE_NAMES = [
     "player_detection",
     "ball_detection",
-    "pitch_detection",
     "bytetrack",
     "ball_tracker",
     "team_classifier_fit",
@@ -592,38 +583,6 @@ def detection_foot_point(box):
     return int((x1 + x2) / 2), int(y2)
 
 
-def build_view_transformer_from_pitch_keypoints(keypoints):
-    """Fit every supplied point. The analysis loop uses PitchHomographyGate instead."""
-    keypoints_by_index = {}
-    for keypoint in keypoints:
-        keypoint_index = int(keypoint["index"])
-        if keypoint_index < 0 or keypoint_index >= len(SOCCER_PITCH_CONFIGURATION.vertices):
-            continue
-
-        score = float(keypoint["confidence"]) if keypoint.get("confidence") is not None else -1.0
-        previous = keypoints_by_index.get(keypoint_index)
-        if previous is None or score > previous["score"]:
-            keypoints_by_index[keypoint_index] = {"keypoint": keypoint, "score": score}
-
-    if len(keypoints_by_index) < HOMOGRAPHY_MIN_KEYPOINTS:
-        return None
-
-    source_points = []
-    target_points = []
-    for keypoint_index in sorted(keypoints_by_index.keys()):
-        keypoint = keypoints_by_index[keypoint_index]["keypoint"]
-        source_points.append([keypoint["x"], keypoint["y"]])
-        target_points.append(SOCCER_PITCH_CONFIGURATION.vertices[keypoint_index])
-
-    try:
-        return ViewTransformer(
-            source=np.array(source_points, dtype=np.float32),
-            target=np.array(target_points, dtype=np.float32),
-        )
-    except ValueError:
-        return None
-
-
 def assign_map_coordinates(detections, pitch_map, anchor_getter):
     """Publish the visible-third map beside the event coordinates.
 
@@ -797,10 +756,6 @@ def resolve_model_path(model_arg):
     if not candidate.is_absolute():
         candidate = Path(__file__).resolve().parent / candidate
     return candidate.resolve()
-
-
-def resolve_pitch_model_path(pitch_model_arg):
-    return resolve_model_path(pitch_model_arg)
 
 
 def resolve_ball_model_path(ball_model_arg):
@@ -1042,83 +997,6 @@ def build_ball_detector(args, confidence_threshold):
         backend,
         str(checkpoint_path),
     )
-
-
-def extract_pitch_keypoints(pitch_result, confidence_threshold):
-    keypoints = getattr(pitch_result, "keypoints", None)
-    if keypoints is None:
-        return []
-
-    xy = getattr(keypoints, "xy", None)
-    if xy is None:
-        return []
-
-    xy_array = xy.cpu().numpy() if hasattr(xy, "cpu") else np.asarray(xy)
-    if xy_array.size == 0:
-        return []
-
-    confidence_array = None
-    confidence = getattr(keypoints, "conf", None)
-    if confidence is not None:
-        confidence_array = (
-            confidence.cpu().numpy() if hasattr(confidence, "cpu") else np.asarray(confidence)
-        )
-
-    visible_keypoints = []
-    for detection_index, detection_keypoints in enumerate(xy_array):
-        for keypoint_index, point in enumerate(detection_keypoints):
-            x, y = float(point[0]), float(point[1])
-            if not np.isfinite(x) or not np.isfinite(y):
-                continue
-
-            keypoint_confidence = None
-            if confidence_array is not None:
-                keypoint_confidence = float(confidence_array[detection_index][keypoint_index])
-                if keypoint_confidence < confidence_threshold:
-                    continue
-
-            visible_keypoints.append(
-                {
-                    "x": x,
-                    "y": y,
-                    "confidence": keypoint_confidence,
-                    "index": keypoint_index,
-                }
-            )
-
-    return visible_keypoints
-
-
-def _draw_homography_debug(frame, decision):
-    """Green lines passed the paint check. Red lines are the rejected candidate."""
-    if decision.get("reason") == "accepted" and decision.get("matrix") is not None:
-        draw_projected_pitch(frame, decision["matrix"], (0, 200, 0))
-        return
-    if decision.get("candidate_matrix") is not None:
-        draw_projected_pitch(frame, decision["candidate_matrix"], (0, 0, 255))
-    if decision.get("held") and decision.get("matrix") is not None:
-        draw_projected_pitch(frame, decision["matrix"], (0, 200, 0))
-
-
-def draw_pitch_keypoints(frame, keypoints):
-    if frame is None:
-        return
-
-    for keypoint in keypoints:
-        x = clamp(int(round(keypoint["x"])), 0, frame.shape[1] - 1)
-        y = clamp(int(round(keypoint["y"])), 0, frame.shape[0] - 1)
-        cv2.circle(frame, (x, y), PITCH_KEYPOINT_RADIUS + 2, PITCH_KEYPOINT_OUTLINE_COLOR, 1)
-        cv2.circle(frame, (x, y), PITCH_KEYPOINT_RADIUS, PITCH_KEYPOINT_COLOR, -1)
-        cv2.putText(
-            frame,
-            str(keypoint["index"] + 1),
-            (x + 5, y - 5),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.35,
-            PITCH_KEYPOINT_OUTLINE_COLOR,
-            1,
-            cv2.LINE_AA,
-        )
 
 
 def extract_ball_detections(ball_result):
@@ -2873,10 +2751,6 @@ def analyze(args):
             f"Modelo oficial de detecção de jogadores não encontrado: {player_model_path}"
         )
     model = YOLO(str(player_model_path))
-    pitch_model_path = resolve_pitch_model_path(args.pitch_model)
-    if not pitch_model_path.exists():
-        raise FileNotFoundError(f"Modelo de detecção de campo não encontrado: {pitch_model_path}")
-    pitch_model = YOLO(str(pitch_model_path))
     ball_detector, ball_detector_backend, ball_detector_model_path = build_ball_detector(
         args=args,
         confidence_threshold=ball_detector_confidence_for_run,
@@ -3115,7 +2989,7 @@ def analyze(args):
         {
             "type": "progress",
             "progress": 1,
-            "message": "YOLOv8 carregado. Iniciando detecção de player/goalkeeper/referee/ball e keypoints do campo...",
+            "message": "YOLOv8 carregado. Iniciando detecção de player/goalkeeper/referee/ball...",
             "framesProcessed": 0,
             "playersDetected": 0,
             "ballDetected": False,
@@ -3136,8 +3010,6 @@ def analyze(args):
     ball_detected = False
     confidence_sum = {"Player": 0.0, "Ball": 0.0}
     confidence_count = {"Player": 0, "Ball": 0}
-    homography_valid_frames = 0
-    total_pitch_keypoints_detected = 0
     homography_examples = []
     ball_position_history = deque(maxlen=BALL_TRAJECTORY_HISTORY_SIZE)
     ball_field_position_history = deque(maxlen=BALL_TRAJECTORY_HISTORY_SIZE)
@@ -3291,8 +3163,6 @@ def analyze(args):
     radar_memory = RadarMemory(hold_frames=max(1, int(float(fps) / 30.0 * BYTE_TRACK_LOST_TRACK_BUFFER)))
     radar_team_colours = TeamColours()
     spatial_metrics = SpatialMetrics(fps=fps)
-    pitch_homography_gate = PitchHomographyGate(pitch=SOCCER_PITCH_CONFIGURATION)
-    pitch_homography_debug = os.getenv("PITCH_HOMOGRAPHY_DEBUG", "").strip().lower() in {"1", "true", "on", "yes"}
     last_possession_events = possession_engine.snapshot().as_dict()
     pass_detector = PassDetector()
 
@@ -3368,28 +3238,11 @@ def analyze(args):
             time.perf_counter() - bytetrack_stage_start,
         )
 
-        pitch_detection_stage_start = time.perf_counter()
-        pitch_result = pitch_model.predict(
-            frame,
-            imgsz=args.imgsz,
-            conf=args.pitch_keypoint_conf,
-            verbose=False,
-        )[0]
-        pitch_keypoints = extract_pitch_keypoints(pitch_result, args.pitch_keypoint_conf)
-        total_pitch_keypoints_detected += len(pitch_keypoints)
-        record_profile_stage(
-            profile_state,
-            "pitch_detection",
-            time.perf_counter() - pitch_detection_stage_start,
-        )
-
         homography_stage_start = time.perf_counter()
         grass_mask = build_grass_support_mask(frame)
         white_line_mask = build_white_line_mask(frame, grass_mask)
-        homography_decision = pitch_homography_gate.update(pitch_keypoints, white_line_mask, frame)
-        view_transformer = homography_decision["transformer"]
-        if view_transformer is not None:
-            homography_valid_frames += 1
+        # No image-to-field matrix feeds the decisions. The map and the radar read the paint.
+        view_transformer = None
         record_profile_stage(
             profile_state,
             "homography",
@@ -4671,13 +4524,6 @@ def analyze(args):
         output_frame = frame.copy()
         debug_frame = output_frame.copy() if args.debug_frame_dir else None
 
-        draw_pitch_keypoints(output_frame, pitch_keypoints)
-        if debug_frame is not None:
-            draw_pitch_keypoints(debug_frame, pitch_keypoints)
-        if pitch_homography_debug:
-            _draw_homography_debug(output_frame, homography_decision)
-            if debug_frame is not None:
-                _draw_homography_debug(debug_frame, homography_decision)
         if map_decision.get("matrix") is not None and map_decision.get("region") == "centre":
             draw_visible_centre(output_frame, map_decision["matrix"])
             if debug_frame is not None:
@@ -5019,9 +4865,6 @@ def analyze(args):
     avg_ball_confidence = (
         confidence_sum["Ball"] / confidence_count["Ball"] if confidence_count["Ball"] else 0
     )
-    avg_pitch_keypoints_detected = (
-        total_pitch_keypoints_detected / frames_processed if frames_processed else 0
-    )
 
     result = {
         "version": "yolo-1.0",
@@ -5132,11 +4975,8 @@ def analyze(args):
         "homography": {
             "status": "event coordinates stay in pixels; the visible-third map is a separate channel",
             "feeds_decisions": HOMOGRAPHY_FEEDS_DECISIONS,
-            "valid_frames": homography_valid_frames,
             "total_frames": frames_processed,
-            "avg_keypoints_detected": avg_pitch_keypoints_detected,
             "examples": homography_examples,
-            "gate": pitch_homography_gate.metrics(),
         },
         "features": {"status": "implemented (ball possession state machine + pass detector refinements)"},
         "machine_learning": {"status": "pending"},
@@ -5181,7 +5021,6 @@ def analyze(args):
 
 def parse_args():
     player_model_default = Path(__file__).resolve().parent / PLAYER_MODEL_RELATIVE_PATH
-    pitch_model_default = Path(__file__).resolve().parent / PITCH_MODEL_RELATIVE_PATH
     ball_model_default = Path(__file__).resolve().parent / BALL_MODEL_RELATIVE_PATH
     parser = argparse.ArgumentParser(description="Analyze a soccer video with YOLOv8.")
     parser.add_argument("--input", required=True, help="Input MP4 path")
@@ -5190,11 +5029,6 @@ def parse_args():
         "--model",
         default=str(player_model_default),
         help="Path to the official football player detector model (.pt)",
-    )
-    parser.add_argument(
-        "--pitch-model",
-        default=str(pitch_model_default),
-        help="Path to the football pitch keypoint model (.pt)",
     )
     parser.add_argument(
         "--ball-model",
@@ -5314,12 +5148,6 @@ def parse_args():
     )
     parser.add_argument("--imgsz", type=int, default=1280, help="YOLO inference image size")
     parser.add_argument("--conf", type=float, default=0.25, help="YOLO confidence threshold")
-    parser.add_argument(
-        "--pitch-keypoint-conf",
-        type=float,
-        default=PITCH_KEYPOINT_MIN_CONFIDENCE,
-        help="Confidence threshold for football pitch keypoints",
-    )
     parser.add_argument("--debug-frame-dir", default=None, help="Directory for opt-in live debug frames")
     parser.add_argument(
         "--no-radar",

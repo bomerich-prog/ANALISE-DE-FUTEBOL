@@ -26,16 +26,9 @@ def parse_args():
         help="Path to run_yolo_analysis.py",
     )
     parser.add_argument("--model", default=None, help="Player model path")
-    parser.add_argument("--pitch-model", default=None, help="Pitch model path")
     parser.add_argument("--ball-model", default=None, help="YOLO ball model path")
     parser.add_argument("--imgsz", type=int, default=1280, help="Inference size")
     parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold")
-    parser.add_argument(
-        "--pitch-keypoint-conf",
-        type=float,
-        default=0.25,
-        help="Pitch keypoint confidence threshold",
-    )
     parser.add_argument(
         "--ball-diagnostics-min-confidence",
         type=float,
@@ -85,8 +78,6 @@ def run_detector_analysis(args, detector_backend, output_dir):
         str(args.imgsz),
         "--conf",
         str(args.conf),
-        "--pitch-keypoint-conf",
-        str(args.pitch_keypoint_conf),
         "--ball-diagnostics-output",
         str(diagnostics_json),
         "--ball-diagnostics-min-confidence",
@@ -100,8 +91,6 @@ def run_detector_analysis(args, detector_backend, output_dir):
     ]
     if args.model:
         command.extend(["--model", str(args.model)])
-    if args.pitch_model:
-        command.extend(["--pitch-model", str(args.pitch_model)])
     if args.ball_model:
         command.extend(["--ball-model", str(args.ball_model)])
 
