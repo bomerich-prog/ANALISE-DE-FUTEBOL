@@ -809,6 +809,46 @@ def test_real_penalty_paint_locks_and_a_blank_frame_drops_it():
     assert_true(dropped["matrix"] is None, "the dropped frame has no coordinates")
 
 
+def test_the_camera_on_the_halfway_line_follows_a_pan():
+    import pitch_camera as camera_module
+
+    width, height = 1280, 720
+    truth = camera_module.camera_centre(4200.0, 1800.0)
+    grass = np.full((height, width), 255, dtype=np.uint8)
+    camera = camera_module.BroadcastCamera(calibration_frames=6)
+    published = []
+    for step in range(14):
+        # The camera pans from the middle toward the high-x penalty area.
+        target = np.array([5250.0 + 260.0 * step, 3000.0, 0.0])
+        pose = np.array([*camera_module._look_at(truth, target), np.log(1500.0)])
+        radar_to_image = camera_module._homography(pose, truth, width, height)
+        ink = np.zeros((height, width), dtype=np.uint8)
+        for x, y in camera_module._project(radar_to_image, camera_module._TEMPLATE):
+            if np.isfinite(x) and 0 <= x < width and 0 <= y < height:
+                cv2.circle(ink, (int(x), int(y)), 2, 255, -1)
+        # The map fit of the frame: right on the box, a few per cent off on the far side.
+        skew = np.array([[1.0, 0.03, 0.0], [0.0, 1.02, 0.0], [0.0, 0.0, 1.0]])
+        shift = camera_module._shift("penalty", True)
+        fit = camera_module._radar_to_field(shift) @ np.linalg.inv(skew @ radar_to_image)
+        matrix = camera.solve(fit, "penalty", True, True, ink, grass, (height, width))
+        published.append((matrix, radar_to_image, shift, fit))
+    centre = camera.centre
+    assert_true(centre is not None, "the camera centre is measured on the first frames")
+    assert_true(abs(centre[0] - camera_module.HALFWAY_X_CM) < 1.0, "the camera stays on the halfway line")
+    assert_true(abs(centre[1] - truth[1]) < 900.0 and abs(centre[2] - truth[2]) < 500.0, "the stand is found")
+    matrix, radar_to_image, shift, fit = published[-1]
+    assert_true(matrix is not None, "a frame after the calibration is published from the camera")
+    far = np.array([[7000.0, 0.0], [9000.0, 0.0], [10500.0, 3400.0]])
+    image = camera_module._project(radar_to_image, far).reshape(-1, 1, 2)
+
+    def error(image_to_field):
+        field = cv2.perspectiveTransform(image, image_to_field).reshape(-1, 2)
+        return float(np.linalg.norm(field + shift - far, axis=1).max())
+
+    assert_true(error(matrix) < 250.0, "the far touchline lands within 2.5 m")
+    assert_true(error(matrix) < 0.5 * error(fit), "the camera beats the skewed fit on the far side")
+
+
 def main():
     cv2.setRNGSeed(0)
     test_scale_jump_is_rejected_and_the_third_is_35_m()
@@ -839,6 +879,7 @@ def main():
     test_a_camera_move_replaces_a_matrix_that_left_the_paint()
     test_a_short_gap_keeps_the_last_matrix_then_drops_it()
     test_replacement_refuses_a_mirror_and_allows_a_far_camera()
+    test_the_camera_on_the_halfway_line_follows_a_pan()
     print("pitch map tests passed")
 
 

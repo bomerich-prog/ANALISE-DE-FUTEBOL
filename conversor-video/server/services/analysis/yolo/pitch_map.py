@@ -37,6 +37,7 @@ from pitch_homography import (
     fit_broadcast_centre,
     fit_broadcast_penalty,
 )
+from pitch_camera import BroadcastCamera
 from pitch_centre import centre_holds, fit_centre_on_ink
 from pitch_radar import RADAR_LENGTH_CM, RADAR_WIDTH_CM, on_radar, to_radar
 
@@ -1630,11 +1631,14 @@ class VisiblePitchMap:
     marks takes over, even if that moves the field by more than 12 m.
     """
 
-    def __init__(self, pitch=None, hold_frames=HOLD_FRAMES):
+    def __init__(self, pitch=None, hold_frames=HOLD_FRAMES, fixed_camera=True):
         self.pitch = pitch or SoccerPitchConfiguration()
         self.hold_frames = int(hold_frames)
         self.matrix = None
         self.transformer = None
+        # The main camera stands on the halfway line: every published matrix comes from it.
+        self.camera = BroadcastCamera() if fixed_camera else None
+        self.camera_matrix = None
         self.positive_x = None
         self.region = None
         self.scale = None
@@ -1667,6 +1671,35 @@ class VisiblePitchMap:
         self.reasons = Counter()
 
     def update(self, white_line_mask, frame=None, grass_mask=None):
+        decision = self._update_fit(white_line_mask, frame, grass_mask)
+        return self._through_camera(decision, frame, grass_mask)
+
+    def _through_camera(self, decision, frame, grass_mask):
+        """The published matrix re-solved with the camera on the halfway line.
+
+        The penalty and centre fits still decide when there is a map and which
+        end it shows. The camera only replaces the matrix that maps points:
+        its pan, tilt and zoom are read off the thin marks, its centre is fixed,
+        so the far side of the pitch can no longer swing toward a corner.
+        """
+        self.camera_matrix = None
+        decision["camera_matrix"] = None
+        if not decision.get("accepted") or self.matrix is None:
+            return decision
+        if self.camera is not None and frame is not None:
+            ink = self._ink_cache[1] if self._ink_cache is not None and self._ink_cache[0] is frame else None
+            matrix = self.camera.solve(
+                self.matrix, self.region, self.positive_x, self.projective, ink, grass_mask, frame.shape
+            )
+            if matrix is not None and np.isfinite(matrix).all():
+                self.camera_matrix = matrix
+        self.transformer = ViewTransformer.from_matrix(
+            self.camera_matrix if self.camera_matrix is not None else self.matrix
+        )
+        decision["camera_matrix"] = self.camera_matrix
+        return decision
+
+    def _update_fit(self, white_line_mask, frame=None, grass_mask=None):
         self._side_cache = None
         ink = self._ink(white_line_mask, frame, grass_mask)
         # A matrix read off the thin marks is checked against the thin marks.
@@ -1782,7 +1815,10 @@ class VisiblePitchMap:
         mapped = []
         center = float(self.pitch.width) / 2.0
         for (image_x, image_y), (x, y) in zip(array.reshape(-1, 2), transformed):
-            corrected = self._field_y(float(image_x), float(image_y), float(y), center)
+            # The camera matrix is a true perspective: the width needs no correction.
+            corrected = None if self.camera_matrix is not None else self._field_y(
+                float(image_x), float(image_y), float(y), center
+            )
             if corrected is not None:
                 y = corrected
             if not inside_visible(
@@ -1819,7 +1855,10 @@ class VisiblePitchMap:
             if not (np.isfinite(x) and np.isfinite(y)):
                 mapped.append(None)
                 continue
-            corrected = self._field_y(float(image_x), float(image_y), float(y), center)
+            # The camera matrix is a true perspective: the width needs no correction.
+            corrected = None if self.camera_matrix is not None else self._field_y(
+                float(image_x), float(image_y), float(y), center
+            )
             if corrected is not None:
                 y = corrected
             if self.grass is not None and _classify_pixel(float(image_x), float(image_y), self.grass) != "grass":
@@ -1884,6 +1923,7 @@ class VisiblePitchMap:
             "goal_end": goal_end,
             "cm_per_px": None if self.scale is None else round(float(self.scale), 4),
             "reasons": dict(self.reasons),
+            "camera": None if self.camera is None else self.camera.metrics(),
         }
 
     def _accept(self, report, grass_mask, fresh_view=False):
@@ -1996,6 +2036,7 @@ class VisiblePitchMap:
 
     def _drop(self):
         self.matrix = None
+        self.camera_matrix = None
         self.transformer = None
         self.positive_x = None
         self.region = None
