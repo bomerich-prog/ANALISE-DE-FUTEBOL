@@ -56,25 +56,6 @@ def assert_close(actual, expected, label, tolerance=1.0):
         raise AssertionError(f"{label}: expected {expected!r}, got {actual!r}")
 
 
-def drawn_round(test):
-    """The synthetic paint below draws the arc as a round circle on a steep line,
-    which the halfway-line camera never shows. Tests of the hold, bridge and
-    replacement logic built on it switch the main-camera circle check off."""
-
-    def run():
-        import pitch_map as module
-
-        check = module.broadcast_circle_fault
-        module.broadcast_circle_fault = lambda *args, **kwargs: None
-        try:
-            test()
-        finally:
-            module.broadcast_circle_fault = check
-
-    run.__name__ = test.__name__
-    return run
-
-
 def paint_penalty(gap=100.0, shift=(0.0, 0.0)):
     """Penalty line plus the arc the fitter expects 5.5 m behind it."""
     mask = np.zeros((750, 1338), dtype=np.uint8)
@@ -570,6 +551,49 @@ def test_a_close_circle_touched_by_players_is_still_a_curve():
     assert_true(len(pieces) == 2, f"both halves of the circle are curves ({len(pieces)})")
 
 
+def test_a_flat_penalty_fit_is_not_held_to_the_camera_shape():
+    """The penalty fit by line and arc has no perspective: its circle is round by construction."""
+    from pitch_map import broadcast_circle_fault, has_perspective
+
+    pitch = SoccerPitchConfiguration()
+    width, height = 1920, 1080
+    along = np.array([0.6, 0.8])
+    perp = np.array([0.8, -0.6])
+    front_x = float(pitch.length) - 1650.0
+    matrix = _affine_matrix(np.array([1300.0, 500.0]), along, perp, 0.25, front_x, float(pitch.width), True)
+    assert_true(not has_perspective(matrix), "the line-and-arc fit is flat")
+    grass = np.full((height, width), 255, dtype=np.uint8)
+    grass[:80] = 0
+    assert_true(
+        broadcast_circle_fault(matrix, "penalty", True, grass, (height, width)) is None,
+        "a flat fit on the grass is not refused as a round circle",
+    )
+    # The same fit on the near boards and stands, below the grass.
+    grass[450:, :] = 0
+    assert_true(
+        broadcast_circle_fault(matrix, "penalty", True, grass, (height, width)) == "circle_in_stands",
+        "a flat fit with its circle off the grass on the camera side is refused",
+    )
+
+
+def test_a_watermark_is_not_asked_to_be_a_pitch_mark():
+    """Roboflow clip: the white SCOUTINGFEED watermark on the grass hid a clean centre circle."""
+    from pitch_centre import straight_lines, text_lines
+
+    for scale, stroke in ((1.3, 5), (1.1, 4)):
+        frame, grass, to_image = _broadcast_centre([(1000.0, 330.0), (1010.0, 560.0), (520.0, 440.0), (1480.0, 445.0)])
+        cv2.putText(frame, "SCOUTINGFEED", (1180, 780), cv2.FONT_HERSHEY_SIMPLEX, scale, (225, 225, 225), stroke, cv2.LINE_AA)
+        ink = line_ink(frame, grass, None)
+        lines = straight_lines(ink, ink.shape[0] * 0.10)
+        text = text_lines(ink, lines)
+        written = {k for k, (_length, point, _direction) in enumerate(lines) if 700 < point[1] < 800 and point[0] > 1100}
+        assert_true(written and written <= text, f"the watermark lines are text ({scale})")
+        assert_true(text <= written, f"no pitch line is taken for text ({scale})")
+        report = fit_centre_on_ink(frame, grass)
+        assert_true(report is not None, f"the circle beside the watermark still gives a matrix ({scale})")
+        error = _centre_error(report, to_image)
+        assert_true(error < 6.0, f"the circle beside the watermark lands on the paint ({error:.1f} px)")
+
 def test_grass_without_the_centre_marks_gives_no_centre():
     frame = np.full((1080, 1920, 3), (60, 120, 70), np.uint8)
     grass = np.full((1080, 1920), 255, np.uint8)
@@ -774,7 +798,6 @@ def test_blank_paint_publishes_nothing():
     assert_true(decision["matrix"] is None, "a rejected frame keeps no matrix")
 
 
-@drawn_round
 def test_a_camera_move_replaces_a_matrix_that_left_the_paint():
     pitch_map = VisiblePitchMap(hold_frames=15)
     first = pitch_map.update(paint_penalty())
@@ -792,7 +815,6 @@ def test_a_camera_move_replaces_a_matrix_that_left_the_paint():
     assert_true(inside[0][0] <= 3600.0, "the new side does not draw the other half")
 
 
-@drawn_round
 def test_a_short_gap_keeps_the_last_matrix_then_drops_it():
     pitch_map = VisiblePitchMap(hold_frames=15)
     assert_true(pitch_map.update(paint_penalty())["accepted"], "the penalty locks")
@@ -842,7 +864,6 @@ def test_replacement_refuses_a_mirror_and_allows_a_far_camera():
     )
 
 
-@drawn_round
 def test_real_penalty_paint_locks_and_a_blank_frame_drops_it():
     mask = paint_penalty()
     report = fit_broadcast_penalty(mask, SoccerPitchConfiguration(), frame=None)
@@ -990,6 +1011,7 @@ def main():
     test_marker_colours_follow_the_team()
     test_a_round_circle_is_not_the_centre_circle()
     test_a_round_or_raised_circle_is_not_the_main_camera()
+    test_a_flat_penalty_fit_is_not_held_to_the_camera_shape()
     test_uneven_corners_move_the_width_and_keep_the_arc_scale()
     test_the_side_ridge_sets_the_width_and_keeps_the_depth()
     test_a_board_is_not_a_side_and_one_corner_draws_one_side()
@@ -1002,6 +1024,7 @@ def main():
     test_green_pockets_in_the_stands_are_not_the_grass()
     test_paint_in_the_stands_is_not_asked_to_be_a_pitch_mark()
     test_a_close_circle_touched_by_players_is_still_a_curve()
+    test_a_watermark_is_not_asked_to_be_a_pitch_mark()
     test_grass_without_the_centre_marks_gives_no_centre()
     test_the_radar_keeps_real_distances_from_the_mark_it_was_read_from()
     test_the_radar_puts_a_player_where_the_centre_matrix_sees_him()

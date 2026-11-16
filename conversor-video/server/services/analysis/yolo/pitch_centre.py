@@ -38,6 +38,16 @@ MIN_CIRCLE_ON_GRASS = 0.9
 # the circle 8 px thick and a player standing on it adds more; a blob in the
 # stands is well over 17.
 _THIN_PIECE = 16.0
+# Text on the grass (watermark, painted advert): short straight lines (at most
+# this share of the width), parallel within a few degrees, this share of the
+# height apart, overlapping along most of their length, and at least this share
+# of paint (letter strokes) on the line half-way between them.
+_TEXT_MAX_LENGTH = 0.35
+_TEXT_MAX_ANGLE_DEG = 4.0
+_TEXT_MIN_GAP = 0.008
+_TEXT_MAX_GAP = 0.06
+_TEXT_MIN_OVERLAP = 0.6
+_TEXT_INK = 0.2
 TWO_WAY_WEIGHT = 0.01
 _COST_CAP_PX = 15.0
 _UNEXPLAINED_CAP_CM = 500.0
@@ -178,6 +188,53 @@ def _ellipse_residual(ellipse, points):
     v = -(points[:, 0] - cx) * np.sin(t) + (points[:, 1] - cy) * np.cos(t)
     radius = np.sqrt((u / (a / 2.0)) ** 2 + (v / (b / 2.0)) ** 2)
     return np.abs(radius - 1.0) * min(a, b) / 2.0
+
+
+def _band_ink(ink, point, direction, length, offset):
+    """Share of the line, shifted `offset` px sideways, that lands on paint."""
+    height, width = ink.shape[:2]
+    normal = np.array([-direction[1], direction[0]], dtype=np.float64)
+    steps = np.arange(0.0, float(length), 2.0)
+    q = np.rint(np.asarray(point, np.float64) + np.outer(steps, direction) + offset * normal).astype(np.int64)
+    inside = (q[:, 0] >= 0) & (q[:, 0] < width) & (q[:, 1] >= 0) & (q[:, 1] < height)
+    return float(np.mean(ink[q[inside, 1], q[inside, 0]] > 0)) if inside.any() else 0.0
+
+
+def text_lines(ink, lines):
+    """Indices of the straight lines that are written text, not pitch marks.
+
+    Letters of a watermark or of an advert painted on the grass line up into
+    short parallel straight lines a few pixels apart (top, middle and base of
+    the letters), with the strokes of the letters packed between them. A pitch
+    line is long, or alone, or beside the edge of a board with no strokes in
+    between.
+    """
+    height, width = ink.shape[:2]
+    short = width * _TEXT_MAX_LENGTH
+    gap_min = height * _TEXT_MIN_GAP
+    gap_max = height * _TEXT_MAX_GAP
+    found = set()
+    for i, (length_i, point_i, dir_i) in enumerate(lines):
+        if length_i > short:
+            continue
+        normal = np.array([-dir_i[1], dir_i[0]], dtype=np.float64)
+        for j, (length_j, point_j, dir_j) in enumerate(lines):
+            if j <= i or length_j > short:
+                continue
+            if abs(float(np.dot(dir_i, dir_j))) < np.cos(np.radians(_TEXT_MAX_ANGLE_DEG)):
+                continue
+            gap = float(np.dot(np.asarray(point_j) - np.asarray(point_i), normal))
+            if not gap_min <= abs(gap) <= gap_max:
+                continue
+            # Overlap along the line.
+            start_j = float(np.dot(np.asarray(point_j) - np.asarray(point_i), dir_i))
+            ends_j = sorted((start_j, start_j + float(np.dot(dir_j, dir_i)) * length_j))
+            overlap = min(length_i, ends_j[1]) - max(0.0, ends_j[0])
+            if overlap < _TEXT_MIN_OVERLAP * min(length_i, length_j):
+                continue
+            if _band_ink(ink, point_i, dir_i, length_i, gap / 2.0) >= _TEXT_INK:
+                found.update((i, j))
+    return found
 
 
 def straight_lines(ink, min_length):
@@ -365,7 +422,10 @@ class _Frame:
 
     def _samples(self, lines):
         points = []
-        for length, point, direction in lines:
+        text = text_lines(self.ink, lines)
+        for index, (length, point, direction) in enumerate(lines):
+            if index in text:
+                continue
             points.extend(point + direction * t for t in np.linspace(0.0, length, max(2, int(length / 18.0))))
         for ellipse in self.circles[:1]:
             curve = _ellipse_points(ellipse, 60)

@@ -385,6 +385,14 @@ _PENALTY_SPOT_CM = 1100.0
 _CIRCLE_RADIUS_CM = 915.0
 
 
+def has_perspective(matrix):
+    """False for a flat (affine) image-to-field matrix, whose last row is (0, 0, c)."""
+    m = np.asarray(matrix, dtype=np.float64)
+    scale = max(abs(float(m[2, 2])), 1e-12)
+    # Perspective terms are per pixel: 1e-7 per px is under 0.02% across 1920 px.
+    return abs(float(m[2, 0])) / scale > 1e-7 or abs(float(m[2, 1])) / scale > 1e-7
+
+
 def broadcast_circle_fault(matrix, region, positive_x, grass_mask, frame_shape, pitch=None):
     """Why the circle this fit draws cannot come from the main camera, or None when it can."""
     pitch = pitch or SoccerPitchConfiguration()
@@ -415,22 +423,34 @@ def broadcast_circle_fault(matrix, region, positive_x, grass_mask, frame_shape, 
     minor = min(axis_a, axis_b)
     if major < BROADCAST_MIN_CIRCLE_WIDTH_PX:
         return "circle_degenerate"
-    if minor / major > BROADCAST_MAX_CIRCLE_RATIO:
-        return "circle_round"
-    if minor / major < BROADCAST_MIN_CIRCLE_RATIO:
-        return "circle_flat"
-    tilt = angle if axis_a >= axis_b else angle - 90.0
-    tilt = (tilt + 90.0) % 180.0 - 90.0
-    if abs(tilt) > BROADCAST_MAX_CIRCLE_TILT_DEG:
-        return "circle_tilted"
+    # The penalty fit by line and arc is flat (no perspective): it draws every
+    # circle round by construction, so its shape says nothing about the camera.
+    # A flat centre fit (round circle found by Hough) stays held to the shape:
+    # the main camera never shows the centre circle round.
+    if region == "centre" or has_perspective(matrix):
+        if minor / major > BROADCAST_MAX_CIRCLE_RATIO:
+            return "circle_round"
+        if minor / major < BROADCAST_MIN_CIRCLE_RATIO:
+            return "circle_flat"
+        tilt = angle if axis_a >= axis_b else angle - 90.0
+        tilt = (tilt + 90.0) % 180.0 - 90.0
+        if abs(tilt) > BROADCAST_MAX_CIRCLE_TILT_DEG:
+            return "circle_tilted"
     if grass_mask is not None:
         height, width_px = frame_shape[:2]
         inside = (image[:, 0] >= 0) & (image[:, 0] < width_px) & (image[:, 1] >= 0) & (image[:, 1] < height)
         if inside.any():
             has = grass_mask > 0
-            top = np.where(has.any(axis=0), has.argmax(axis=0), height)
             xs = image[inside, 0].astype(int)
-            on_grass = float(np.mean(image[inside, 1] >= top[xs] - 10))
+            ys = image[inside, 1].astype(int)
+            if has_perspective(matrix):
+                top = np.where(has.any(axis=0), has.argmax(axis=0), height)
+                on_grass = float(np.mean(image[inside, 1] >= top[xs] - 10))
+            else:
+                # A flat fit can also land on the near boards and the stands
+                # on the camera side, below the grass: check each point.
+                near = cv2.dilate(has.astype(np.uint8), np.ones((15, 15), np.uint8)) > 0
+                on_grass = float(np.mean(near[ys, xs]))
             if on_grass < BROADCAST_MIN_CIRCLE_ON_GRASS:
                 return "circle_in_stands"
     return None
