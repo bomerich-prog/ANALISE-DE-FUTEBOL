@@ -32,7 +32,8 @@ from pitch_map import (  # noqa: E402
     visible_bounds,
     _width_terms,
 )
-from pitch_centre import fit_centre_on_ink  # noqa: E402
+from pitch_centre import _Frame, _curve_pieces, _grass_top, _without_lines, fit_centre_on_ink  # noqa: E402
+from pitch_map import line_ink  # noqa: E402
 from pitch_radar import RADAR_LENGTH_CM, RADAR_WIDTH_CM, RadarMemory, draw_radar, to_radar  # noqa: E402
 from possession import _player_distance  # noqa: E402
 from roboflow_soccer_config import SoccerPitchConfiguration  # noqa: E402
@@ -522,6 +523,53 @@ def test_a_circle_cut_by_the_picture_edge_still_gives_the_centre():
     assert_true(error < 12.0, f"the cut circle lands on the paint ({error:.1f} px)")
 
 
+def _centre_under_stands():
+    """A close camera on the centre circle with boards and stands above the far touchline.
+
+    The stands have green pockets (pillars, shadows) and long straight paint
+    (board edges, LED panels, railings), as in a World Cup broadcast.
+    """
+    frame, grass, to_image = _broadcast_centre([(1200.0, 615.0), (1190.0, 865.0), (600.0, 740.0), (1800.0, 742.0)])
+    touchline = cv2.perspectiveTransform(np.array([[[6000.0, 100.0]]], np.float32), to_image)[0, 0]
+    edge = int(touchline[1]) - 8
+    grass[:edge] = 0
+    frame[:edge] = (90, 90, 140)
+    for x in range(0, 1920, 100):
+        grass[:edge, x : x + 80] = 255
+    for y in (edge - 12, edge - 110, edge - 160):
+        _paint_ridge(frame, (0.0, float(y)), (1919.0, float(y + 6)), 200)
+    return frame, grass, to_image, edge
+
+
+def test_green_pockets_in_the_stands_are_not_the_grass():
+    _frame, grass, _to_image, edge = _centre_under_stands()
+    top = _grass_top(grass)
+    assert_true(abs(float(np.median(top)) - edge) <= 2.0, f"the grass starts at the far touchline ({np.median(top):.0f} vs {edge})")
+
+
+def test_paint_in_the_stands_is_not_asked_to_be_a_pitch_mark():
+    frame, grass, to_image, edge = _centre_under_stands()
+    view = _Frame(line_ink(frame, grass, None), grass)
+    above = int(np.count_nonzero(view.samples[:, 1] < edge)) if len(view.samples) else 0
+    assert_true(above == 0, f"board edges and railings are left out of the two-way check ({above} samples)")
+    report = fit_centre_on_ink(frame, grass)
+    assert_true(report is not None, "the circle under the stands still gives a matrix")
+    error = _centre_error(report, to_image)
+    assert_true(error < 6.0, f"the circle under the stands lands on the paint ({error:.1f} px)")
+
+
+def test_a_close_circle_touched_by_players_is_still_a_curve():
+    # A close camera paints the circle a few pixels thick and players stand on it.
+    ink = np.zeros((1080, 1920), np.uint8)
+    cv2.ellipse(ink, (1200, 740), (600, 120), 0, 0, 360, 255, 5)
+    cv2.line(ink, (1200, 0), (1200, 1079), 255, 8)
+    for x in (700, 1550):
+        cv2.rectangle(ink, (x, 840), (x + 28, 900), 255, -1)
+    halfway = (1079.0, np.array([1200.0, 0.0]), np.array([0.0, 1.0]))
+    pieces = _curve_pieces(_without_lines(ink, [halfway]))
+    assert_true(len(pieces) == 2, f"both halves of the circle are curves ({len(pieces)})")
+
+
 def test_grass_without_the_centre_marks_gives_no_centre():
     frame = np.full((1080, 1920, 3), (60, 120, 70), np.uint8)
     grass = np.full((1080, 1920), 255, np.uint8)
@@ -951,6 +999,9 @@ def main():
     test_without_the_goal_line_the_arc_closes_the_box()
     test_the_centre_circle_is_read_off_the_thin_marks()
     test_a_circle_cut_by_the_picture_edge_still_gives_the_centre()
+    test_green_pockets_in_the_stands_are_not_the_grass()
+    test_paint_in_the_stands_is_not_asked_to_be_a_pitch_mark()
+    test_a_close_circle_touched_by_players_is_still_a_curve()
     test_grass_without_the_centre_marks_gives_no_centre()
     test_the_radar_keeps_real_distances_from_the_mark_it_was_read_from()
     test_the_radar_puts_a_player_where_the_centre_matrix_sees_him()

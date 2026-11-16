@@ -33,9 +33,18 @@ BOX_DEPTH_CM = 1650.0
 MAX_COST_PX = 2.5
 MAX_UNEXPLAINED_CM = 65.0
 MIN_CIRCLE_ON_INK = 0.6
+MIN_CIRCLE_ON_GRASS = 0.9
+# Area over width plus height of a thin painted curve. A close camera paints
+# the circle 8 px thick and a player standing on it adds more; a blob in the
+# stands is well over 17.
+_THIN_PIECE = 16.0
 TWO_WAY_WEIGHT = 0.01
 _COST_CAP_PX = 15.0
 _UNEXPLAINED_CAP_CM = 500.0
+# The far touchline is painted on the grass, below the topmost grass row
+# (the grass mask is dilated a few pixels). Paint above that row is the
+# bottom edge of the boards or the stands.
+_GRASS_EDGE_PX = 0.0
 
 _X = FIELD_CENTRE_X
 _Y = FIELD_CENTRE_Y
@@ -229,7 +238,7 @@ def _curve_pieces(ink):
         span = stats[index, cv2.CC_STAT_WIDTH] + stats[index, cv2.CC_STAT_HEIGHT]
         if area < 40 or max(stats[index, cv2.CC_STAT_WIDTH], stats[index, cv2.CC_STAT_HEIGHT]) < 40:
             continue
-        if area > 10.0 * span:
+        if area > _THIN_PIECE * span:
             continue
         piece = points[starts[index] : ends[index]]
         vx, vy, x0, y0 = cv2.fitLine(piece.astype(np.float32), cv2.DIST_L2, 0, 0.01, 0.01).reshape(-1)
@@ -240,8 +249,12 @@ def _curve_pieces(ink):
     return pieces[:8]
 
 
-def circle_candidates(ink, wide, steep_lines=()):
-    """Ellipses that sit on the painted curves. Players and the picture edge are outliers."""
+def circle_candidates(ink, wide, steep_lines=(), on_pitch=None):
+    """Ellipses that sit on the painted curves. Players and the picture edge are outliers.
+
+    on_pitch, when given, drops curves off the grass before the best few are
+    kept, so a logo on the boards cannot take the place of the circle.
+    """
     height, width = ink.shape[:2]
     pieces = _curve_pieces(_without_lines(ink, steep_lines))
     if not pieces:
@@ -289,6 +302,8 @@ def circle_candidates(ink, wide, steep_lines=()):
         cover = float(hit[inside].mean())
         if cover < MIN_CIRCLE_ON_INK:
             continue
+        if on_pitch is not None and not on_pitch(ellipse):
+            continue
         seen.append((cx, cy, max(a, b)))
         candidates.append((float(hit.sum()) * cover, ellipse))
         if len(candidates) >= 4:
@@ -300,7 +315,19 @@ def circle_candidates(ink, wide, steep_lines=()):
 def _grass_top(grass):
     """Topmost grass row of each column, smoothed. Above it are the boards and the stands."""
     height, width = grass.shape[:2]
-    has = grass > 0
+    # Green in the stands comes in narrow pockets: pillars, shadows, seats.
+    # The pitch is wide, so only grass that runs across the picture counts,
+    # and only the piece joined to the bottom of the picture.
+    run = max(31, int(width * 0.08)) | 1
+    wide = cv2.morphologyEx(
+        (grass > 0).astype(np.uint8), cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (run, 1))
+    )
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(wide, connectivity=8)
+    if count > 1:
+        biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        if stats[biggest, cv2.CC_STAT_AREA] >= 0.2 * height * width:
+            wide = (labels == biggest).astype(np.uint8)
+    has = wide > 0
     rows = np.where(has.any(axis=0), has.argmax(axis=0), height).astype(np.float64)
     padded = np.pad(rows, 15, mode="edge")
     windows = np.lib.stride_tricks.sliding_window_view(padded, 31)
@@ -319,8 +346,22 @@ class _Frame:
         every = straight_lines(ink, self.height * 0.18)
         self.steep = [line for line in every if abs(line[2][1]) > 0.55]
         self.flat = [line for line in every if abs(line[2][0]) > 0.9 and line[0] > 0.35 * self.width]
-        self.circles = circle_candidates(ink, self.wide, self.steep)
+        self.circles = circle_candidates(ink, self.wide, self.steep, on_pitch=self._on_grass)
         self.samples = self._samples(straight_lines(ink, self.height * 0.10))
+
+    def _on_grass(self, ellipse):
+        """True when the ellipse lies on the pitch. Round logos on the boards are curves too."""
+        curve = _ellipse_points(ellipse, 120)
+        inside = (curve[:, 0] >= 0) & (curve[:, 0] < self.width) & (curve[:, 1] >= 0) & (curve[:, 1] < self.height)
+        if not np.any(inside):
+            return False
+        curve = curve[inside]
+        xs = curve[:, 0].astype(np.int64)
+        if self.grass_top is not None:
+            low = curve[:, 1] >= self.grass_top[xs] - _GRASS_EDGE_PX
+        else:
+            low = curve[:, 1] >= self.height * CROWD_BAND
+        return float(low.mean()) >= MIN_CIRCLE_ON_GRASS
 
     def _samples(self, lines):
         points = []
@@ -330,7 +371,19 @@ class _Frame:
             curve = _ellipse_points(ellipse, 60)
             hit, _inside = _on_ink(curve, self.wide)
             points.extend(curve[hit])
-        return np.array(points, dtype=np.float64) if points else np.zeros((0, 2))
+        if not points:
+            return np.zeros((0, 2))
+        points = np.array(points, dtype=np.float64)
+        # Only paint on the grass has to be a pitch mark. The edges of the
+        # boards, the LED panels and the railings in the stands are long
+        # straight lines too, and a line running off the touchline into the
+        # boards keeps its straight piece up there.
+        xs = np.clip(points[:, 0].astype(np.int64), 0, self.width - 1)
+        if self.grass_top is not None:
+            on_grass = points[:, 1] >= self.grass_top[xs] - _GRASS_EDGE_PX
+        else:
+            on_grass = points[:, 1] >= self.height * CROWD_BAND
+        return points[on_grass]
 
     def chamfer(self, field_to_image):
         """Weighted distance, in pixels, from the projected marks to the ink, or None."""
