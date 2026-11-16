@@ -3,9 +3,8 @@ import { navigateTo } from './utils.js';
 
 const PAGE_META = {
   dashboard: { title: 'Dashboard', breadcrumb: 'Visão geral da plataforma' },
-  converter: { title: 'Converter Vídeos', breadcrumb: 'Módulo de ingestão de vídeo' },
-  history: { title: 'Meu Histórico', breadcrumb: 'Biblioteca de vídeos convertidos' },
-  analyses: { title: 'Análises', breadcrumb: 'Histórico de execuções de análise' },
+  converter: { title: 'Analisar Vídeos', breadcrumb: 'Envio e análise de vídeo' },
+  history: { title: 'Análises', breadcrumb: 'Biblioteca de vídeos e análises' },
   settings: { title: 'Configurações', breadcrumb: 'Conta e preferências' },
 };
 
@@ -67,7 +66,6 @@ navItems.forEach((btn) => {
 
     if (view === 'dashboard') window.dispatchEvent(new CustomEvent('dashboard:load'));
     if (view === 'history') window.dispatchEvent(new CustomEvent('history:load'));
-    if (view === 'analyses') window.dispatchEvent(new CustomEvent('analyses:load'));
     if (view === 'settings') window.dispatchEvent(new CustomEvent('settings:load'));
   });
 });

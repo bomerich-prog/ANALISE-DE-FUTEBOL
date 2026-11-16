@@ -14,9 +14,6 @@ import {
   drawBallHeatmap,
   drawVisibleThird,
   drawPlayerHeat,
-  hottestCell,
-  formatHottestZone,
-  formatHottestDetail,
   isRadarHeatmap,
 } from './ballHeatmap.js';
 import {
@@ -62,19 +59,6 @@ const ballHeatmapCanvasEl = byId('ballHeatmapCanvas');
 const ballHeatmapEmptyEl = byId('ballHeatmapEmpty');
 const ballHeatmapObservedEl = byId('ballHeatmapObserved');
 const ballHeatmapObservedDetailEl = byId('ballHeatmapObservedDetail');
-const ballHeatmapHotZoneEl = byId('ballHeatmapHotZone');
-const ballHeatmapHotDetailEl = byId('ballHeatmapHotDetail');
-const ballHeatmapNoFieldEl = byId('ballHeatmapNoField');
-const pitchMapWidthEl = byId('pitchMapWidth');
-const pitchMapWidthDetailEl = byId('pitchMapWidthDetail');
-const pitchMapLengthEl = byId('pitchMapLength');
-const pitchMapLengthDetailEl = byId('pitchMapLengthDetail');
-const pitchMapCompactnessEl = byId('pitchMapCompactness');
-const pitchMapCompactnessDetailEl = byId('pitchMapCompactnessDetail');
-const pitchMapDefenseEl = byId('pitchMapDefense');
-const pitchMapDefenseDetailEl = byId('pitchMapDefenseDetail');
-const pitchMapSpeedEl = byId('pitchMapSpeed');
-const pitchMapSpeedDetailEl = byId('pitchMapSpeedDetail');
 const heatmapPanelEl = byId('analysisHeatmapPanel');
 const playersPanelEl = byId('analysisPlayersPanel');
 const heatmapTabEl = byId('analysisTabHeatmap');
@@ -337,14 +321,6 @@ function readPitchMap(analysis) {
   return null;
 }
 
-function metricPair(map, key) {
-  const format = (value) => {
-    const number = Number(value);
-    return Number.isFinite(number) ? number.toFixed(1).replace('.', ',') : '—';
-  };
-  return `${format(map?.teams?.['Team 0']?.[key])} / ${format(map?.teams?.['Team 1']?.[key])}`;
-}
-
 function renderPitchMap(analysis, ctx, overlay = true) {
   const map = readPitchMap(analysis);
   // The old 12 x 8 grid shows the player heat of the visible third on top. The
@@ -353,25 +329,6 @@ function renderPitchMap(analysis, ctx, overlay = true) {
     drawPlayerHeat(ctx, ballHeatmapCanvasEl.width, ballHeatmapCanvasEl.height, map?.player_heatmap);
     drawVisibleThird(ctx, ballHeatmapCanvasEl.width, ballHeatmapCanvasEl.height, map?.goal_end);
   }
-  setText(pitchMapWidthEl, map ? `${metricPair(map, 'width_m')} m` : '—');
-  setText(pitchMapLengthEl, map ? `${metricPair(map, 'length_m')} m` : '—');
-  setText(pitchMapCompactnessEl, map ? `${metricPair(map, 'compactness_m2')} m²` : '—');
-  setText(pitchMapWidthDetailEl, 'Team 0 / Team 1');
-  setText(pitchMapLengthDetailEl, 'No terço de 35 m da baliza visível');
-  setText(pitchMapCompactnessDetailEl, 'Área do grupo, Team 0 / Team 1');
-  const line = Number(map?.defensive_line_m);
-  const defender = map?.defending_visible_goal;
-  setText(pitchMapDefenseEl, Number.isFinite(line) ? `${line.toFixed(1).replace('.', ',')} m` : '—');
-  setText(pitchMapDefenseDetailEl, defender ? `${defender}, a partir da baliza visível` : 'Distância da baliza visível');
-  const ballSpeed = Number(map?.ball_speed_m_s);
-  setText(
-    pitchMapSpeedEl,
-    map ? `${metricPair(map, 'speed_m_s')} m/s` : '—'
-  );
-  setText(
-    pitchMapSpeedDetailEl,
-    Number.isFinite(ballSpeed) ? `Bola ${ballSpeed.toFixed(1).replace('.', ',')} m/s` : 'Jogadores e bola, com a mesma matriz'
-  );
 }
 
 function renderBallHeatmap(analysis) {
@@ -384,19 +341,12 @@ function renderBallHeatmap(analysis) {
     renderPitchMap(analysis, null);
   }
   ballHeatmapEmptyEl?.classList.toggle('hidden', heatmap.observed_points > 0);
-  const hottest = hottestCell(heatmap);
   setText(ballHeatmapObservedEl, String(heatmap.observed_points));
   setText(
     ballHeatmapObservedDetailEl,
     isRadarHeatmap(heatmap)
       ? `${heatmap.seen_points} vistas · ${heatmap.estimated_points} estimadas`
       : 'Bolas vistas'
-  );
-  setText(ballHeatmapHotZoneEl, formatHottestZone(hottest));
-  setText(ballHeatmapHotDetailEl, formatHottestDetail(hottest));
-  setText(
-    ballHeatmapNoFieldEl,
-    String(heatmap.frames_without_field_point + heatmap.frames_outside_field)
   );
 }
 

@@ -876,12 +876,6 @@ body {
 .btn-upload-trigger {
   width: auto;
   padding: 0.6rem 1.25rem;
-  background: #e53935;
-  color: #fff;
-}
-
-.btn-upload-trigger:hover:not(:disabled) {
-  background: #c62828;
 }
 
 /* Alert */
@@ -1181,17 +1175,22 @@ body {
 
 .analysis-player-card {
   position: relative;
-  min-height: 420px;
+  /* Only as tall as the video: the sidebar on the right is taller, and the
+     card stretched to it showed an empty black band under the video. */
+  align-self: start;
   background: #050505;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   overflow: hidden;
 }
 
-.analysis-video,
 .analysis-video-placeholder {
   width: 100%;
   min-height: 420px;
+}
+
+.analysis-video {
+  width: 100%;
 }
 
 .analysis-video {
@@ -1749,7 +1748,5 @@ body {
   .analysis-visual-grid { padding: 1rem; }
   .analysis-insights { margin: 0 1rem 1rem; }
   .player-detail { grid-template-columns: 1fr; }
-  .analysis-player-card,
-  .analysis-video,
   .analysis-video-placeholder { min-height: 260px; }
 }

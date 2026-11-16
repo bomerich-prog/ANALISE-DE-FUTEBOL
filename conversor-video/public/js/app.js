@@ -233,7 +233,7 @@ async function runAnalysis(cardId) {
         updateAnalysisProgress(cardId, 100, 'Análise concluída com sucesso.');
         const success = document.getElementById(`cardSuccess-${cardId}`);
         if (success) {
-          success.textContent = 'Análise concluída com sucesso. Resultados disponíveis no histórico de análises.';
+          success.textContent = 'Análise concluída com sucesso. Resultados disponíveis na aba Análises.';
           success.classList.remove('hidden');
         }
         if (analyzeBtn) {
