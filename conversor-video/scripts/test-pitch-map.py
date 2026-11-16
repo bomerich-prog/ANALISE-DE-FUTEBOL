@@ -55,6 +55,25 @@ def assert_close(actual, expected, label, tolerance=1.0):
         raise AssertionError(f"{label}: expected {expected!r}, got {actual!r}")
 
 
+def drawn_round(test):
+    """The synthetic paint below draws the arc as a round circle on a steep line,
+    which the halfway-line camera never shows. Tests of the hold, bridge and
+    replacement logic built on it switch the main-camera circle check off."""
+
+    def run():
+        import pitch_map as module
+
+        check = module.broadcast_circle_fault
+        module.broadcast_circle_fault = lambda *args, **kwargs: None
+        try:
+            test()
+        finally:
+            module.broadcast_circle_fault = check
+
+    run.__name__ = test.__name__
+    return run
+
+
 def paint_penalty(gap=100.0, shift=(0.0, 0.0)):
     """Penalty line plus the arc the fitter expects 5.5 m behind it."""
     mask = np.zeros((750, 1338), dtype=np.uint8)
@@ -114,24 +133,14 @@ def test_marker_colours_follow_the_team():
     assert_equal(marker_bgr("player", None), (180, 180, 180), "a player without a team stays neutral")
 
 
-def test_the_centre_circle_publishes_the_middle():
+def test_a_round_circle_is_not_the_centre_circle():
+    """The halfway-line camera never sees the centre circle round: it is a flat ellipse."""
     pitch_map = VisiblePitchMap()
-    decision = pitch_map.update(_centre_circle_mask())
-    assert_true(decision["accepted"] and decision["region"] == "centre", "the open camera locks the middle")
-    near = pitch_map.project(np.array([[520.0, 430.0]], dtype=np.float32))
-    assert_true(near[0] is not None, "a player beside the circle stays on the map")
-    assert_true(3000.0 <= near[0][0] <= 9000.0, "that player is in the middle 60 m")
-    blank = np.zeros((750, 1338), dtype=np.uint8)
-    for _ in range(15):
-        assert_true(pitch_map.update(blank)["accepted"], "a short gap keeps the centre")
-    assert_true(not pitch_map.update(blank)["accepted"], "the centre bridge ends")
-
-
-def _centre_circle_mask():
     mask = np.zeros((750, 1338), dtype=np.uint8)
     cv2.line(mask, (400, 180), (400, 680), 255, 5)
     cv2.circle(mask, (400, 430), 120, 255, 5)
-    return mask
+    assert_true(not pitch_map.update(mask)["accepted"], "a circle seen face on is refused")
+    assert_true(pitch_map.reasons["circle_round"] >= 1, "as round")
 
 
 def _uneven_penalty(continue_past=False):
@@ -717,6 +726,7 @@ def test_blank_paint_publishes_nothing():
     assert_true(decision["matrix"] is None, "a rejected frame keeps no matrix")
 
 
+@drawn_round
 def test_a_camera_move_replaces_a_matrix_that_left_the_paint():
     pitch_map = VisiblePitchMap(hold_frames=15)
     first = pitch_map.update(paint_penalty())
@@ -734,6 +744,7 @@ def test_a_camera_move_replaces_a_matrix_that_left_the_paint():
     assert_true(inside[0][0] <= 3600.0, "the new side does not draw the other half")
 
 
+@drawn_round
 def test_a_short_gap_keeps_the_last_matrix_then_drops_it():
     pitch_map = VisiblePitchMap(hold_frames=15)
     assert_true(pitch_map.update(paint_penalty())["accepted"], "the penalty locks")
@@ -783,6 +794,7 @@ def test_replacement_refuses_a_mirror_and_allows_a_far_camera():
     )
 
 
+@drawn_round
 def test_real_penalty_paint_locks_and_a_blank_frame_drops_it():
     mask = paint_penalty()
     report = fit_broadcast_penalty(mask, SoccerPitchConfiguration(), frame=None)
@@ -892,6 +904,35 @@ def test_two_lost_dots_about_as_close_are_not_guessed():
     assert_true(len(dots) == 3 and memory.relinked_ids == 0, "an ambiguous new ID gets its own dot")
 
 
+def test_a_round_or_raised_circle_is_not_the_main_camera():
+    """Spain clip: curves in the stands and round circles were taken for the centre circle."""
+    import pitch_camera as camera_module
+    from pitch_map import broadcast_circle_fault
+
+    width, height = 1280, 720
+    centre = camera_module.camera_centre(4200.0, 1800.0)
+    pose = np.array([*camera_module._look_at(centre, np.array([5250.0, 3400.0, 0.0])), np.log(1500.0)])
+    radar_to_image = camera_module._homography(pose, centre, width, height)
+    matrix = camera_module._radar_to_field(camera_module._shift("centre", False)) @ np.linalg.inv(radar_to_image)
+    assert_true(
+        broadcast_circle_fault(matrix, "centre", False, None, (height, width)) is None,
+        "the centre circle from the halfway-line camera passes",
+    )
+    grass = np.zeros((height, width), dtype=np.uint8)
+    grass[height - 40 :, :] = 255
+    assert_true(
+        broadcast_circle_fault(matrix, "centre", False, grass, (height, width)) == "circle_in_stands",
+        "the same circle above the grass is in the stands",
+    )
+    tilted = cv2.getRotationMatrix2D((width / 2.0, height / 2.0), 35.0, 1.0)
+    tilted = np.vstack([tilted, [0.0, 0.0, 1.0]])
+    assert_true(
+        broadcast_circle_fault(matrix @ np.linalg.inv(tilted), "centre", False, None, (height, width))
+        == "circle_tilted",
+        "a circle tilted 35 degrees is not level",
+    )
+
+
 def main():
     cv2.setRNGSeed(0)
     test_scale_jump_is_rejected_and_the_third_is_35_m()
@@ -899,7 +940,8 @@ def main():
     test_heatmap_reads_the_map_channel()
     test_projection_drops_the_far_half()
     test_marker_colours_follow_the_team()
-    test_the_centre_circle_publishes_the_middle()
+    test_a_round_circle_is_not_the_centre_circle()
+    test_a_round_or_raised_circle_is_not_the_main_camera()
     test_uneven_corners_move_the_width_and_keep_the_arc_scale()
     test_the_side_ridge_sets_the_width_and_keeps_the_depth()
     test_a_board_is_not_a_side_and_one_corner_draws_one_side()

@@ -370,6 +370,72 @@ def inside_visible(x, y, positive_x, pitch=None, tolerance=EDGE_TOLERANCE_CM, re
     return (x0 - tolerance) <= float(x) <= (x1 + tolerance) and (y0 - tolerance) <= float(y) <= (y1 + tolerance)
 
 
+# The main camera sits high on the halfway line. Seen from there the centre
+# circle and the circle of the penalty arc are always wide, flat, level
+# ellipses on the grass: about 0.16 to 0.23 as tall as wide in the Barcelona,
+# reference and Spain clips, never tilted more than 4 degrees. A fit that draws them round, tall,
+# tilted or up in the stands has read something else.
+BROADCAST_MAX_CIRCLE_RATIO = 0.45
+# Flatter than this is a curve along the far touchline or the boards.
+BROADCAST_MIN_CIRCLE_RATIO = 0.10
+BROADCAST_MAX_CIRCLE_TILT_DEG = 15.0
+BROADCAST_MIN_CIRCLE_ON_GRASS = 0.8
+BROADCAST_MIN_CIRCLE_WIDTH_PX = 40.0
+_PENALTY_SPOT_CM = 1100.0
+_CIRCLE_RADIUS_CM = 915.0
+
+
+def broadcast_circle_fault(matrix, region, positive_x, grass_mask, frame_shape, pitch=None):
+    """Why the circle this fit draws cannot come from the main camera, or None when it can."""
+    pitch = pitch or SoccerPitchConfiguration()
+    length = float(pitch.length)
+    width = float(pitch.width)
+    if region == "centre":
+        centre = (length / 2.0, width / 2.0)
+    else:
+        centre = (length - _PENALTY_SPOT_CM if positive_x else _PENALTY_SPOT_CM, width / 2.0)
+    angles = np.linspace(0.0, 2.0 * np.pi, 72, endpoint=False)
+    field = np.column_stack(
+        [centre[0] + _CIRCLE_RADIUS_CM * np.cos(angles), centre[1] + _CIRCLE_RADIUS_CM * np.sin(angles)]
+    )
+    try:
+        to_image = np.linalg.inv(np.asarray(matrix, dtype=np.float64))
+    except np.linalg.LinAlgError:
+        return "circle_degenerate"
+    homogeneous = np.column_stack([field, np.ones(len(field))]) @ to_image.T
+    depth = homogeneous[:, 2]
+    # The whole circle has to be in front of the camera: a sign change is a broken matrix.
+    if not (np.all(depth > 1e-9) or np.all(depth < -1e-9)):
+        return "circle_degenerate"
+    image = homogeneous[:, :2] / depth[:, None]
+    if not np.isfinite(image).all():
+        return "circle_degenerate"
+    (_cx, _cy), (axis_a, axis_b), angle = cv2.fitEllipse(image.astype(np.float32))
+    major = max(axis_a, axis_b)
+    minor = min(axis_a, axis_b)
+    if major < BROADCAST_MIN_CIRCLE_WIDTH_PX:
+        return "circle_degenerate"
+    if minor / major > BROADCAST_MAX_CIRCLE_RATIO:
+        return "circle_round"
+    if minor / major < BROADCAST_MIN_CIRCLE_RATIO:
+        return "circle_flat"
+    tilt = angle if axis_a >= axis_b else angle - 90.0
+    tilt = (tilt + 90.0) % 180.0 - 90.0
+    if abs(tilt) > BROADCAST_MAX_CIRCLE_TILT_DEG:
+        return "circle_tilted"
+    if grass_mask is not None:
+        height, width_px = frame_shape[:2]
+        inside = (image[:, 0] >= 0) & (image[:, 0] < width_px) & (image[:, 1] >= 0) & (image[:, 1] < height)
+        if inside.any():
+            has = grass_mask > 0
+            top = np.where(has.any(axis=0), has.argmax(axis=0), height)
+            xs = image[inside, 0].astype(int)
+            on_grass = float(np.mean(image[inside, 1] >= top[xs] - 10))
+            if on_grass < BROADCAST_MIN_CIRCLE_ON_GRASS:
+                return "circle_in_stands"
+    return None
+
+
 def centre_on_paint(matrix, grass_mask, white_mask, pitch=None):
     """True when the centre circle and the halfway line still sit on the paint."""
     if matrix is None:
@@ -1699,6 +1765,23 @@ class VisiblePitchMap:
         decision["camera_matrix"] = self.camera_matrix
         return decision
 
+    def _from_main_camera(self, report, grass_mask, white_line_mask):
+        """The fit, or None when its circle could not be seen from the halfway-line camera."""
+        if report is None:
+            return None
+        fault = broadcast_circle_fault(
+            report["matrix"],
+            report.get("region") or "penalty",
+            bool(report.get("positive_x")),
+            grass_mask,
+            white_line_mask.shape,
+            self.pitch,
+        )
+        if fault is None:
+            return report
+        self.reasons[fault] += 1
+        return None
+
     def _update_fit(self, white_line_mask, frame=None, grass_mask=None):
         self._side_cache = None
         ink = self._ink(white_line_mask, frame, grass_mask)
@@ -1708,6 +1791,7 @@ class VisiblePitchMap:
         if report is not None and not (SANE_CM_MIN <= float(report["cm_per_px"]) <= SANE_CM_MAX):
             self.reasons["absurd"] += 1
             report = None
+        report = self._from_main_camera(report, grass_mask, white_line_mask)
         if report is not None and grass_mask is not None:
             patch = paint_patch(report["matrix"], report["positive_x"], grass_mask, white_line_mask, self.pitch)
             if patch is None:
@@ -1724,15 +1808,18 @@ class VisiblePitchMap:
             if report is not None and not (SANE_CM_MIN <= float(report["cm_per_px"]) <= SANE_CM_MAX):
                 self.reasons["absurd"] += 1
                 report = None
+            report = self._from_main_camera(report, grass_mask, white_line_mask)
             boxed = report is not None
         if report is None:
             report = self._centre_report(white_line_mask, frame, grass_mask, ink, marks)
+            report = self._from_main_camera(report, grass_mask, white_line_mask)
             boxed = boxed or (report is not None and report.get("projective"))
         if report is None:
             centre = fit_broadcast_centre(white_line_mask, self.pitch, frame)
             if centre is not None and not (SANE_CM_MIN <= float(centre["cm_per_px"]) <= SANE_CM_MAX):
                 self.reasons["absurd"] += 1
                 centre = None
+            centre = self._from_main_camera(centre, grass_mask, white_line_mask)
             if centre is not None and centre_on_paint(centre["matrix"], grass_mask, white_line_mask, self.pitch):
                 report = centre
             elif centre is not None:
