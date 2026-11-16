@@ -120,8 +120,13 @@ class RadarSmoother:
         return point
 
 
-# A lost player keeps his dot this many frames, as long as the tracker keeps his ID.
-RADAR_HOLD_FRAMES = 60
+# A lost player keeps his dot this long (0.6 s at 30 fps). Longer, a player who
+# comes back under a new ID far from his dot is drawn twice.
+RADAR_HOLD_SECONDS = 0.6
+RADAR_HOLD_FRAMES = 18
+# A held dot goes as soon as a player of the same team is seen this close to it:
+# almost always the same player back under a new ID.
+_SHADOW_CM = 500.0
 # A new ID this close to a lost dot of the same team is the same player.
 _RELINK_BASE_CM = 300.0
 _RELINK_CM_PER_FRAME = 30.0
@@ -140,8 +145,10 @@ class RadarMemory:
     player keeps his dot where he was last mapped, for up to hold_frames.
     When the tracker gives a lost player a new ID, the new ID takes over the
     lost dot if it appears close to it, on the same team, and no other lost
-    dot is about as close. Only the drawing uses this: possession, passes and
-    the contest read the tracker as before.
+    dot is about as close. A held dot with a seen player of the same team
+    within 5 m goes away: it is almost always him under another ID. Only the
+    drawing uses this: possession, passes and the contest read the tracker as
+    before.
     """
 
     def __init__(self, hold_frames=RADAR_HOLD_FRAMES):
@@ -151,6 +158,7 @@ class RadarMemory:
         self._next_slot = 0
         self.held_dots = 0
         self.relinked_ids = 0
+        self.dropped_shadows = 0
 
     def update(self, frame_number, players):
         """All dots of this frame: the players seen now and the lost ones still held.
@@ -183,6 +191,7 @@ class RadarMemory:
             taken.add(slot)
             self._store(slot, player, frame_number)
         self._expire(frame_number)
+        self._drop_shadows(taken, loose)
         dots = []
         for slot, entry in self._slots.items():
             dot = dict(entry["player"])
@@ -242,6 +251,24 @@ class RadarMemory:
             chosen[index] = slot
             used.add(slot)
         return [(player, chosen.get(index)) for index, player in enumerate(fresh)]
+
+    def _drop_shadows(self, taken, loose):
+        """Remove held dots with a seen player of the same team and role close by."""
+        seen = [self._slots[slot]["player"] for slot in taken if slot in self._slots] + list(loose)
+        for slot in [s for s in self._slots if s not in taken]:
+            old = self._slots[slot]["player"]
+            for player in seen:
+                if _role_group(old.get("role")) != _role_group(player.get("role")):
+                    continue
+                if old.get("team_id") != player.get("team_id"):
+                    continue
+                if float(np.hypot(player["x"] - old["x"], player["y"] - old["y"])) <= _SHADOW_CM:
+                    track = self._slots[slot]["track_id"]
+                    del self._slots[slot]
+                    if self._slot_of_track.get(track) == slot:
+                        del self._slot_of_track[track]
+                    self.dropped_shadows += 1
+                    break
 
     def _expire(self, frame_number):
         for slot in [s for s, entry in self._slots.items() if frame_number - entry["frame"] > self.hold_frames]:

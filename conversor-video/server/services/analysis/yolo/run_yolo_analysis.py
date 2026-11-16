@@ -43,7 +43,7 @@ from roboflow_ball import BallTracker
 from roboflow_soccer_config import SoccerPitchConfiguration
 from roboflow_team import TeamClassifier, TeamTrackLock, crops_form_two_teams, reject_training_crop
 from pitch_map import VisiblePitchMap, draw_visible_centre, draw_visible_penalty
-from pitch_radar import RadarMemory, RadarSmoother, TeamColours, draw_radar
+from pitch_radar import RADAR_HOLD_SECONDS, RadarMemory, RadarSmoother, TeamColours, draw_radar
 from spatial_metrics import SpatialMetrics
 
 
@@ -3205,8 +3205,8 @@ def analyze(args):
     ball_heatmap = BallHeatmapAccumulator()
     visible_pitch_map = VisiblePitchMap(pitch=SOCCER_PITCH_CONFIGURATION)
     radar_smoother = RadarSmoother()
-    # The radar holds a lost player as long as ByteTrack keeps his ID (its buffer scales with fps).
-    radar_memory = RadarMemory(hold_frames=max(1, int(float(fps) / 30.0 * BYTE_TRACK_LOST_TRACK_BUFFER)))
+    # The radar holds a lost player for a short moment only (RADAR_HOLD_SECONDS).
+    radar_memory = RadarMemory(hold_frames=max(1, int(round(float(fps) * RADAR_HOLD_SECONDS))))
     radar_team_colours = TeamColours()
     spatial_metrics = SpatialMetrics(fps=fps)
     last_possession_events = possession_engine.snapshot().as_dict()

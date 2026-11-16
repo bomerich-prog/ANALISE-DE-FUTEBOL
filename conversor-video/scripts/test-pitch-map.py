@@ -970,7 +970,34 @@ def test_two_lost_dots_about_as_close_are_not_guessed():
     memory.update(0, [_dot(1, 3000.0, 2000.0), _dot(2, 3400.0, 2000.0)])
     memory.update(1, [])
     dots = memory.update(2, [_dot(5, 3200.0, 2000.0)])
-    assert_true(len(dots) == 3 and memory.relinked_ids == 0, "an ambiguous new ID gets its own dot")
+    assert_true(memory.relinked_ids == 0, "an ambiguous new ID is not linked to either lost dot")
+    assert_true(len(dots) == 1, "the two held dots next to him go: no doubles")
+
+
+def test_a_player_back_under_a_new_id_far_from_his_dot_is_not_drawn_twice():
+    # He ran on while the detector missed him and came back past the relink reach,
+    # then walked past the spot of his old dot.
+    memory = RadarMemory(hold_frames=18)
+    memory.update(0, [_dot(7, 3000.0, 2000.0), _dot(8, 6000.0, 2000.0, team=1)])
+    dots = memory.update(1, [_dot(31, 3700.0, 2000.0), _dot(8, 6000.0, 2000.0, team=1)])
+    assert_true(len(dots) == 3, "a new ID 7 m away is not taken for him yet")
+    dots = memory.update(2, [_dot(31, 3450.0, 2000.0), _dot(8, 6000.0, 2000.0, team=1)])
+    assert_true(len(dots) == 2, "his held dot goes once a team-mate is seen within 5 m")
+    assert_true(memory.dropped_shadows == 1, "one shadow dropped")
+    # A held dot of the other team next to a seen player stays.
+    memory.update(3, [_dot(31, 3450.0, 2000.0)])
+    dots = memory.update(4, [_dot(31, 5800.0, 2000.0)])
+    assert_true(len(dots) == 2, "the other team's held dot stays beside him")
+
+
+def test_a_lost_dot_goes_after_the_short_hold():
+    memory = RadarMemory(hold_frames=18)
+    memory.update(0, [_dot(7, 3000.0, 2000.0), _dot(8, 8000.0, 4000.0, team=1)])
+    for frame in range(1, 19):
+        dots = memory.update(frame, [_dot(8, 8000.0, 4000.0, team=1)])
+    assert_true(len(dots) == 2, "held for 18 frames (0.6 s at 30 fps)")
+    dots = memory.update(19, [_dot(8, 8000.0, 4000.0, team=1)])
+    assert_true(len(dots) == 1, "gone after that")
 
 
 def test_a_round_or_raised_circle_is_not_the_main_camera():
@@ -1042,6 +1069,8 @@ def main():
     test_a_missed_player_keeps_his_dot_on_his_last_spot()
     test_a_new_id_near_a_lost_dot_continues_it()
     test_two_lost_dots_about_as_close_are_not_guessed()
+    test_a_player_back_under_a_new_id_far_from_his_dot_is_not_drawn_twice()
+    test_a_lost_dot_goes_after_the_short_hold()
     print("pitch map tests passed")
 
 
