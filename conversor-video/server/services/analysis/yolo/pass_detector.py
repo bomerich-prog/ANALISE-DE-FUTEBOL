@@ -783,7 +783,12 @@ class PassDetector:
             # The one-touch is the flight to the receiver's feet. Possession
             # may confirm later; that wait is not the pass.
             timing_seconds = flight["flight_seconds"]
-        elif flight["arrival_observed"] and flight["reception_lag_seconds"] <= PASS_MAX_RECEPTION_LAG_SECONDS:
+        elif flight["arrival_observed"] and (
+            flight["reception_lag_seconds"] <= PASS_MAX_RECEPTION_LAG_SECONDS
+            or flight["lost_at_receiver"]
+        ):
+            # The ball reached the receiver. If the detector then lost it at his
+            # feet, the wait for possession to confirm is not the ball rolling loose.
             timing_seconds = min(gap_seconds, flight["flight_seconds"])
         verified_pixel_flight = (
             distance_cm is None
@@ -908,6 +913,16 @@ class PassDetector:
         in_flight_samples = sum(
             1 for entry in self._entries(release_frame + 1, arrival_frame - 1) if entry["ball"] is not None
         )
+        after_arrival = self._entries(arrival_frame + 1, gained_frame)
+        seen_after = [entry for entry in after_arrival if entry["ball"] is not None]
+        # The wait after the arrival is the detector losing the ball at the
+        # receiver's feet when the ball is mostly unseen and never seen elsewhere.
+        lost_at_receiver = (
+            arrival_observed
+            and len(after_arrival) - len(seen_after) >= len(seen_after)
+            # One stray box elsewhere is not the ball leaving him.
+            and sum(1 for entry in seen_after if not _within_control(entry, to_id)) < TOUCH_MIN_OBSERVED
+        )
 
         return {
             "release_frame": int(release_frame),
@@ -917,6 +932,7 @@ class PassDetector:
             "flight_seconds": max(0, arrival_frame - release_frame) / fps,
             "reception_lag_seconds": max(0, gained_frame - arrival_frame) / fps,
             "in_flight_samples": int(in_flight_samples),
+            "lost_at_receiver": bool(lost_at_receiver),
             "window_start": int(min(release_frame, from_frame)),
             "window_end": int(arrival_frame),
         }
@@ -1022,6 +1038,14 @@ class PassDetector:
         to_receiver_x = to_pos["x"] - window[-1][0]
         to_receiver_y = to_pos["y"] - window[-1][1]
         if math.hypot(to_receiver_x, to_receiver_y) <= _min_motion(space):
+            return "compatible"
+        # The ball ended much closer to the receiver than it started: it went to
+        # him, even if he then carried it back past the last ball seen.
+        start_distance = math.hypot(to_pos["x"] - window[0][0], to_pos["y"] - window[0][1])
+        end_distance = math.hypot(to_receiver_x, to_receiver_y)
+        if start_distance - end_distance >= max(
+            _min_motion(space), PASS_TRAJECTORY_MIN_PROGRESS * start_distance
+        ):
             return "compatible"
         if (motion_x * to_receiver_x) + (motion_y * to_receiver_y) >= 0.0:
             return "compatible"

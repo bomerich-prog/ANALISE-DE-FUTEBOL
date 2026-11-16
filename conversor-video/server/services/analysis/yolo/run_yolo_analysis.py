@@ -863,6 +863,20 @@ def ensure_rfdetr_soccernet_files(repo_id, model_directory):
     return checkpoint_path.resolve(), config_path.resolve()
 
 
+# The ball model sees at least 640 px. A small crop is enlarged to that, as
+# before. A larger crop or the whole frame is read at its own resolution: shrunk
+# to 640 px, a 1400 px crop turned a 10 px ball into 4 px and the detector lost it.
+BALL_MIN_INFERENCE_PX = 640
+BALL_MAX_INFERENCE_PX = 1920
+
+
+def ball_inference_size(shape):
+    height, width = shape[:2]
+    longest = max(int(height), int(width))
+    size = max(BALL_MIN_INFERENCE_PX, min(BALL_MAX_INFERENCE_PX, longest))
+    return int(-(-size // 32) * 32)
+
+
 class BallDetectorYOLO:
     def __init__(self, model, confidence_threshold):
         self.model = model
@@ -881,7 +895,7 @@ class BallDetectorYOLO:
 
         result = self.model(
             roi_frame,
-            imgsz=640,
+            imgsz=ball_inference_size(roi_frame.shape),
             conf=self.confidence_threshold,
             verbose=False,
         )[0]

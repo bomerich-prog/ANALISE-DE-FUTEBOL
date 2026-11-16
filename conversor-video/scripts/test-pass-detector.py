@@ -837,7 +837,56 @@ def test_both_teams_on_the_ball_is_a_dispute():
     assert_equal(metrics["dispute_events"][0]["to_track_id"], 2, "next possessor")
 
 
+def test_ball_lost_at_the_receivers_feet_does_not_time_out_the_pass():
+    """Spain clip, 17 -> 22: the ball reaches the receiver, then the detector loses it for a second."""
+    detector = PassDetector()
+    a = player(1, 0, 0.0, 0.0)
+    b = player(2, 0, 1500.0, 0.0)
+    players = [a, b]
+    frames = []
+    frame = 1
+    for _ in range(8):
+        frames.append((frame, 1, "Team 0", players, ball(0.0, 0.0)))
+        frame += 1
+    for ball_x in (400.0, 800.0, 1200.0, 1500.0):
+        frames.append((frame, None, None, players, ball(ball_x, 0.0)))
+        frame += 1
+    for _ in range(14):
+        frames.append((frame, None, None, players, None))
+        frame += 1
+    frames.append((frame, None, None, players, ball(3000.0, 900.0)))
+    frame += 1
+    for _ in range(4):
+        frames.append((frame, None, None, players, ball(1500.0, 0.0)))
+        frame += 1
+    frames.append((frame, 2, "Team 0", players, ball(1500.0, 0.0)))
+    metrics = run_frames(detector, frames)
+    assert_equal(metrics["total_passes"], 1, "the wait at his feet is not a loose ball")
+    assert_equal(metrics["events"][0]["timing_seconds"] < 1.0, True, "the flight is timed, not the wait")
+
+
+def test_receiver_who_carries_the_ball_back_still_received_it():
+    """Spain clip, 10 -> 22: the receiver is only seen at the end, behind the last ball box."""
+    detector = PassDetector()
+    a = player(1, 0, 0.0, 0.0)
+    b = player(2, 0, 1350.0, 0.0)
+    frames = []
+    frame = 1
+    for _ in range(8):
+        frames.append((frame, 1, "Team 0", [a], ball(0.0, 0.0)))
+        frame += 1
+    for ball_x in (300.0, 700.0, 1100.0, 1500.0):
+        frames.append((frame, None, None, [a], ball(ball_x, 0.0)))
+        frame += 1
+    frames.append((frame, 2, "Team 0", [a, b], ball(1350.0, 0.0)))
+    metrics = run_frames(detector, frames)
+    assert_equal(metrics["total_passes"], 1, "the ball went to him")
+    assert_equal(metrics["events"][0]["trajectory"], "compatible", "most of the way to the receiver")
+
+
 if __name__ == "__main__":
+    test_ball_lost_at_the_receivers_feet_does_not_time_out_the_pass()
+    test_receiver_who_carries_the_ball_back_still_received_it()
     test_confirms_stable_same_team_pass()
     test_confirmed_snapshot_is_enough()
     test_ball_near_donor_does_not_veto_confirmed_reception()

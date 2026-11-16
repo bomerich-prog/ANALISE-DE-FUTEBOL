@@ -11,6 +11,7 @@ from run_yolo_analysis import (  # noqa: E402
     BALL_TRACK_OBSERVED,
     BALL_TRACK_RECOVERED,
     BALL_TRACK_RECOVERING,
+    ball_inference_size,
     ball_track_state_for_gap,
     note_rejected_ball_center,
     select_ball_reacquisition,
@@ -233,7 +234,15 @@ def test_window_requires_two_frames_at_the_feet():
     assert_true(second["used"], "the second frame at the feet is accepted")
 
 
+def test_a_large_crop_is_read_at_its_own_resolution():
+    """Spain clip: a 1400 px crop shrunk to 640 px turned the 10 px ball into 4 px."""
+    assert_true(ball_inference_size((250, 250, 3)) == 640, "a small crop is still enlarged to 640")
+    assert_true(ball_inference_size((1080, 1400, 3)) == 1408, "a large crop keeps its pixels")
+    assert_true(ball_inference_size((1080, 1920, 3)) == 1920, "the whole frame is read at full size")
+
+
 if __name__ == "__main__":
+    test_a_large_crop_is_read_at_its_own_resolution()
     test_states_follow_the_gap()
     test_frame_47_ball_is_recovered_away_from_the_prediction()
     test_grass_box_following_the_prediction_is_rejected()
