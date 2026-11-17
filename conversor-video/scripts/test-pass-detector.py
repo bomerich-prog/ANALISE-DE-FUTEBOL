@@ -884,6 +884,44 @@ def test_receiver_who_carries_the_ball_back_still_received_it():
     assert_equal(metrics["events"][0]["trajectory"], "compatible", "most of the way to the receiver")
 
 
+def _first_time_frames(receiver_takes_it):
+    """7 passes to 14, who sends it back first time; the ball is not seen at his foot."""
+    a = player(1, 0, 0.0, 0.0)
+    b = player(2, 0, 300.0, 0.0)
+    players = [a, b]
+    frames = []
+    frame = 1
+    for _ in range(8):
+        frames.append((frame, 1, "Team 0", players, ball(0.0, 0.0)))
+        frame += 1
+    for x in (60.0, 120.0, 180.0, 240.0, 285.0):
+        frames.append((frame, None, None, players, ball(x, 0.0)))
+        frame += 1
+    for _ in range(4):
+        frames.append((frame, None, None, players, None))
+        frame += 1
+    if receiver_takes_it:
+        for _ in range(6):
+            frames.append((frame, 2, "Team 0", players, ball(290.0, 0.0)))
+            frame += 1
+    else:
+        for x in (230.0, 190.0, 150.0, 110.0, 70.0, 40.0, 20.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0):
+            frames.append((frame, None, None, players, ball(x, -60.0)))
+            frame += 1
+    return frames
+
+
+def test_a_first_time_touch_receives_the_pass():
+    """Final Spain v Argentina: 7 to 14, played straight back; nobody held it after."""
+    metrics = run_frames(PassDetector(), _first_time_frames(receiver_takes_it=False))
+    assert_equal(metrics["total_passes"], 1, "the pass to the first-time touch counts")
+    assert_equal(metrics["events"][0]["to_track_id"], 2, "to the teammate who touched it")
+    assert_equal(metrics["first_time_receptions"], 1, "by the first-time reading")
+    controlled = run_frames(PassDetector(), _first_time_frames(receiver_takes_it=True))
+    assert_equal(controlled["total_passes"], 1, "a controlled reception is one pass")
+    assert_equal(controlled["first_time_receptions"], 0, "and goes the normal way")
+
+
 def test_a_receiver_whose_shirt_has_not_voted_waits_for_his_team():
     """France v Spain: an opponent covered the receiver, his new id had no team
     yet, and the pass to him and his next pass were both dropped."""
@@ -904,6 +942,7 @@ def test_a_receiver_whose_shirt_has_not_voted_waits_for_his_team():
         assert_equal(metrics["team_wait_resolved"], 1, "the decision waited for his shirt")
 
 if __name__ == "__main__":
+    test_a_first_time_touch_receives_the_pass()
     test_a_receiver_whose_shirt_has_not_voted_waits_for_his_team()
     test_ball_lost_at_the_receivers_feet_does_not_time_out_the_pass()
     test_receiver_who_carries_the_ball_back_still_received_it()

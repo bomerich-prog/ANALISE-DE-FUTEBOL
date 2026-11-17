@@ -75,6 +75,16 @@ TOUCH_RADIUS_PX = 30.0
 TOUCH_MARGIN_CM = 30.0
 TOUCH_MARGIN_PX = 12.0
 TOUCH_MIN_OBSERVED = 2
+# First-time ball: the ball of an open pass reaches a teammate of the passer
+# (within the contest radius, no teamed opponent closer) and is next seen going
+# back the other way, away from him, within this many frames.
+FIRST_TIME_MIN_FRAMES = 3
+FIRST_TIME_MAX_FRAMES = 20
+FIRST_TIME_MIN_MOTION_PX = 20.0
+FIRST_TIME_MIN_MOTION_CM = 60.0
+# A teammate who takes the ball afterwards controlled it (normal pass); the
+# first-time reading waits this long for that before it counts.
+FIRST_TIME_CONFIRM_FRAMES = 15
 TURNOVER_BASE_SCORE = 70
 TURNOVER_TRAJECTORY_BONUS = 10
 TURNOVER_TRAJECTORY_PENALTY = -10
@@ -269,6 +279,11 @@ class PassDetector:
         self.known_teams = {}
         self.waiting_for_team = []
         self.team_wait_resolved = 0
+        self.first_time_receptions = 0
+        self.deflection = None
+        self.first_time = None
+        self._last_ball = None
+        self._fps = 25.0
         self.total_passes = 0
         self.raw_candidate_passes = 0
         self.discarded_short_passes = 0
@@ -302,6 +317,7 @@ class PassDetector:
             "discarded_long_passes": self.discarded_long_passes,
             "discarded_unstable_possession": self.discarded_unstable_possession,
             "team_wait_resolved": self.team_wait_resolved,
+            "first_time_receptions": self.first_time_receptions,
             "discarded_timeout": self.discarded_timeout,
             "discarded_direction_check": self.discarded_direction_check,
             "discarded_intercepted": self.discarded_intercepted,
@@ -325,12 +341,31 @@ class PassDetector:
     def update(self, frame_number, fps, snapshot, players, ball):
         frame_number = int(frame_number)
         fps = float(fps) if fps and float(fps) > 0 else 25.0
+        self._fps = fps
         possessor_id = snapshot.current_possessor_track_id if snapshot is not None else None
         possessor_team = _team_of(snapshot, players, possessor_id)
         possessor_player = _find_player(players, possessor_id)
         possessor_pos = _point_from_entity(possessor_player)
         observed_ball = _observed_ball_point(ball)
         self._note_teams(players)
+        if self.first_time is not None:
+            candidate = self.first_time
+            if possessor_id is not None:
+                self.first_time = None
+                if possessor_id not in {candidate["id"], (self.pending or {}).get("from_id")}:
+                    # Someone else took the ball after the first-time touch:
+                    # the touch was a pass in, and the ball went on from him.
+                    self._commit_first_time(candidate)
+                    self._open_pending(candidate["frame"], None, players)
+            elif frame_number - candidate["seen"] >= FIRST_TIME_CONFIRM_FRAMES:
+                self.first_time = None
+                self._commit_first_time(candidate)
+        if possessor_id is None and self.pending is not None and self.first_time is None:
+            self._watch_first_time(frame_number, fps, players, observed_ball)
+        else:
+            self.deflection = None
+        if observed_ball is not None:
+            self._last_ball = observed_ball
         self._retry_waiting(frame_number, fps)
         self._log_frame(frame_number, fps, players, ball)
         self._observe_touch(frame_number, players, ball, possessor_id)
@@ -379,6 +414,10 @@ class PassDetector:
         return self.metrics()
 
     def finalize(self):
+        if self.first_time is not None:
+            candidate = self.first_time
+            self.first_time = None
+            self._commit_first_time(candidate)
         self.pending = None
         self.waiting_for_team = []
         return self.metrics()
@@ -514,6 +553,90 @@ class PassDetector:
         touch["frames"] = int(touch["frames"]) + 1
         touch["pos"] = leader["pos"]
         touch["frame"] = int(frame_number)
+
+    def _commit_first_time(self, candidate):
+        if self.pending is None:
+            return
+        self.first_time_receptions += 1
+        self._resolve(candidate["frame"], candidate["fps"], candidate["id"], candidate["team"], candidate["pos"])
+        self.last_possessor_id = candidate["id"]
+        self.last_possessor_team = candidate["team"]
+        self.last_possessor_pos = candidate["pos"]
+        self.last_possessor_frame = candidate["frame"]
+
+    def _watch_first_time(self, frame_number, fps, players, ball_point):
+        """Close an open pass on a teammate who played it first time.
+
+        Final Spain v Argentina: 7 passed to 14, who sent it straight back with
+        an opponent at his side. The ball was not seen at his foot, and nobody
+        held it afterwards, so the open pass used to expire.
+        """
+        pending = self.pending
+        if ball_point is None or pending is None or pending.get("contested"):
+            return
+        from_id = int(pending["from_id"]) if pending.get("from_id") is not None else None
+        from_team = pending.get("from_team") or (self.known_teams.get(from_id) if from_id is not None else None)
+        if from_team not in {"Team 0", "Team 1"}:
+            return
+        min_motion = FIRST_TIME_MIN_MOTION_PX if ball_point["space"] == "pixel" else FIRST_TIME_MIN_MOTION_CM
+        approach = self.deflection
+        if approach is not None:
+            age = frame_number - approach["frame"]
+            if age > FIRST_TIME_MAX_FRAMES:
+                self.deflection = approach = None
+            elif age >= FIRST_TIME_MIN_FRAMES:
+                out_x = ball_point["x"] - approach["ball"]["x"]
+                out_y = ball_point["y"] - approach["ball"]["y"]
+                in_x, in_y = approach["incoming"]
+                before, _space = _distance(approach["pos"], approach["ball"])
+                after, _space = _distance(approach["pos"], ball_point)
+                if (
+                    math.hypot(out_x, out_y) >= min_motion
+                    and out_x * in_x + out_y * in_y < 0
+                    and before is not None
+                    and after is not None
+                    and after >= before + min_motion
+                ):
+                    self.deflection = None
+                    self.first_time = dict(approach, seen=int(frame_number), fps=fps)
+                    return
+        last = self._last_ball
+        if last is None or last["space"] != ball_point["space"]:
+            return
+        incoming = (ball_point["x"] - last["x"], ball_point["y"] - last["y"])
+        if math.hypot(*incoming) < 1.0:
+            return
+        ranked = []
+        for player in players or []:
+            team = _team_name_from_player(player)
+            if team not in {"Team 0", "Team 1"}:
+                continue
+            point = _point_from_entity(player)
+            distance, space = _distance(point, ball_point)
+            if distance is None or space != ball_point["space"]:
+                continue
+            try:
+                track_id = int(player.get("track_id"))
+            except (TypeError, ValueError):
+                continue
+            ranked.append((distance, track_id, team, point))
+        if not ranked:
+            return
+        ranked.sort(key=lambda item: item[0])
+        distance, track_id, team, point = ranked[0]
+        radius = PASS_CONTEST_RADIUS_PX if ball_point["space"] == "pixel" else PASS_CONTEST_RADIUS_CM
+        if track_id == from_id or team != from_team or distance > radius:
+            return
+        if approach is None or distance <= approach["distance"]:
+            self.deflection = {
+                "id": track_id,
+                "team": team,
+                "pos": point,
+                "frame": int(frame_number),
+                "ball": ball_point,
+                "incoming": incoming,
+                "distance": distance,
+            }
 
     def _release_touch(self, frame_number):
         touch = self.touch
