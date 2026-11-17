@@ -47,6 +47,9 @@ PASS_MAX_BALL_SPEED_CM_S = 4000.0
 PASS_RECEPTION_ALLOWANCE_SECONDS = 0.5
 PASS_MAX_RECEPTION_LAG_SECONDS = 1.0
 PASS_FLIGHT_LOG_SECONDS = 8.0
+# A receiver whose shirt has not voted yet (covered by an opponent) holds the
+# decision this long, waiting for his team, instead of dropping the pass.
+PASS_TEAM_WAIT_SECONDS = 2.0
 PASS_INTERCEPT_MIN_SECONDS = 0.25
 PASS_INTERCEPT_MIN_FRAMES = 3
 PASS_MIN_DISTANCE_CM = 150.0
@@ -263,6 +266,9 @@ class PassDetector:
         self.last_possessor_frame = None
         self.recent_contest = False
         self.pending = None
+        self.known_teams = {}
+        self.waiting_for_team = []
+        self.team_wait_resolved = 0
         self.total_passes = 0
         self.raw_candidate_passes = 0
         self.discarded_short_passes = 0
@@ -295,6 +301,7 @@ class PassDetector:
             "discarded_short_passes": self.discarded_short_passes,
             "discarded_long_passes": self.discarded_long_passes,
             "discarded_unstable_possession": self.discarded_unstable_possession,
+            "team_wait_resolved": self.team_wait_resolved,
             "discarded_timeout": self.discarded_timeout,
             "discarded_direction_check": self.discarded_direction_check,
             "discarded_intercepted": self.discarded_intercepted,
@@ -323,6 +330,8 @@ class PassDetector:
         possessor_player = _find_player(players, possessor_id)
         possessor_pos = _point_from_entity(possessor_player)
         observed_ball = _observed_ball_point(ball)
+        self._note_teams(players)
+        self._retry_waiting(frame_number, fps)
         self._log_frame(frame_number, fps, players, ball)
         self._observe_touch(frame_number, players, ball, possessor_id)
 
@@ -371,7 +380,36 @@ class PassDetector:
 
     def finalize(self):
         self.pending = None
+        self.waiting_for_team = []
         return self.metrics()
+
+    def _note_teams(self, players):
+        for player in players or []:
+            team = _team_name_from_player(player)
+            if team not in {"Team 0", "Team 1"}:
+                continue
+            try:
+                self.known_teams[int(player.get("track_id"))] = team
+            except (TypeError, ValueError):
+                continue
+
+    def _retry_waiting(self, frame_number, fps):
+        """Settle the passes that waited for a receiver's shirt, once it voted."""
+        still = []
+        for item in self.waiting_for_team:
+            team = self.known_teams.get(item["to_id"])
+            if team is None:
+                if frame_number - item["frame"] <= PASS_TEAM_WAIT_SECONDS * fps:
+                    still.append(item)
+                else:
+                    self.discarded_unstable_possession += 1
+                continue
+            saved = self.pending
+            self.pending = item["pending"]
+            self.team_wait_resolved += 1
+            self._resolve(item["frame"], item["fps"], item["to_id"], team, item["to_pos"], waited=True)
+            self.pending = saved
+        self.waiting_for_team = still
 
     def _log_frame(self, frame_number, fps, players, ball):
         roster = {}
@@ -506,10 +544,27 @@ class PassDetector:
             return None
         return origin
 
-    def _resolve(self, frame_number, fps, possessor_id, possessor_team, possessor_pos):
+    def _resolve(self, frame_number, fps, possessor_id, possessor_team, possessor_pos, waited=False):
         pending = self.pending
         self.pending = None
         if pending is None or pending.get("from_id") is None:
+            return
+        if pending.get("from_team") not in {"Team 0", "Team 1"}:
+            # The passer held the ball before his shirt voted; it has voted since.
+            known = self.known_teams.get(int(pending["from_id"]))
+            if known is not None:
+                pending = dict(pending)
+                pending["from_team"] = known
+        if possessor_team not in {"Team 0", "Team 1"} and not waited and not pending.get("contested"):
+            self.waiting_for_team.append(
+                {
+                    "pending": dict(pending),
+                    "frame": int(frame_number),
+                    "fps": fps,
+                    "to_id": int(possessor_id),
+                    "to_pos": possessor_pos,
+                }
+            )
             return
 
         from_id = int(pending["from_id"])

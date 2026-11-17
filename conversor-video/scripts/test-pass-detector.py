@@ -884,7 +884,27 @@ def test_receiver_who_carries_the_ball_back_still_received_it():
     assert_equal(metrics["events"][0]["trajectory"], "compatible", "most of the way to the receiver")
 
 
+def test_a_receiver_whose_shirt_has_not_voted_waits_for_his_team():
+    """France v Spain: an opponent covered the receiver, his new id had no team
+    yet, and the pass to him and his next pass were both dropped."""
+    for later_team, expected_passes, expected_turnovers in ((0, 1, 0), (1, 0, 1)):
+        detector = PassDetector()
+        frames, _lost = valid_pass_sequence()
+        # While he takes the ball his shirt has not voted yet.
+        frames = [
+            (frame, possessor, (None if possessor == 2 else team), [player(1, 0, 0.0, 0.0), player(2, None, 1500.0, 0.0)], ball_state)
+            for frame, possessor, team, _players, ball_state in frames
+        ]
+        last = frames[-1][0]
+        voted = [player(1, 0, 0.0, 0.0), player(2, later_team, 1500.0, 0.0)]
+        frames.append((last + 1, 2, "Team 1" if later_team else "Team 0", voted, ball(1500.0, 0.0)))
+        metrics = run_frames(detector, frames)
+        assert_equal(metrics["total_passes"], expected_passes, f"pass once his team is {later_team}")
+        assert_equal(metrics["turnovers"], expected_turnovers, f"turnover once his team is {later_team}")
+        assert_equal(metrics["team_wait_resolved"], 1, "the decision waited for his shirt")
+
 if __name__ == "__main__":
+    test_a_receiver_whose_shirt_has_not_voted_waits_for_his_team()
     test_ball_lost_at_the_receivers_feet_does_not_time_out_the_pass()
     test_receiver_who_carries_the_ball_back_still_received_it()
     test_confirms_stable_same_team_pass()
