@@ -29,6 +29,7 @@ from pass_detector import PassDetector
 from player_stats import PlayerStatsAccumulator
 from person_class import (
     NEON_GREEN_MIN,
+    OfficialKitVote,
     YELLOW_TORSO_MIN,
     PersonClassLock,
     TrackAppearanceGate,
@@ -3188,6 +3189,7 @@ def analyze(args):
     player_referee_stabilized_swap_events = 0
     person_class_lock = PersonClassLock()
     appearance_gate = TrackAppearanceGate()
+    official_kit_vote = OfficialKitVote()
     referee_selection_stats = {
         "limit": 3,
         "published": 0,
@@ -3569,6 +3571,7 @@ def analyze(args):
             if person_crop is not None and getattr(person_crop, "size", 0) > 0:
                 team_match = bool(team_classifier.matches_team(person_crop))
             referee_blocked = (neon_shirt or team_match) and not official_dark
+            official_kit_referee = official_kit_vote.vote(track_id, raw_class_id, official_dark, team_match)
             prefer_referee = bool(official_yellow) and not referee_blocked
             if track_id >= 0 and raw_class_id in {PLAYER_CLASS_ID, GOALKEEPER_CLASS_ID, REFEREE_CLASS_ID}:
                 previous_raw_class = last_raw_player_referee_class.get(track_id)
@@ -3611,6 +3614,7 @@ def analyze(args):
                 foot_field=foot_field,
                 role_locked=track_id >= 0 and person_class_lock.is_locked(track_id),
                 team_colored=referee_blocked,
+                official_kit=official_kit_referee,
             )
             if official_dark:
                 official_score = 1.0
@@ -3632,7 +3636,7 @@ def analyze(args):
                     person_class_lock.referee_continuity(track_id) if track_id >= 0 else 0
                 ),
             }
-            pending_humans.append((detection_payload, class_id))
+            pending_humans.append((detection_payload, class_id, official_kit_referee))
             if player_record_frames is not None:
                 raw_track_id = (
                     raw_tracker_ids[detection_index]
@@ -3641,7 +3645,9 @@ def analyze(args):
                 )
                 player_record_slots.append((detection_payload, class_id, raw_class_id, raw_track_id))
 
-        for (detection_payload, class_id), verdict in zip(pending_humans, appearance_gate.finish_frame()):
+        for (detection_payload, class_id, official_kit_referee), verdict in zip(
+            pending_humans, appearance_gate.finish_frame()
+        ):
             if verdict["action"] == "drop":
                 rejected_non_person += 1
                 reason = verdict["reason"]
@@ -3649,6 +3655,10 @@ def analyze(args):
                 continue
             if verdict["action"] == "referee":
                 class_id = REFEREE_CLASS_ID
+            elif official_kit_referee and class_id == PLAYER_CLASS_ID:
+                class_id = REFEREE_CLASS_ID
+                detection_payload["official_score"] = max(float(detection_payload.get("official_score") or 0.0), 1.0)
+                detection_payload["official_kit"] = True
 
             if class_id == PLAYER_CLASS_ID:
                 raw_player_detections += 1
@@ -5021,6 +5031,7 @@ def analyze(args):
                 "person_class_lock": person_class_lock.metrics(),
                 "appearance_gate": appearance_gate.metrics(),
                 "referee_selection": dict(referee_selection_stats),
+                "official_kit_referee": official_kit_vote.metrics(),
                 "player_track_stitch": player_track_stitch.metrics(),
                 "rejected_non_person": rejected_non_person,
                 "rejected_non_person_reasons": rejected_non_person_reasons,

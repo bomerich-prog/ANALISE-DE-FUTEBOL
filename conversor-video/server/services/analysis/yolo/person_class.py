@@ -374,7 +374,9 @@ def _protected_official(item: dict) -> bool:
     raw_referee = int(item.get("raw_class_id", -1)) == GATE_REFEREE_CLASS_ID
     locked_referee = int(item.get("locked_class_id", -1)) == GATE_REFEREE_CLASS_ID
     dark_kit = float(profile.get("official_dark", 0.0)) >= 1.0
-    if locked_referee:
+    if locked_referee or item.get("official_kit"):
+        # A referee by his kit (OfficialKitVote) is a person, whatever the
+        # detector calls him and whatever boards are behind him.
         return True
     return raw_referee and dark_kit
 
@@ -598,6 +600,7 @@ class TrackAppearanceGate:
         foot_field=None,
         role_locked: bool = False,
         team_colored: bool = False,
+        official_kit: bool = False,
     ) -> None:
         box_values = [float(value) for value in list(box)[:4]]
         foot = ((box_values[0] + box_values[2]) * 0.5, box_values[3])
@@ -611,6 +614,7 @@ class TrackAppearanceGate:
                 "locked_class_id": int(locked_class_id),
                 "role_locked": bool(role_locked),
                 "team_colored": bool(team_colored),
+                "official_kit": bool(official_kit),
                 "foot": foot,
                 "foot_field": field_point,
                 "profile": appearance_profile(frame, box_values),
@@ -818,10 +822,65 @@ class TrackAppearanceGate:
         return {"action": "keep", "reason": None}
 
 
+OFFICIAL_KIT_WINDOW = 15
+OFFICIAL_KIT_LATCH = 10
+OFFICIAL_KIT_RELEASE = 4
+OFFICIAL_KIT_GOALKEEPER_MAX = 1
+
+
+class OfficialKitVote:
+    """A referee the detector keeps calling a player.
+
+    The detector learnt referees mostly in yellow and often calls a referee
+    in a black or dark kit a player, frame after frame, so the role lock
+    keeps him a player. Two cues are general: the kit is dark (black, grey,
+    navy), and the shirt does not match either fitted team. A dark team
+    (Barcelona's blue and garnet) matches its team and is never counted.
+    A track with both cues in 10 of its last 15 frames is a referee until
+    fewer than 4 of the last 15 have them. A track the detector has called a
+    goalkeeper more than once is left alone: goalkeepers often wear black too.
+    """
+
+    def __init__(self, window=OFFICIAL_KIT_WINDOW, latch=OFFICIAL_KIT_LATCH, release=OFFICIAL_KIT_RELEASE):
+        self.window = int(window)
+        self.latch = int(latch)
+        self.release = int(release)
+        self._tracks = {}
+        self.referee_frames = 0
+        self.latched_tracks = set()
+
+    def vote(self, track_id, raw_class_id, official_dark, team_match):
+        """True when this track is a referee by its kit in this frame."""
+        if int(track_id) < 0:
+            return False
+        state = self._tracks.get(int(track_id))
+        if state is None:
+            state = {"votes": deque(maxlen=self.window), "keepers": 0, "latched": False}
+            self._tracks[int(track_id)] = state
+        state["votes"].append(1 if official_dark and not team_match else 0)
+        if int(raw_class_id) == GATE_GOALKEEPER_CLASS_ID:
+            state["keepers"] += 1
+        if state["keepers"] > OFFICIAL_KIT_GOALKEEPER_MAX:
+            state["latched"] = False
+            return False
+        count = sum(state["votes"])
+        if not state["latched"] and count >= self.latch:
+            state["latched"] = True
+            self.latched_tracks.add(int(track_id))
+        elif state["latched"] and count < self.release:
+            state["latched"] = False
+        if state["latched"]:
+            self.referee_frames += 1
+        return bool(state["latched"])
+
+    def metrics(self):
+        return {"referee_frames": int(self.referee_frames), "tracks": len(self.latched_tracks)}
+
+
 def _referee_rank(detection: dict) -> tuple:
     locked = bool(detection.get("role_locked"))
     role = detection.get("role_class")
-    confirmed = 1 if locked and int(role or -1) == GATE_REFEREE_CLASS_ID else 0
+    confirmed = 1 if (locked and int(role or -1) == GATE_REFEREE_CLASS_ID) or detection.get("official_kit") else 0
     return (
         confirmed,
         int(detection.get("referee_frames") or 0),
@@ -833,13 +892,18 @@ def _referee_rank(detection: dict) -> tuple:
 def select_referee_publications(candidates: List[dict], limit: int = MAX_REFEREES_PER_FRAME):
     """Keep the three strongest referee candidates.
 
-    A confirmed player who leaked into the list goes back to players.
+    A confirmed player who leaked into the list goes back to players, unless
+    his kit made him a referee (OfficialKitVote): the detector calls a dark
+    referee a player, so his lock says player.
     Everyone else who misses the cut is held: the role is not rewritten.
     """
     limit = max(0, int(limit))
     restored = []
     eligible = []
     for detection in candidates or []:
+        if detection.get("official_kit"):
+            eligible.append(detection)
+            continue
         locked = bool(detection.get("role_locked"))
         role = detection.get("role_class")
         if locked and int(role or -1) == GATE_PLAYER_CLASS_ID:

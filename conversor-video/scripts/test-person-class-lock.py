@@ -10,6 +10,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server/services/analysis/yolo"))
 
 from person_class import (  # noqa: E402
+    OfficialKitVote,
     PERSON_CLASS_CONFIRM_STREAK,
     PERSON_CLASS_UNLOCK_STREAK,
     PLAYER_TO_REFEREE_STREAK,
@@ -870,6 +871,15 @@ def test_dark_official_is_not_dropped_as_a_corner_flag():
     assert_equal(gate.metrics()["dropped_corner_flag"], 0, "he was not counted as a flag")
 
 
+def test_a_kit_referee_called_a_player_is_not_dropped_as_a_corner_flag():
+    """Spain clips: red and yellow boards behind the black referee made him a 'flag'."""
+    from person_class import _protected_official
+
+    player = {"raw_class_id": PLAYER, "locked_class_id": PLAYER, "profile": {"official_dark": 1.0}}
+    assert_equal(_protected_official(player), False, "a dark box the detector calls a player is not protected")
+    assert_equal(_protected_official({**player, "official_kit": True}), True, "a referee by his kit is protected")
+
+
 def test_broadcast_lime_yellow_is_official_and_team_shirts_are_not():
     def shirt(hue, saturation, value):
         image = solid_bgr(hue, saturation=saturation, value=value, width=48, height=120)
@@ -1002,6 +1012,42 @@ def test_referee_post_selection_keeps_three_and_holds_the_rest():
     assert_equal([item["track_id"] for item in restored], [5], "confirmed player leaves the referee list")
 
 
+def test_a_dark_kit_the_detector_calls_a_player_becomes_a_referee():
+    """Spain clips: the referee in black is a 'player' to the detector most of the time."""
+    vote = OfficialKitVote()
+    results = [vote.vote(14, 2, official_dark=True, team_match=False) for _ in range(12)]
+    assert results[8] is False, "not before 10 frames"
+    assert results[9] is True and results[-1] is True, "a referee after 10 dark frames with no team"
+    # A few frames in shadow or behind a player keep him a referee.
+    for _ in range(5):
+        assert vote.vote(14, 2, official_dark=False, team_match=False) is True
+    # Then many frames that are no longer dark release him.
+    for _ in range(10):
+        last = vote.vote(14, 2, official_dark=False, team_match=False)
+    assert last is False, "released once the dark kit is gone for most of the window"
+
+
+def test_a_dark_team_shirt_and_a_dark_goalkeeper_stay_as_they_are():
+    vote = OfficialKitVote()
+    # Barcelona's dark shirt matches its team: never counted.
+    assert not any(vote.vote(7, 2, official_dark=True, team_match=True) for _ in range(30))
+    # A goalkeeper in black: the detector calls him a goalkeeper now and then.
+    calls = [1, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+    assert not any(vote.vote(1, raw, official_dark=True, team_match=False) for raw in calls)
+    # A dark shirt that matches no team only now and then is not enough.
+    flicker = [vote.vote(9, 2, official_dark=(i % 3 == 0), team_match=False) for i in range(40)]
+    assert not any(flicker), "a shirt dark in one frame of three never latches"
+    assert vote.metrics()["tracks"] == 0
+
+
+def test_a_kit_referee_locked_as_player_is_published():
+    kit_referee = {"track_id": 14, "role_locked": True, "role_class": PLAYER, "official_kit": True, "confidence": 0.8}
+    leaked_player = {"track_id": 5, "role_locked": True, "role_class": PLAYER, "confidence": 0.9}
+    published, held, restored = select_referee_publications([leaked_player, kit_referee])
+    assert_equal([d["track_id"] for d in published], [14], "the kit referee is published")
+    assert_equal([d["track_id"] for d in restored], [5], "a locked player still goes back")
+
+
 if __name__ == "__main__":
     test_rejects_pole_flag_and_wide_box()
     test_player_does_not_become_referee_on_flicker()
@@ -1029,4 +1075,8 @@ if __name__ == "__main__":
     test_a_gap_resets_the_yellow_promotion()
     test_team_shirt_never_becomes_a_referee()
     test_a_long_team_run_can_release_a_referee()
+    test_a_dark_kit_the_detector_calls_a_player_becomes_a_referee()
+    test_a_dark_team_shirt_and_a_dark_goalkeeper_stay_as_they_are()
+    test_a_kit_referee_locked_as_player_is_published()
+    test_a_kit_referee_called_a_player_is_not_dropped_as_a_corner_flag()
     print("person class lock tests passed")
