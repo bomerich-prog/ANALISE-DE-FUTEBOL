@@ -76,6 +76,11 @@ class YoloAnalysisProvider extends AnalysisProvider {
       String(this.confidence),
       '--imgsz',
       String(this.imageSize),
+      // Replay log of possession and passes (event-record.json beside the
+      // video). It does not change detection; it lets a pass be re-checked
+      // in seconds without running YOLO again.
+      '--event-record',
+      path.join(outputDir, 'event-record.json'),
     ];
 
     if (this.debugLiveFrames) {
