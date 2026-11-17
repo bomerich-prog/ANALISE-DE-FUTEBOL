@@ -911,6 +911,36 @@ def _first_time_frames(receiver_takes_it):
     return frames
 
 
+def test_a_ball_kept_by_the_receiver_before_possession_confirms_is_a_pass():
+    """France v Spain, Olympic final: the ball reached 17 and stayed at his feet,
+    unseen or with him undetected, for 2.6 s before possession confirmed."""
+    passer = player(1, 1, 0.0, 0.0)
+    receiver = player(2, 1, 1500.0, 0.0)
+    both = [passer, receiver]
+    only_passer = [passer]
+    frames = []
+    frame = 1
+    for _ in range(8):
+        frames.append((frame, 1, "Team 1", both, ball(0.0, 0.0)))
+        frame += 1
+    for x in (300.0, 600.0, 900.0, 1200.0, 1480.0):
+        frames.append((frame, None, None, both, ball(x, 0.0)))
+        frame += 1
+    for step in range(70):
+        if step % 10 < 3:
+            frames.append((frame, None, None, both, ball(1500.0, 0.0)))
+        elif step % 10 < 6:
+            frames.append((frame, None, None, only_passer, ball(1520.0, 0.0)))
+        else:
+            frames.append((frame, None, None, both, None))
+        frame += 1
+    for _ in range(6):
+        frames.append((frame, 2, "Team 1", both, ball(1500.0, 0.0)))
+        frame += 1
+    metrics = run_frames(PassDetector(), frames)
+    assert_equal(metrics["total_passes"], 1, "the wait at his feet is not flight time")
+
+
 def test_a_first_time_touch_receives_the_pass():
     """Final Spain v Argentina: 7 to 14, played straight back; nobody held it after."""
     metrics = run_frames(PassDetector(), _first_time_frames(receiver_takes_it=False))
@@ -942,6 +972,7 @@ def test_a_receiver_whose_shirt_has_not_voted_waits_for_his_team():
         assert_equal(metrics["team_wait_resolved"], 1, "the decision waited for his shirt")
 
 if __name__ == "__main__":
+    test_a_ball_kept_by_the_receiver_before_possession_confirms_is_a_pass()
     test_a_first_time_touch_receives_the_pass()
     test_a_receiver_whose_shirt_has_not_voted_waits_for_his_team()
     test_ball_lost_at_the_receivers_feet_does_not_time_out_the_pass()

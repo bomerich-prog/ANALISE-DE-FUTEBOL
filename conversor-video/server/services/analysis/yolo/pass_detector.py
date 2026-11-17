@@ -973,6 +973,7 @@ class PassDetector:
         elif flight["arrival_observed"] and (
             flight["reception_lag_seconds"] <= PASS_MAX_RECEPTION_LAG_SECONDS
             or flight["lost_at_receiver"]
+            or flight["kept_by_receiver"]
         ):
             # The ball reached the receiver. If the detector then lost it at his
             # feet, the wait for possession to confirm is not the ball rolling loose.
@@ -1111,6 +1112,25 @@ class PassDetector:
             and sum(1 for entry in seen_after if not _within_control(entry, to_id)) < TOUCH_MIN_OBSERVED
         )
 
+        # The ball reached him and stayed with him until possession confirmed:
+        # whenever it was seen it was at his feet, or he was not detected in
+        # that frame. A contested wait (an opponent nearer the ball while he is
+        # in view) is not this.
+        with_him = sum(1 for entry in seen_after if _within_control(entry, to_id))
+        elsewhere = sum(
+            1
+            for entry in seen_after
+            if not _within_control(entry, to_id) and to_id in entry["players"]
+        )
+        # A ball seen at his feet most of the wait without possession
+        # confirming is a loose ball resting near him, not a reception.
+        kept_by_receiver = (
+            arrival_observed
+            and with_him >= TOUCH_MIN_OBSERVED
+            and elsewhere < TOUCH_MIN_OBSERVED
+            and with_him * 2 < len(after_arrival)
+        )
+
         return {
             "release_frame": int(release_frame),
             "arrival_frame": int(arrival_frame),
@@ -1120,6 +1140,7 @@ class PassDetector:
             "reception_lag_seconds": max(0, gained_frame - arrival_frame) / fps,
             "in_flight_samples": int(in_flight_samples),
             "lost_at_receiver": bool(lost_at_receiver),
+            "kept_by_receiver": bool(kept_by_receiver),
             "window_start": int(min(release_frame, from_frame)),
             "window_end": int(arrival_frame),
         }
