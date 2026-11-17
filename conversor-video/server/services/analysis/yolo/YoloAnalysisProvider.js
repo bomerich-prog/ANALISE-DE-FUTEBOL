@@ -81,6 +81,9 @@ class YoloAnalysisProvider extends AnalysisProvider {
       // in seconds without running YOLO again.
       '--event-record',
       path.join(outputDir, 'event-record.json'),
+      // Raw ids, stitched ids, roles and team votes per box (player-record.json).
+      '--player-record',
+      path.join(outputDir, 'player-record.json'),
     ];
 
     if (this.debugLiveFrames) {
