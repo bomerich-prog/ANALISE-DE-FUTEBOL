@@ -693,7 +693,7 @@ def test_verified_pixel_flight_can_run_past_one_second():
     assert_equal(event["from_track_id"], 11, "donor")
     assert_equal(event["to_track_id"], 30, "receiver")
     assert_equal(event["timing_tier"], "extended", "past the one second gap")
-    assert_equal(event["max_timing_seconds"], 2.0, "verified pixel budget")
+    assert_equal(event["max_timing_seconds"], 2.5, "verified pixel budget")
     assert_equal(event["trajectory"], "compatible", "the ball approaches the receiver")
 
 
@@ -721,10 +721,10 @@ def test_hidden_pixel_flight_past_one_second_is_rejected():
 
 def test_verified_pixel_flight_beyond_two_seconds_is_rejected():
     detector = PassDetector()
-    metrics = run_frames(detector, _seen_pixel_flight(cruise_frames=21))
-    assert_equal(metrics["total_passes"], 0, "2.5 s is a loose ball even when the ball is seen")
+    metrics = run_frames(detector, _seen_pixel_flight(cruise_frames=26))
+    assert_equal(metrics["total_passes"], 0, "3 s is a loose ball even when the ball is seen")
     assert_equal(metrics["rejected_events"][0]["reason"], "timeout", "the verified budget is two seconds")
-    assert_equal(metrics["rejected_events"][0]["max_timing_seconds"], 2.0, "verified pixel budget")
+    assert_equal(metrics["rejected_events"][0]["max_timing_seconds"], 2.5, "verified pixel budget")
 
 
 def pixel_player(track_id, team_id, x, y=300.0):

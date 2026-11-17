@@ -641,6 +641,17 @@ def test_a_fit_that_throws_the_grass_off_the_pitch_is_refused():
     assert_true(grass_inside_pitch(wrong, grass) < 0.75, "a wrong scale throws the grass off the pitch")
 
 
+def test_a_box_turned_towards_the_halfway_line_is_refused():
+    """France v Spain (Olympic final): a fit put the left box on the right end."""
+    from pitch_map import field_runs_backwards
+
+    _frame, _grass, to_image = _broadcast_centre([(960.0, 420.0), (962.0, 600.0), (640.0, 510.0), (1280.0, 512.0)])
+    right = np.linalg.inv(np.asarray(to_image, np.float64))
+    assert_true(not field_runs_backwards(right, (1080, 1920)), "the main camera runs left to right")
+    mirror = np.array([[-1.0, 0.0, 12000.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    assert_true(field_runs_backwards(mirror @ right, (1080, 1920)), "the mirrored pitch is refused")
+
+
 def test_grass_without_the_centre_marks_gives_no_centre():
     frame = np.full((1080, 1920, 3), (60, 120, 70), np.uint8)
     grass = np.full((1080, 1920), 255, np.uint8)
@@ -1104,6 +1115,7 @@ def main():
     test_a_watermark_is_not_asked_to_be_a_pitch_mark()
     test_a_wide_centre_with_the_far_touchline_hidden_is_read()
     test_a_fit_that_throws_the_grass_off_the_pitch_is_refused()
+    test_a_box_turned_towards_the_halfway_line_is_refused()
     test_grass_without_the_centre_marks_gives_no_centre()
     test_the_radar_keeps_real_distances_from_the_mark_it_was_read_from()
     test_the_radar_puts_a_player_where_the_centre_matrix_sees_him()

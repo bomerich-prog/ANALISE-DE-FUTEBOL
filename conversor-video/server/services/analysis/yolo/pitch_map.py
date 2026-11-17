@@ -398,6 +398,8 @@ def has_perspective(matrix):
 def broadcast_circle_fault(matrix, region, positive_x, grass_mask, frame_shape, pitch=None):
     """Why the circle this fit draws cannot come from the main camera, or None when it can."""
     pitch = pitch or SoccerPitchConfiguration()
+    if field_runs_backwards(matrix, frame_shape):
+        return "mirrored"
     length = float(pitch.length)
     width = float(pitch.width)
     if region == "centre":
@@ -452,6 +454,26 @@ def broadcast_circle_fault(matrix, region, positive_x, grass_mask, frame_shape, 
         if grass_inside_pitch(matrix, grass_mask, pitch) < BROADCAST_MIN_GRASS_INSIDE_PITCH:
             return "pitch_off_grass"
     return None
+
+
+def field_runs_backwards(matrix, frame_shape):
+    """True when the fit puts the pitch the wrong way round for the main camera.
+
+    The main camera stands on the near touchline, so across the picture the
+    pitch runs from one goal (left) to the other (right): of two points on the
+    same row, the right one is further along the pitch. A fit that matches the
+    front line and the arc of a box but turns the box towards the halfway line
+    (France v Spain, Olympic final, 10-14 s) runs the other way.
+    """
+    if matrix is None or frame_shape is None:
+        return False
+    height, width = int(frame_shape[0]), int(frame_shape[1])
+    points = np.array([[0.35 * width, 0.6 * height, 1.0], [0.65 * width, 0.6 * height, 1.0]])
+    field = points @ np.asarray(matrix, dtype=np.float64).T
+    if np.any(np.abs(field[:, 2]) < 1e-12) or np.any(field[:, 2] * field[0, 2] < 0):
+        return False
+    along = field[:, 0] / field[:, 2]
+    return bool(along[1] - along[0] <= 0.0)
 
 
 def grass_inside_pitch(matrix, grass_mask, pitch=None, step=24, margin_cm=500.0):

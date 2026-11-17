@@ -40,8 +40,9 @@ PASS_MAX_GAP_SECONDS = 1.0
 PASS_MAX_FLIGHT_SECONDS = 4.0
 # A pass measured in image pixels has no field length, so the one-second gap
 # is the normal budget. A flight the detector actually followed, moving toward
-# the receiver, can run longer than that gap without being a loose ball.
-PASS_VERIFIED_PIXEL_FLIGHT_SECONDS = 2.0
+# the receiver, can run longer than that gap without being a loose ball: a long
+# ball across the box took 2.2 s (France v Spain, Olympic final).
+PASS_VERIFIED_PIXEL_FLIGHT_SECONDS = 2.5
 PASS_MIN_BALL_SPEED_CM_S = 800.0
 PASS_MAX_BALL_SPEED_CM_S = 4000.0
 PASS_RECEPTION_ALLOWANCE_SECONDS = 0.5
@@ -280,6 +281,7 @@ class PassDetector:
         self.waiting_for_team = []
         self.team_wait_resolved = 0
         self.first_time_receptions = 0
+        self.possession_start = None
         self.deflection = None
         self.first_time = None
         self._last_ball = None
@@ -473,6 +475,8 @@ class PassDetector:
             self.flight_log.popleft()
 
     def _remember(self, possessor_id, possessor_team, possessor_pos, frame_number):
+        if possessor_id != self.last_possessor_id or self.possession_start is None:
+            self.possession_start = int(frame_number)
         self.last_possessor_id = possessor_id
         self.last_possessor_team = possessor_team
         if possessor_pos is not None:
@@ -485,6 +489,7 @@ class PassDetector:
             "from_team": self.last_possessor_team,
             "from_pos": self.last_possessor_pos,
             "from_frame": int(self.last_possessor_frame or frame_number),
+            "possession_start": int(self.possession_start if self.possession_start is not None else frame_number),
             "lost_frame": int(frame_number),
             "ball_missing_frames": 0 if observed_ball is not None else 1,
             "contested": bool(self.recent_contest)
@@ -707,6 +712,10 @@ class PassDetector:
             possessor_pos,
         )
         origin = self._claim_short_touch(to_id, possessor_team, from_id)
+        if origin is not None and int(origin["release_frame"]) < int(pending.get("possession_start", -1)):
+            # The touch left the foot before the passer even had the ball: it
+            # belongs to an older move, not to this pass.
+            origin = None
         if origin is not None:
             prepared = self._prepare_pass(
                 origin["id"],

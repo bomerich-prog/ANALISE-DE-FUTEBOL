@@ -154,7 +154,6 @@ def _event_key(event):
         "reason": event.get("reason"),
         "release_frame": event.get("release_frame"),
         "arrival_frame": event.get("arrival_frame"),
-        "max_timing_seconds": event.get("max_timing_seconds"),
     }
 
 
@@ -220,7 +219,7 @@ def test_fixture_replays_the_recorded_clip():
         )
         assert_equal(
             float(event["max_timing_seconds"]),
-            2.0 if verified else 1.0,
+            2.5 if verified else 1.0,
             f"frame {event.get('frame')} keeps its pixel window",
         )
     identity = possessor_identity_report(record)
@@ -243,7 +242,7 @@ def test_clip_events_follow_the_recorded_ball(replay):
     long_pass = passes["events"][3]
     assert_equal(long_pass["timing_tier"], "extended", "11 to 30 runs past one second")
     assert_equal(long_pass["trajectory"], "compatible", "the ball moves toward 30")
-    assert_equal(long_pass["max_timing_seconds"], 2.0, "the seen flight keeps the longer budget")
+    assert_equal(long_pass["max_timing_seconds"], 2.5, "the seen flight keeps the longer budget")
     assert_equal(passes["rejected_events"], [], "nothing was rejected")
     assert_equal(passes["turnover_events"], [], "team 0 keeps the ball")
     assert_equal(passes["dispute_events"], [], "no dispute")
