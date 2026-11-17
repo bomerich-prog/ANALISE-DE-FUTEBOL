@@ -380,6 +380,8 @@ BROADCAST_MAX_CIRCLE_RATIO = 0.45
 BROADCAST_MIN_CIRCLE_RATIO = 0.10
 BROADCAST_MAX_CIRCLE_TILT_DEG = 15.0
 BROADCAST_MIN_CIRCLE_ON_GRASS = 0.8
+# Share of the visible grass the fit must put on the pitch (5 m margin).
+BROADCAST_MIN_GRASS_INSIDE_PITCH = 0.75
 BROADCAST_MIN_CIRCLE_WIDTH_PX = 40.0
 _PENALTY_SPOT_CM = 1100.0
 _CIRCLE_RADIUS_CM = 915.0
@@ -423,37 +425,65 @@ def broadcast_circle_fault(matrix, region, positive_x, grass_mask, frame_shape, 
     minor = min(axis_a, axis_b)
     if major < BROADCAST_MIN_CIRCLE_WIDTH_PX:
         return "circle_degenerate"
-    # The penalty fit by line and arc is flat (no perspective): it draws every
-    # circle round by construction, so its shape says nothing about the camera.
-    # A flat centre fit (round circle found by Hough) stays held to the shape:
-    # the main camera never shows the centre circle round.
-    if region == "centre" or has_perspective(matrix):
-        if minor / major > BROADCAST_MAX_CIRCLE_RATIO:
-            return "circle_round"
-        if minor / major < BROADCAST_MIN_CIRCLE_RATIO:
-            return "circle_flat"
-        tilt = angle if axis_a >= axis_b else angle - 90.0
-        tilt = (tilt + 90.0) % 180.0 - 90.0
-        if abs(tilt) > BROADCAST_MAX_CIRCLE_TILT_DEG:
-            return "circle_tilted"
+    # A flat fit (no perspective, the penalty fit by line and arc) cannot be
+    # the main camera: checked by eye on France, Spain final and Spain middle,
+    # every flat fit drew the box and the arc where there is no paint, often on
+    # the boards and the stands next to the camera.
+    if not has_perspective(matrix):
+        return "flat_fit"
+    if minor / major > BROADCAST_MAX_CIRCLE_RATIO:
+        return "circle_round"
+    if minor / major < BROADCAST_MIN_CIRCLE_RATIO:
+        return "circle_flat"
+    tilt = angle if axis_a >= axis_b else angle - 90.0
+    tilt = (tilt + 90.0) % 180.0 - 90.0
+    if abs(tilt) > BROADCAST_MAX_CIRCLE_TILT_DEG:
+        return "circle_tilted"
     if grass_mask is not None:
         height, width_px = frame_shape[:2]
         inside = (image[:, 0] >= 0) & (image[:, 0] < width_px) & (image[:, 1] >= 0) & (image[:, 1] < height)
         if inside.any():
             has = grass_mask > 0
             xs = image[inside, 0].astype(int)
-            ys = image[inside, 1].astype(int)
-            if has_perspective(matrix):
-                top = np.where(has.any(axis=0), has.argmax(axis=0), height)
-                on_grass = float(np.mean(image[inside, 1] >= top[xs] - 10))
-            else:
-                # A flat fit can also land on the near boards and the stands
-                # on the camera side, below the grass: check each point.
-                near = cv2.dilate(has.astype(np.uint8), np.ones((15, 15), np.uint8)) > 0
-                on_grass = float(np.mean(near[ys, xs]))
+            top = np.where(has.any(axis=0), has.argmax(axis=0), height)
+            on_grass = float(np.mean(image[inside, 1] >= top[xs] - 10))
             if on_grass < BROADCAST_MIN_CIRCLE_ON_GRASS:
                 return "circle_in_stands"
+        if grass_inside_pitch(matrix, grass_mask, pitch) < BROADCAST_MIN_GRASS_INSIDE_PITCH:
+            return "pitch_off_grass"
     return None
+
+
+def grass_inside_pitch(matrix, grass_mask, pitch=None, step=24, margin_cm=500.0):
+    """Share of the visible grass that this image-to-field matrix puts on the pitch.
+
+    With the right matrix nearly all the grass in the picture is the pitch or
+    the few metres around it (85-100% on every checked clip). A fit read off
+    the boards or the railings throws most of the grass far outside the pitch.
+    """
+    if matrix is None or grass_mask is None:
+        return 1.0
+    pitch = pitch or SoccerPitchConfiguration()
+    height, width = grass_mask.shape[:2]
+    ys, xs = np.mgrid[0:height:step, 0:width:step]
+    ys = ys.ravel()
+    xs = xs.ravel()
+    on = grass_mask[ys, xs] > 0
+    if int(np.count_nonzero(on)) < 20:
+        return 1.0
+    points = np.column_stack([xs[on], ys[on], np.ones(int(np.count_nonzero(on)))]).astype(np.float64)
+    field = points @ np.asarray(matrix, dtype=np.float64).T
+    w = field[:, 2]
+    ahead = w > 1e-12
+    safe = np.where(ahead, w, 1.0)
+    fx = field[:, 0] / safe
+    fy = field[:, 1] / safe
+    inside = (
+        ahead
+        & (fx > -margin_cm) & (fx < float(pitch.length) + margin_cm)
+        & (fy > -margin_cm) & (fy < float(pitch.width) + margin_cm)
+    )
+    return float(np.mean(inside))
 
 
 def centre_on_paint(matrix, grass_mask, white_mask, pitch=None):

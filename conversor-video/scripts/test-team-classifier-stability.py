@@ -308,7 +308,22 @@ def test_cached_interval_skips_locked_tracks():
     assert_equal(lock.needs_observation(3, 1, 30), True, "unknown track")
 
 
+def test_a_covered_torso_does_not_vote():
+    """France v Spain: a French player covering a Spanish one made the new id
+    lock the French team, and three Spanish passes became turnovers."""
+    from run_yolo_analysis import occluded_person_indices
+
+    spanish = [1537, 700, 1581, 809]
+    french_on_top = [1536, 669, 1582, 740]
+    far_away = [200, 300, 240, 400]
+    assert_equal(occluded_person_indices([spanish, french_on_top, far_away], 3), {0, 1}, "both covered players skip the vote")
+    assert_equal(occluded_person_indices([spanish, far_away], 2), set(), "a clear player votes")
+    feet_touch = [1540, 805, 1580, 900]
+    assert_equal(occluded_person_indices([spanish, feet_touch], 1), set(), "a box touching only the legs does not block the torso")
+
+
 if __name__ == "__main__":
+    test_a_covered_torso_does_not_vote()
     test_blue_and_red_shirts_have_opposite_scores()
     test_anchor_swaps_raw_kmeans_ids_to_shirt_color()
     test_two_runs_with_swapped_labels_share_semantic_ids()

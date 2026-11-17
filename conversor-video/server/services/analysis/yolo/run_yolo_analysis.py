@@ -735,6 +735,34 @@ def is_crop_blurry(crop, min_laplacian_variance):
     return cv2.Laplacian(gray_crop, cv2.CV_64F).var() < min_laplacian_variance
 
 
+TEAM_VOTE_MAX_OVERLAP = 0.15
+# Frames after an occlusion during which the shirt still does not vote.
+TEAM_VOTE_OCCLUSION_MEMORY = 3
+
+
+def occluded_person_indices(boxes, count):
+    """Indices among the first `count` boxes whose torso another person covers.
+
+    A box counts as occluded when another person's box covers at least 15% of
+    its upper two thirds (the torso the team colour is read from).
+    """
+    occluded = set()
+    for index in range(min(int(count), len(boxes))):
+        x1, y1, x2, y2 = [float(value) for value in boxes[index][:4]]
+        torso_y2 = y1 + (y2 - y1) * 0.66
+        area = max(1.0, (x2 - x1) * (torso_y2 - y1))
+        for other_index, other in enumerate(boxes):
+            if other_index == index:
+                continue
+            ox1, oy1, ox2, oy2 = [float(value) for value in other[:4]]
+            width = min(x2, ox2) - max(x1, ox1)
+            height = min(torso_y2, oy2) - max(y1, oy1)
+            if width > 0 and height > 0 and width * height / area >= TEAM_VOTE_MAX_OVERLAP:
+                occluded.add(index)
+                break
+    return occluded
+
+
 def stabilize_player_referee_class(class_history, fallback_class_id):
     if not class_history:
         return fallback_class_id
@@ -3168,6 +3196,8 @@ def analyze(args):
     }
     team_prediction_counts = {0: 0, 1: 0}
     team_track_lock = TeamTrackLock()
+    team_occluded_votes = 0
+    last_occluded_frame = {}
     team_classifier_cache_metrics = {
         "predict_calls_before_cache": 0,
         "predict_calls_after_cache": 0,
@@ -4347,6 +4377,12 @@ def analyze(args):
                 accepted_player_detections[idx] for idx, _verifying in detections_needing_prediction
             ]
             prediction_crops = get_player_crops_from_payload(frame, detections_to_predict)
+            occluded_players = occluded_person_indices(
+                [detection["box"] for detection in accepted_player_detections]
+                + [detection["box"] for detection in accepted_goalkeeper_detections]
+                + [detection["box"] for detection in accepted_referee_detections],
+                len(accepted_player_detections),
+            )
             predicted_team_ids = team_classifier.predict(prediction_crops) if prediction_crops else np.array([])
             for prediction_idx, (detection_idx, verifying) in enumerate(detections_needing_prediction):
                 predicted_team_id = None
@@ -4356,6 +4392,18 @@ def analyze(args):
                         predicted_team_id = raw_team_id
                 detection = accepted_player_detections[detection_idx]
                 track_id = int(detection.get("track_id", -1))
+                if detection_idx in occluded_players and track_id >= 0:
+                    last_occluded_frame[track_id] = current_frame_number
+                recently_occluded = (
+                    track_id >= 0
+                    and current_frame_number - last_occluded_frame.get(track_id, -10**9) <= TEAM_VOTE_OCCLUSION_MEMORY
+                )
+                if predicted_team_id is not None and (detection_idx in occluded_players or recently_occluded):
+                    # The torso crop holds another player's shirt too, or did a
+                    # moment ago (the detector can miss the other player for a
+                    # frame while he still covers this one): no vote.
+                    predicted_team_id = None
+                    team_occluded_votes += 1
                 team_vote_by_detection[id(detection)] = predicted_team_id
                 if track_id >= 0:
                     detection["team_id"] = team_track_lock.assign(
@@ -5068,6 +5116,7 @@ def analyze(args):
             "frame_examples": team_classification_frame_examples,
             "color_anchor": team_classifier.color_anchor,
             "stability": team_track_lock.metrics(),
+            "occluded_votes_skipped": int(team_occluded_votes),
         },
         "goalkeeper_assignment": {
             "method": "official centroid proximity heuristic from roboflow/sports",
