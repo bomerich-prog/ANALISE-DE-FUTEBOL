@@ -31,6 +31,15 @@ BOX_HALF_CM = 2016.0
 BOX_DEPTH_CM = 1650.0
 
 MAX_COST_PX = 2.5
+# Far stadiums: the far touchline hides under the boards and the score band
+# and is no ink at all, so its marks sit at the cost cap and lift the mean
+# over 2.5 px even with the circle and the halfway line on the paint. Such a
+# fit still counts when the best 80% of the marks are within 1 px, the circle
+# within 0.5 px, and the full mean under 5 px.
+TRIMMED_SHARE = 0.8
+MAX_TRIMMED_COST_PX = 1.0
+MAX_CIRCLE_COST_PX = 0.5
+MAX_COST_WITH_HIDDEN_PX = 5.0
 MAX_UNEXPLAINED_CM = 65.0
 MIN_CIRCLE_ON_INK = 0.6
 MIN_CIRCLE_ON_GRASS = 0.9
@@ -470,6 +479,33 @@ class _Frame:
         weights = _WEIGHTS[inside]
         return float(np.sum(reach * weights) / np.sum(weights))
 
+    def fits_with_hidden_lines(self, field_to_image):
+        """True when the circle and most marks are on the paint and only a hidden part misses."""
+        image = _project(field_to_image, _MARKS)
+        inside = (
+            np.isfinite(image).all(axis=1)
+            & (image[:, 0] >= 0) & (image[:, 0] < self.width)
+            & (image[:, 1] >= 0) & (image[:, 1] < self.height)
+        )
+        circle = inside[:_CIRCLE_COUNT]
+        if int(np.count_nonzero(circle)) < _CIRCLE_COUNT * 0.5:
+            return False
+        xs = image[inside, 0].astype(np.int64)
+        ys = image[inside, 1].astype(np.int64)
+        reach = np.minimum(self.distance[ys, xs], _COST_CAP_PX)
+        if self.grass_top is not None:
+            reach = np.where(ys >= self.grass_top[xs] - 25.0, reach, _COST_CAP_PX)
+        weights = _WEIGHTS[inside]
+        order = np.argsort(reach)
+        share = np.cumsum(weights[order]) / np.sum(weights)
+        keep = order[share <= TRIMMED_SHARE]
+        if keep.size == 0:
+            return False
+        trimmed = float(np.sum(reach[keep] * weights[keep]) / np.sum(weights[keep]))
+        ring = image[:_CIRCLE_COUNT][circle]
+        ring_cost = float(np.mean(np.minimum(self.distance[ring[:, 1].astype(np.int64), ring[:, 0].astype(np.int64)], _COST_CAP_PX)))
+        return trimmed <= MAX_TRIMMED_COST_PX and ring_cost <= MAX_CIRCLE_COST_PX
+
     def unexplained(self, field_to_image):
         """Mean distance, in cm, from the long paint in the picture to the nearest pitch mark."""
         if len(self.samples) == 0:
@@ -640,7 +676,9 @@ def _accept(view, found):
     if found is None:
         return None
     chamfer = view.chamfer(found[1])
-    if chamfer is None or chamfer > MAX_COST_PX:
+    if chamfer is None or chamfer > MAX_COST_WITH_HIDDEN_PX:
+        return None
+    if chamfer > MAX_COST_PX and not view.fits_with_hidden_lines(found[1]):
         return None
     unexplained = view.unexplained(found[1])
     if unexplained > MAX_UNEXPLAINED_CM or view.circle_on_ink(found[1]) < MIN_CIRCLE_ON_INK:
@@ -715,4 +753,8 @@ def centre_holds(matrix, grass, ink):
     view.distance = cv2.distanceTransform(cv2.bitwise_not(ink), cv2.DIST_L2, 3)
     view.grass_top = _grass_top(grass) if grass is not None else None
     chamfer = view.chamfer(field_to_image)
-    return chamfer is not None and chamfer <= MAX_COST_PX and view.circle_on_ink(field_to_image) >= MIN_CIRCLE_ON_INK
+    if chamfer is None or chamfer > MAX_COST_WITH_HIDDEN_PX:
+        return False
+    if chamfer > MAX_COST_PX and not view.fits_with_hidden_lines(field_to_image):
+        return False
+    return view.circle_on_ink(field_to_image) >= MIN_CIRCLE_ON_INK

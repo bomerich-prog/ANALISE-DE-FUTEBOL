@@ -594,6 +594,23 @@ def test_a_watermark_is_not_asked_to_be_a_pitch_mark():
         error = _centre_error(report, to_image)
         assert_true(error < 6.0, f"the circle beside the watermark lands on the paint ({error:.1f} px)")
 
+def test_a_wide_centre_with_the_far_touchline_hidden_is_read():
+    """England v Slovenia: touchlines lost under the boards lifted the mean over 2.5 px."""
+    from pitch_centre import MAX_COST_PX, _Frame, _accept
+
+    frame, grass, to_image = _broadcast_centre([(960.0, 420.0), (962.0, 600.0), (640.0, 510.0), (1280.0, 512.0)])
+    ink = line_ink(frame, grass, None)
+    ink[:200] = 0  # no paint left on the far touchline
+    ink[780:] = 0  # nor on the near one, under the score band and out of focus
+    view = _Frame(ink, grass)
+    true = np.asarray(to_image, np.float64)
+    assert_true(view.chamfer(true) > MAX_COST_PX, "the hidden touchline lifts the mean over the old limit")
+    assert_true(view.fits_with_hidden_lines(true), "the circle and the rest of the marks are on the paint")
+    assert_true(_accept(view, (0.0, true)) is not None, "the true matrix is accepted")
+    shifted = np.array([[1.0, 0.0, 14.0], [0.0, 1.0, 6.0], [0.0, 0.0, 1.0]]) @ true
+    assert_true(not view.fits_with_hidden_lines(shifted), "a matrix 15 px off the circle is not")
+
+
 def test_grass_without_the_centre_marks_gives_no_centre():
     frame = np.full((1080, 1920, 3), (60, 120, 70), np.uint8)
     grass = np.full((1080, 1920), 255, np.uint8)
@@ -1052,6 +1069,7 @@ def main():
     test_paint_in_the_stands_is_not_asked_to_be_a_pitch_mark()
     test_a_close_circle_touched_by_players_is_still_a_curve()
     test_a_watermark_is_not_asked_to_be_a_pitch_mark()
+    test_a_wide_centre_with_the_far_touchline_hidden_is_read()
     test_grass_without_the_centre_marks_gives_no_centre()
     test_the_radar_keeps_real_distances_from_the_mark_it_was_read_from()
     test_the_radar_puts_a_player_where_the_centre_matrix_sees_him()
