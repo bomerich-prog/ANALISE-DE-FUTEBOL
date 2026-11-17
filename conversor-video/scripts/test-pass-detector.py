@@ -952,6 +952,36 @@ def test_a_first_time_touch_receives_the_pass():
     assert_equal(controlled["first_time_receptions"], 0, "and goes the normal way")
 
 
+def test_a_first_time_touch_seen_only_after_the_ball_turned_back():
+    """Final Spain on the PC: 14 was out of the detections when the ball reached
+    him, and the first frame that saw them together already had the ball going
+    back. That step must not be read as the approach."""
+    a = player(1, 0, 0.0, 0.0)
+    b = player(2, 0, 300.0, 0.0)
+    players = [a, b]
+    frames = []
+    frame = 1
+    for _ in range(8):
+        frames.append((frame, 1, "Team 0", players, ball(0.0, 0.0)))
+        frame += 1
+    for x in (60.0, 120.0, 180.0, 250.0):
+        frames.append((frame, None, None, players, ball(x, 0.0)))
+        frame += 1
+    frames.append((frame, None, None, [a], ball(290.0, 0.0)))
+    frame += 1
+    frames.append((frame, None, None, players, ball(275.0, 0.0)))
+    frame += 1
+    for _ in range(4):
+        frames.append((frame, None, None, players, None))
+        frame += 1
+    for x in (230.0, 190.0, 150.0, 110.0, 70.0, 40.0, 20.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0):
+        frames.append((frame, None, None, players, ball(x, -60.0)))
+        frame += 1
+    metrics = run_frames(PassDetector(), frames)
+    assert_equal(metrics["total_passes"], 1, "the approach direction comes from before the touch")
+    assert_equal(metrics["first_time_receptions"], 1, "read as a first-time touch")
+
+
 def test_a_receiver_whose_shirt_has_not_voted_waits_for_his_team():
     """France v Spain: an opponent covered the receiver, his new id had no team
     yet, and the pass to him and his next pass were both dropped."""
@@ -972,6 +1002,7 @@ def test_a_receiver_whose_shirt_has_not_voted_waits_for_his_team():
         assert_equal(metrics["team_wait_resolved"], 1, "the decision waited for his shirt")
 
 if __name__ == "__main__":
+    test_a_first_time_touch_seen_only_after_the_ball_turned_back()
     test_a_ball_kept_by_the_receiver_before_possession_confirms_is_a_pass()
     test_a_first_time_touch_receives_the_pass()
     test_a_receiver_whose_shirt_has_not_voted_waits_for_his_team()

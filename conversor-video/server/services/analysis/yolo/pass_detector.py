@@ -285,6 +285,8 @@ class PassDetector:
         self.deflection = None
         self.first_time = None
         self._last_ball = None
+        # Ball step that ended at _last_ball (the step before the current one).
+        self._ball_step = None
         self._fps = 25.0
         self.total_passes = 0
         self.raw_candidate_passes = 0
@@ -367,6 +369,12 @@ class PassDetector:
         else:
             self.deflection = None
         if observed_ball is not None:
+            last = self._last_ball
+            self._ball_step = (
+                (observed_ball["x"] - last["x"], observed_ball["y"] - last["y"])
+                if last is not None and last["space"] == observed_ball["space"]
+                else None
+            )
             self._last_ball = observed_ball
         self._retry_waiting(frame_number, fps)
         self._log_frame(frame_number, fps, players, ball)
@@ -633,6 +641,22 @@ class PassDetector:
         if track_id == from_id or team != from_team or distance > radius:
             return
         if approach is None or distance <= approach["distance"]:
+            # The frame of the touch can already move the ball back out. That
+            # step is the reply, not the approach: keep the approach direction,
+            # from the earlier approach or from the step before this one.
+            prior = self._ball_step
+            if (
+                approach is not None
+                and approach["id"] == track_id
+                and incoming[0] * approach["incoming"][0] + incoming[1] * approach["incoming"][1] < 0
+            ):
+                incoming = approach["incoming"]
+            elif (
+                prior is not None
+                and math.hypot(*prior) >= 1.0
+                and incoming[0] * prior[0] + incoming[1] * prior[1] < 0
+            ):
+                incoming = prior
             self.deflection = {
                 "id": track_id,
                 "team": team,
