@@ -912,6 +912,7 @@ class BallDetectorYOLO:
         self.model = model
         self.confidence_threshold = float(confidence_threshold)
         self.source_name = "yolo-football-ball-detection"
+        self.fallback_640_frames = 0
 
     def detect(self, frame, roi_xyxy=None):
         roi_frame = frame
@@ -923,13 +924,30 @@ class BallDetectorYOLO:
             offset_x = x1
             offset_y = y1
 
+        size = ball_inference_size(roi_frame.shape)
         result = self.model(
             roi_frame,
-            imgsz=ball_inference_size(roi_frame.shape),
+            imgsz=size,
             conf=self.confidence_threshold,
             verbose=False,
         )[0]
         detections = extract_ball_detections(result)
+        if size > BALL_MIN_INFERENCE_PX:
+            # Each resolution misses balls the other sees. Barcelona (1338x750
+            # recording): the orange ball at 0.80 at 640 px and nothing at 1344,
+            # and a boot at 0.55 at 1344 where 640 px holds the ball at 0.60.
+            # Spain (1920x1080): the 10 px ball is lost at 640 px. Both readings
+            # go to the candidates; NMS and the trajectory choose.
+            result = self.model(
+                roi_frame,
+                imgsz=BALL_MIN_INFERENCE_PX,
+                conf=self.confidence_threshold,
+                verbose=False,
+            )[0]
+            extra = extract_ball_detections(result)
+            self.fallback_640_frames += int(len(extra) > 0 and len(detections) == 0)
+            if len(extra) > 0:
+                detections = extra if len(detections) == 0 else sv.Detections.merge([detections, extra])
         if roi_xyxy is None or len(detections) == 0:
             return detections
         return translate_detections_to_full_frame(detections, offset_x, offset_y)
@@ -5130,6 +5148,7 @@ def analyze(args):
                 "referee_selection": dict(referee_selection_stats),
                 "official_kit_referee": official_kit_vote.metrics(),
                 "position_keeper": dict(position_keeper.metrics(), frames=int(position_keeper_frames)),
+                "ball_640_fallback_frames": int(getattr(ball_detector, "fallback_640_frames", 0)),
                 "player_track_stitch": player_track_stitch.metrics(),
                 "rejected_non_person": rejected_non_person,
                 "rejected_non_person_reasons": rejected_non_person_reasons,
