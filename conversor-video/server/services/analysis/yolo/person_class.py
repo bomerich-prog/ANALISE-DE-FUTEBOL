@@ -900,7 +900,12 @@ class OfficialKitVote:
         if state is None:
             state = {"votes": deque(maxlen=self.window), "keepers": 0, "latched": False}
             self._tracks[int(track_id)] = state
-        state["votes"].append(1 if official_dark and not team_match else 0)
+        # A torso that could not be measured (a mixed or covered crop) is no
+        # evidence either way: Barcelona's dark blue-garnet kit abstained and was
+        # counted as "matches no team", so the receiver of a pass became the
+        # referee for 33 frames.
+        if team_match is not None:
+            state["votes"].append(1 if official_dark and not team_match else 0)
         if int(raw_class_id) == GATE_GOALKEEPER_CLASS_ID:
             state["keepers"] += 1
         if state["keepers"] > OFFICIAL_KIT_GOALKEEPER_MAX:

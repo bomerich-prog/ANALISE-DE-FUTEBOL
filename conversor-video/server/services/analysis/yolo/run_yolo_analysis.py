@@ -3632,7 +3632,9 @@ def analyze(args):
             else:
                 kit_odd = not kit_fit
             referee_blocked = (neon_shirt or team_match) and not official_dark
-            official_kit_referee = official_kit_vote.vote(track_id, raw_class_id, official_dark, team_match)
+            official_kit_referee = official_kit_vote.vote(
+                track_id, raw_class_id, official_dark, None if kit_fit is None else bool(kit_fit)
+            )
             prefer_referee = bool(official_yellow) and not referee_blocked
             if track_id >= 0 and raw_class_id in {PLAYER_CLASS_ID, GOALKEEPER_CLASS_ID, REFEREE_CLASS_ID}:
                 previous_raw_class = last_raw_player_referee_class.get(track_id)
