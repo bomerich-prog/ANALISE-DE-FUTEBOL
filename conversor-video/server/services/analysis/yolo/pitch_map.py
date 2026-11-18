@@ -496,7 +496,10 @@ def grass_inside_pitch(matrix, grass_mask, pitch=None, step=24, margin_cm=500.0)
     points = np.column_stack([xs[on], ys[on], np.ones(int(np.count_nonzero(on)))]).astype(np.float64)
     field = points @ np.asarray(matrix, dtype=np.float64).T
     w = field[:, 2]
-    ahead = w > 1e-12
+    # A homography holds up to a scale of either sign: the grass is in front
+    # of the camera on the side of the horizon where most of it lies.
+    front = 1.0 if float(np.median(w)) >= 0.0 else -1.0
+    ahead = w * front > 1e-12
     safe = np.where(ahead, w, 1.0)
     fx = field[:, 0] / safe
     fy = field[:, 1] / safe
@@ -1261,10 +1264,13 @@ def box_from_sides(measured, grass, ink, pitch=None):
     else:
         backs = None
     width = float(pitch.width)
-    y_anchor = width / 2.0 - sign * _BOX_HALF_CM
-    y_other = width / 2.0 + sign * _BOX_HALF_CM
     distance = cv2.distanceTransform(cv2.bitwise_not(ink), cv2.DIST_L2, 3)
     toward_goal = float((meeting - corner)[0])
+    y_anchor = width / 2.0 - sign * _BOX_HALF_CM
+    y_other = width / 2.0 + sign * _BOX_HALF_CM
+    found_boxes = []
+    # Both goal ends can fit the marks. The first whose grass stays on the
+    # pitch, running the right way for the main camera, is kept.
     for positive_x in (toward_goal >= 0.0, toward_goal < 0.0):
         front = _front_x(positive_x, pitch)
         goal = float(pitch.length) if positive_x else 0.0
@@ -1324,18 +1330,27 @@ def box_from_sides(measured, grass, ink, pitch=None):
         scale = local_scale(matrix, positive_x, pitch)
         if scale is None:
             continue
-        return {
-            "matrix": matrix,
-            "positive_x": bool(positive_x),
-            "cm_per_px": scale,
-            "region": "penalty",
-            "projective": True,
-            "toward_goal_cm": patch["toward_goal_cm"],
-            "toward_arc_cm": patch["toward_arc_cm"],
-            "area_px": 0.5 * (front_px + back_px) * depth_px,
-            "cost": cost,
-        }
-    return None
+        found_boxes.append(
+            {
+                "matrix": matrix,
+                "positive_x": bool(positive_x),
+                "cm_per_px": scale,
+                "region": "penalty",
+                "projective": True,
+                "toward_goal_cm": patch["toward_goal_cm"],
+                "toward_arc_cm": patch["toward_arc_cm"],
+                "area_px": 0.5 * (front_px + back_px) * depth_px,
+                "cost": cost,
+            }
+        )
+    if not found_boxes:
+        return None
+    for box in found_boxes:
+        if field_runs_backwards(box["matrix"], ink.shape) or grass is None:
+            continue
+        if grass_inside_pitch(box["matrix"], grass, pitch) >= BROADCAST_MIN_GRASS_INSIDE_PITCH:
+            return box
+    return found_boxes[0]
 
 
 def _painted_reach(ink, origin, direction, gap_px=40.0):

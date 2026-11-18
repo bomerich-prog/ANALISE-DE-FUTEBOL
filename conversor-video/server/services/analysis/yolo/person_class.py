@@ -424,16 +424,57 @@ def _clip_crop(frame, box):
     return crop
 
 
-def _flag_hue_mask(hsv) -> np.ndarray:
+# Under warm stadium light the grass turns yellow-green (Bayern v Real Madrid:
+# hue 40, saturation 180, value 125), inside the yellow and flag bands. The
+# grass of a box is its outer ring; pixels of that hue are not cloth.
+GRASS_RING_SHARE = 0.12
+GRASS_RING_MIN_SATURATION = 60
+GRASS_HUE_MIN = 25
+GRASS_HUE_MAX = 85
+GRASS_HUE_TOLERANCE = 4
+
+
+def _ring_grass_hue(hsv) -> Optional[float]:
+    """Hue of the grass around the player, read on the border of the box."""
+    height, width = hsv.shape[:2]
+    band_y = max(1, int(round(height * GRASS_RING_SHARE)))
+    band_x = max(1, int(round(width * GRASS_RING_SHARE)))
+    ring = np.concatenate(
+        [
+            hsv[:, :band_x].reshape(-1, 3),
+            hsv[:, width - band_x :].reshape(-1, 3),
+            hsv[height - band_y :, band_x : width - band_x].reshape(-1, 3),
+        ]
+    )
+    if ring.size == 0:
+        return None
+    green = (
+        (ring[:, 0] >= GRASS_HUE_MIN)
+        & (ring[:, 0] <= GRASS_HUE_MAX)
+        & (ring[:, 1] >= GRASS_RING_MIN_SATURATION)
+    )
+    if float(green.mean()) < 0.5:
+        return None
+    return float(np.median(ring[green, 0]))
+
+
+def _grass_like(hsv, grass_hue) -> np.ndarray:
+    if grass_hue is None:
+        return np.zeros(hsv.shape[:2], dtype=bool)
+    hue = hsv[:, :, 0].astype(np.float32)
+    return (np.abs(hue - float(grass_hue)) <= GRASS_HUE_TOLERANCE) & (hsv[:, :, 1] >= GRASS_RING_MIN_SATURATION)
+
+
+def _flag_hue_mask(hsv, grass_hue=None) -> np.ndarray:
     """Yellow, orange and red cloth. OpenCV hue stops at 179."""
     hue = hsv[:, :, 0]
     saturation = hsv[:, :, 1]
     value = hsv[:, :, 2]
     colored = (hue <= 42) | (hue >= 158)
-    return colored & (saturation > 80) & (value > 60)
+    return colored & (saturation > 80) & (value > 60) & ~_grass_like(hsv, grass_hue)
 
 
-def _torso_yellow_fraction(hsv) -> float:
+def _torso_yellow_fraction(hsv, grass_hue=None) -> float:
     """Neon yellow shirt. OpenCV hue stops at 179, and this band is the kit."""
     if hsv.size == 0:
         return 0.0
@@ -445,6 +486,7 @@ def _torso_yellow_fraction(hsv) -> float:
         & (hue <= YELLOW_HUE_MAX)
         & (saturation >= YELLOW_SATURATION_MIN)
         & (value >= YELLOW_VALUE_MIN)
+        & ~_grass_like(hsv, grass_hue)
     )
     return float(yellow.mean())
 
@@ -483,6 +525,7 @@ def appearance_profile(frame, box) -> Dict[str, float]:
     if crop_height < 2 or crop_width < 2:
         return neutral
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    grass_hue = _ring_grass_hue(hsv)
     top = hsv[: max(1, crop_height // 3)]
     torso_y1 = int(crop_height * 0.22)
     torso_y2 = max(torso_y1 + 1, int(crop_height * 0.62))
@@ -515,11 +558,11 @@ def appearance_profile(frame, box) -> Dict[str, float]:
             official_dark = 1.0
     return {
         "aspect": float(crop_width) / float(crop_height),
-        "top_flag": float(_flag_hue_mask(top).mean()),
-        "torso_flag": float(_flag_hue_mask(torso).mean()),
+        "top_flag": float(_flag_hue_mask(top, grass_hue).mean()),
+        "torso_flag": float(_flag_hue_mask(torso, grass_hue).mean()),
         "low_chroma": float(dark_neutral.mean()),
         "bottom_pole": 1.0 if _bottom_is_pole(hsv) else 0.0,
-        "torso_yellow": _torso_yellow_fraction(torso),
+        "torso_yellow": _torso_yellow_fraction(torso, grass_hue),
         "neon_green": float(neon.mean()) if neon.size else 0.0,
         "official_dark": official_dark,
     }

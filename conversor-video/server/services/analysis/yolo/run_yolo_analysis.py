@@ -24,6 +24,7 @@ from ball_chain import BallChains, BallReach
 from ball_flight import BallFlightPath
 from ball_heatmap import BallHeatmapAccumulator
 from event_replay import record_event_frame, write_event_record
+from goalkeeper_position import PositionKeeper
 from player_identity_record import record_player, write_player_record
 from pass_detector import PassDetector
 from player_stats import PlayerStatsAccumulator
@@ -3220,6 +3221,8 @@ def analyze(args):
     person_class_lock = PersonClassLock()
     appearance_gate = TrackAppearanceGate()
     official_kit_vote = OfficialKitVote()
+    position_keeper = PositionKeeper()
+    position_keeper_frames = 0
     referee_selection_stats = {
         "limit": 3,
         "published": 0,
@@ -3598,8 +3601,18 @@ def analyze(args):
             official_yellow = float(role_profile.get("torso_yellow", 0.0)) >= YELLOW_TORSO_MIN
             person_crop = sv.crop_image(frame, np.asarray(box, dtype=np.float32))
             team_match = False
+            kit_fit = None
             if person_crop is not None and getattr(person_crop, "size", 0) > 0:
-                team_match = bool(team_classifier.matches_team(person_crop))
+                kit_fit = team_classifier.kit_fit(person_crop)
+                team_match = bool(kit_fit)
+            if neon_shirt or raw_class_id == GOALKEEPER_CLASS_ID:
+                kit_odd = True
+            elif kit_fit is None or official_dark:
+                # A dark kit off both teams is the referee's first: it does
+                # not make a goalkeeper unless the detector says so.
+                kit_odd = None
+            else:
+                kit_odd = not kit_fit
             referee_blocked = (neon_shirt or team_match) and not official_dark
             official_kit_referee = official_kit_vote.vote(track_id, raw_class_id, official_dark, team_match)
             prefer_referee = bool(official_yellow) and not referee_blocked
@@ -3661,6 +3674,7 @@ def analyze(args):
                 "field_y": None,
                 "role_locked": track_id >= 0 and person_class_lock.is_locked(track_id),
                 "role_class": class_id,
+                "kit_odd": kit_odd,
                 "official_score": official_score,
                 "referee_frames": (
                     person_class_lock.referee_continuity(track_id) if track_id >= 0 else 0
@@ -4340,6 +4354,35 @@ def analyze(args):
                 accepted_goalkeeper_detections.append(restored)
             else:
                 accepted_player_detections.append(restored)
+        # The last man of the line in a kit of his own is the goalkeeper, even
+        # when the detector calls him a player.
+        position_keepers = position_keeper.update(
+            [
+                {
+                    "track_id": int(detection.get("track_id", -1)),
+                    "x": float(detection_foot_point(detection["box"])[0]),
+                    "y": float(detection_foot_point(detection["box"])[1]),
+                    "height": float(detection["box"][3]) - float(detection["box"][1]),
+                    "kit_odd": detection.get("kit_odd"),
+                }
+                for detection in list(accepted_player_detections) + list(accepted_goalkeeper_detections)
+            ]
+        )
+        if position_keepers:
+            moved = [
+                detection
+                for detection in accepted_player_detections
+                if int(detection.get("track_id", -1)) in position_keepers
+            ]
+            if moved:
+                accepted_player_detections = [
+                    detection for detection in accepted_player_detections if detection not in moved
+                ]
+                for detection in moved:
+                    detection["role_class"] = GOALKEEPER_CLASS_ID
+                    detection["position_keeper"] = True
+                accepted_goalkeeper_detections.extend(moved)
+                position_keeper_frames += len(moved)
         referee_selection_stats["published"] += len(accepted_referee_detections)
         referee_selection_stats["held"] += len(held_referees)
         referee_selection_stats["restored"] += len(restored_roles)
@@ -4471,12 +4514,18 @@ def analyze(args):
                     goalkeepers_with_team_id += 1
             track_id = int(detection.get("track_id", -1))
             if track_id >= 0:
-                detection["team_id"] = team_track_lock.assign(
-                    track_id,
-                    goalkeeper_team_id,
-                    current_frame_number,
-                    team_track_lock.is_locked(track_id),
-                )
+                # The centroid vote of every frame decides, not the first
+                # votes: a keeper first seen as a player locked the shirt team.
+                keeper_team = position_keeper.vote_team(track_id, goalkeeper_team_id)
+                if keeper_team is not None:
+                    detection["team_id"] = team_track_lock.force(track_id, keeper_team, current_frame_number)
+                else:
+                    detection["team_id"] = team_track_lock.assign(
+                        track_id,
+                        goalkeeper_team_id,
+                        current_frame_number,
+                        team_track_lock.is_locked(track_id),
+                    )
             else:
                 detection["team_id"] = goalkeeper_team_id
             team_vote_by_detection[id(detection)] = goalkeeper_team_id
@@ -5080,6 +5129,7 @@ def analyze(args):
                 "appearance_gate": appearance_gate.metrics(),
                 "referee_selection": dict(referee_selection_stats),
                 "official_kit_referee": official_kit_vote.metrics(),
+                "position_keeper": dict(position_keeper.metrics(), frames=int(position_keeper_frames)),
                 "player_track_stitch": player_track_stitch.metrics(),
                 "rejected_non_person": rejected_non_person,
                 "rejected_non_person_reasons": rejected_non_person_reasons,

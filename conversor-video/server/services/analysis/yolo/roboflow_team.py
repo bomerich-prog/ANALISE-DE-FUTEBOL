@@ -359,6 +359,23 @@ class TeamTrackLock:
         state["contradiction_streak"] += 1
         return int(state["team_id"])
 
+    def force(self, track_id: int, team_id: int, frame_number: int) -> int:
+        """Set a locked team decided outside the shirt vote (a goalkeeper)."""
+        track_id = int(track_id)
+        state = self.tracks.get(track_id)
+        if state is not None and state["locked"] and int(state["team_id"]) != int(team_id):
+            self.team_changes_after_lock.append(
+                {"track_id": track_id, "frame": int(frame_number), "to": int(team_id), "reason": "goalkeeper"}
+            )
+        self.tracks[track_id] = {
+            "team_id": int(team_id),
+            "locked": True,
+            "confirm_streak": self.confirm_streak,
+            "contradiction_streak": 0,
+            "last_checked_frame": int(frame_number),
+        }
+        return int(team_id)
+
     def metrics(self) -> Dict[str, object]:
         final_team_by_track = {
             str(track_id): int(state["team_id"])
@@ -519,9 +536,13 @@ class TeamClassifier:
 
         This does not record a vote. A dark official kit stays unmatched.
         """
+        return bool(self.kit_fit(crop))
+
+    def kit_fit(self, crop: np.ndarray):
+        """True or False when the torso was measured, None when it abstained."""
         measured = measure_torso(crop)
         if measured["abstain"]:
-            return False
+            return None
         if self.mode == "hue":
             if measured["hue"] is None:
                 return False
