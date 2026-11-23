@@ -11,6 +11,7 @@ import json
 import math
 from pathlib import Path
 
+from ball_jump import BallJumpGuard, jump_guard_ball
 from pass_detector import PassDetector
 from possession import TEAM_NAME_BY_ID, PossessionEngine
 from possession_stats import PossessionTeamAccumulator
@@ -144,10 +145,11 @@ def replay_event_record(record):
     possession = PossessionEngine()
     passes = PassDetector()
     teams = PossessionTeamAccumulator(fps)
+    jump_guard = BallJumpGuard()
     timeline = []
     for frame in record.get("frames") or []:
         players = [_player_from_row(row) for row in frame.get("players") or []]
-        ball = _ball_from_record(frame.get("ball"))
+        ball = jump_guard_ball(jump_guard, possession, _ball_from_record(frame.get("ball")), players)
         snapshot = possession.update(players, ball)
         metrics = passes.update(
             frame_number=int(frame["frame"]),
@@ -173,6 +175,7 @@ def replay_event_record(record):
         "possession": possession.metrics(),
         "possession_by_team": team_stats,
         "passes": passes.finalize(),
+        "ball_jump": jump_guard.metrics(),
     }
 
 

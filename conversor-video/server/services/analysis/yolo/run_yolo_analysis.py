@@ -23,6 +23,7 @@ from ultralytics import YOLO
 from ball_chain import BallChains, BallReach
 from ball_flight import BallFlightPath
 from ball_heatmap import BallHeatmapAccumulator
+from ball_jump import BallJumpGuard, jump_guard_ball
 from event_replay import record_event_frame, write_event_record
 from goalkeeper_position import PositionKeeper
 from player_identity_record import record_player, write_player_record
@@ -3253,6 +3254,7 @@ def analyze(args):
     team_classification_frame_examples = []
     last_emitted_progress = -1
     possession_engine = PossessionEngine()
+    ball_jump_guard = BallJumpGuard()
     possession_team_stats = PossessionTeamAccumulator(fps)
     player_stats = PlayerStatsAccumulator(fps, pitch=SOCCER_PITCH_CONFIGURATION)
     ball_heatmap = BallHeatmapAccumulator()
@@ -4698,7 +4700,12 @@ def analyze(args):
             predicted_pixel=predicted_center_for_search if ball_feeds_possession else None,
             internal_alive=internal_ball_track_alive and ball_feeds_possession,
         )
-        possession_snapshot = possession_engine.update(possession_players, possession_ball)
+        # A ball that leaps onto a rival's boot and then crawls does not take
+        # the ball from its holder; the log keeps the raw ball for replay.
+        possession_input_ball = jump_guard_ball(
+            ball_jump_guard, possession_engine, possession_ball, possession_players
+        )
+        possession_snapshot = possession_engine.update(possession_players, possession_input_ball)
         if event_frames is not None:
             event_frames.append(
                 record_event_frame(
@@ -4721,7 +4728,7 @@ def analyze(args):
             fps=fps,
             snapshot=possession_snapshot,
             players=possession_players,
-            ball=possession_ball,
+            ball=possession_input_ball,
         )
         possession_by_team_live = possession_team_stats.observe(
             possession_snapshot.current_possession_team,

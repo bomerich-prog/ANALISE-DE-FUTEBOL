@@ -281,6 +281,8 @@ class PassDetector:
         self.waiting_for_team = []
         self.team_wait_resolved = 0
         self.first_time_receptions = 0
+        self.duel_turnovers = 0
+        self.duel = None
         self.possession_start = None
         self.deflection = None
         self.first_time = None
@@ -322,6 +324,7 @@ class PassDetector:
             "discarded_unstable_possession": self.discarded_unstable_possession,
             "team_wait_resolved": self.team_wait_resolved,
             "first_time_receptions": self.first_time_receptions,
+            "duel_turnovers": self.duel_turnovers,
             "discarded_timeout": self.discarded_timeout,
             "discarded_direction_check": self.discarded_direction_check,
             "discarded_intercepted": self.discarded_intercepted,
@@ -361,9 +364,12 @@ class PassDetector:
                     # the touch was a pass in, and the ball went on from him.
                     self._commit_first_time(candidate)
                     self._open_pending(candidate["frame"], None, players)
+                    self._duel_turnover(candidate, fps, possessor_id, possessor_team, players)
             elif frame_number - candidate["seen"] >= FIRST_TIME_CONFIRM_FRAMES:
                 self.first_time = None
                 self._commit_first_time(candidate)
+                if candidate.get("rival") is not None:
+                    self.duel = candidate
         if possessor_id is None and self.pending is not None and self.first_time is None:
             self._watch_first_time(frame_number, fps, players, observed_ball)
         else:
@@ -402,6 +408,11 @@ class PassDetector:
 
         if self.pending is None:
             self._open_pending(frame_number, observed_ball, players)
+
+        duel = self.duel
+        self.duel = None
+        if duel is not None and self.pending.get("from_id") == duel["id"]:
+            self._duel_turnover(duel, fps, possessor_id, possessor_team, players)
 
         if possessor_id == self.pending["from_id"]:
             if self._apply_wall(frame_number, fps, possessor_team, possessor_pos):
@@ -577,6 +588,38 @@ class PassDetector:
         self.last_possessor_pos = candidate["pos"]
         self.last_possessor_frame = candidate["frame"]
 
+    def _duel_turnover(self, candidate, fps, possessor_id, possessor_team, players):
+        """The ball came back out of a duel and went to the other team.
+
+        Argentina v Spain, 35 s: Spain's pass reached its man with an Argentine
+        on top of him, and the ball came straight back out to Argentina's 20.
+        The Argentine in the duel had no shirt vote yet, so the reply was given
+        to the Spaniard and the move read as Spain losing the ball to the 20.
+        The man who sent the ball out of the duel is the rival: the ball was won
+        there, and his touch is a pass to the teammate who took it.
+        """
+        rival = candidate.get("rival")
+        if rival is None or self.pending is None:
+            return
+        if possessor_team not in {"Team 0", "Team 1"} or possessor_team == candidate.get("team"):
+            return
+        rival_id = int(rival["id"])
+        if rival_id == int(possessor_id):
+            return
+        rival_team = rival.get("team") if rival.get("team") in {"Team 0", "Team 1"} else self.known_teams.get(rival_id)
+        if rival_team not in {None, possessor_team}:
+            return
+        frame = int(candidate["frame"])
+        # The touch that left the duel belongs to the pass that follows it.
+        self._resolve(frame, fps, rival_id, possessor_team, rival.get("pos"), short_touch=False)
+        self.duel_turnovers += 1
+        self.last_possessor_id = rival_id
+        self.last_possessor_team = possessor_team
+        self.last_possessor_pos = rival.get("pos")
+        self.last_possessor_frame = frame
+        self.possession_start = frame
+        self._open_pending(frame, None, players)
+
     def _watch_first_time(self, frame_number, fps, players, ball_point):
         """Close an open pass on a teammate who played it first time.
 
@@ -665,6 +708,7 @@ class PassDetector:
                 "ball": ball_point,
                 "incoming": incoming,
                 "distance": distance,
+                "rival": _duel_rival(players, ball_point, track_id, from_team, distance, radius),
             }
 
     def _release_touch(self, frame_number):
@@ -696,7 +740,7 @@ class PassDetector:
             return None
         return origin
 
-    def _resolve(self, frame_number, fps, possessor_id, possessor_team, possessor_pos, waited=False):
+    def _resolve(self, frame_number, fps, possessor_id, possessor_team, possessor_pos, waited=False, short_touch=True):
         pending = self.pending
         self.pending = None
         if pending is None or pending.get("from_id") is None:
@@ -735,7 +779,7 @@ class PassDetector:
             pending.get("from_pos"),
             possessor_pos,
         )
-        origin = self._claim_short_touch(to_id, possessor_team, from_id)
+        origin = self._claim_short_touch(to_id, possessor_team, from_id) if short_touch else None
         if origin is not None and int(origin["release_frame"]) < int(pending.get("possession_start", -1)):
             # The touch left the foot before the passer even had the ball: it
             # belongs to an older move, not to this pass.
@@ -1330,6 +1374,34 @@ def _nearest_within_contest(entry):
     if best is None:
         return None, None
     return best[1], best[2]
+
+
+def _duel_rival(players, ball_point, mate_id, mate_team, mate_distance, radius):
+    """A non-teammate as close to the ball as the teammate who met it.
+
+    Players whose shirt has not voted yet count: a duel often starts the moment
+    a new track appears on top of the man with the ball.
+    """
+    best = None
+    for player in players or []:
+        try:
+            track_id = int(player.get("track_id"))
+        except (TypeError, ValueError):
+            continue
+        if track_id == int(mate_id):
+            continue
+        team = _team_name_from_player(player)
+        if team == mate_team:
+            continue
+        point = _point_from_entity(player)
+        distance, space = _distance(point, ball_point)
+        if distance is None or space != ball_point["space"] or distance > radius:
+            continue
+        if distance > mate_distance + _touch_margin(space):
+            continue
+        if best is None or distance < best["distance"]:
+            best = {"id": track_id, "team": team, "pos": point, "distance": distance}
+    return best
 
 
 def _contest_margin(space):
