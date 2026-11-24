@@ -63,6 +63,8 @@ PASS_SCORE_TRAJECTORY_COMPATIBLE = 10
 PASS_SCORE_TRAJECTORY_INCOMPATIBLE = -20
 PASS_SCORE_UNVERIFIED_EXTENSION = -20
 PASS_EXTENDED_MIN_FLIGHT_SAMPLES = 2
+# A flight with the ball seen in fewer than one frame in four was mostly hidden.
+HIDDEN_FLIGHT_SEEN_RATIO = 4
 PASS_SCORE_THRESHOLD = 80
 PASS_DIRECTION_MIN_MOTION_CM = 80.0
 PASS_DIRECTION_MIN_MOTION_PX = 20.0
@@ -1273,6 +1275,28 @@ class PassDetector:
         in_flight_samples = sum(
             1 for entry in self._entries(release_frame + 1, arrival_frame - 1) if entry["ball"] is not None
         )
+        if arrival_observed and in_flight_samples * HIDDEN_FLIGHT_SEEN_RATIO < arrival_frame - release_frame - 1:
+            # The ball was hidden for most of the "flight": the last time it was
+            # seen at the passer's feet is not when it left them. Argentina v
+            # Spain, 5.5 s to 7.5 s: Spain's 10 carried it for two seconds with
+            # the ball behind his legs, then played it to the man beside him.
+            # If it shows up at his feet again before the receiver has it, the
+            # pass left from there.
+            for entry in self._entries(release_frame + 1, arrival_frame):
+                if _within_control(entry, from_id):
+                    release_frame = entry["frame"]
+            if release_frame >= arrival_frame:
+                arrival_frame = None
+                for entry in self._entries(release_frame + 1, gained_frame):
+                    if _within_control(entry, to_id):
+                        arrival_frame = entry["frame"]
+                        break
+                arrival_observed = arrival_frame is not None
+                if arrival_frame is None:
+                    arrival_frame = gained_frame
+            in_flight_samples = sum(
+                1 for entry in self._entries(release_frame + 1, arrival_frame - 1) if entry["ball"] is not None
+            )
         after_arrival = self._entries(arrival_frame + 1, gained_frame)
         seen_after = [entry for entry in after_arrival if entry["ball"] is not None]
         # The wait after the arrival is the detector losing the ball at the
@@ -1397,7 +1421,16 @@ class PassDetector:
             if end - start >= _min_motion(space):
                 return "incompatible"
             return "missing"
-        return self._cross_frame_trajectory(window_start, window_end, from_pos, to_pos)
+        # Judge the flight against where the receiver met the ball. By the
+        # time possession confirms he may have carried it back past the last
+        # ball seen (Argentina v Spain, 3 s: 8 played it 150 px to a man coming
+        # in from the touchline, who turned back with it).
+        arrival = self._entry_at(window_end)
+        receiver = arrival["players"].get(to_id) if arrival is not None else None
+        met_at = _point_from_logged(receiver["points"]) if receiver is not None else None
+        if met_at is None or to_pos is None or met_at["space"] != to_pos.get("space"):
+            met_at = to_pos
+        return self._cross_frame_trajectory(window_start, window_end, from_pos, met_at)
 
     def _cross_frame_trajectory(self, window_start, window_end, from_pos, to_pos):
         """Fallback when the receiver is not visible next to the ball."""
