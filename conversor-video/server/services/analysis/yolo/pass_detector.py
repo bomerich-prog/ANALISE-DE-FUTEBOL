@@ -86,6 +86,22 @@ FIRST_TIME_MIN_MOTION_CM = 60.0
 # A teammate who takes the ball afterwards controlled it (normal pass); the
 # first-time reading waits this long for that before it counts.
 FIRST_TIME_CONFIRM_FRAMES = 15
+# A lookalike visit: the ball layer leaves the ball, settles on a white boot or
+# sock for a few frames, then finds the real ball again back where it was.
+# Spain v Cape Verde, 3.1 s and 7.8 s: Spain's 19 stood still by the touchline,
+# the ball sat on his boot without moving a pixel, and the next ball was 160 to
+# 220 px away after three or four frames. No pass leaves a still ball that fast.
+LOOKALIKE_STILL_PX = 6.0
+LOOKALIKE_STILL_CM = 30.0
+LOOKALIKE_MIN_STILL_FRAMES = 2
+LOOKALIKE_EXIT_PX_PER_FRAME = 40.0
+# A new track id that starts where the player on the ball just vanished is the
+# same player under a new number (ByteTrack retires ids in a crowd). Spain v
+# Cape Verde: 12 became 36 at 9.5 s, 84 became 88 at 29.4 s and 36 became 120
+# at 41.5 s, each time on the ball, and each change read as a pass.
+HANDOFF_MAX_GAP_FRAMES = 12
+HANDOFF_RADIUS_PX = 64.0
+HANDOFF_RADIUS_CM = 250.0
 TURNOVER_BASE_SCORE = 70
 TURNOVER_TRAJECTORY_BONUS = 10
 TURNOVER_TRAJECTORY_PENALTY = -10
@@ -308,6 +324,8 @@ class PassDetector:
         self.short_touch_passes = 0
         self.touch = None
         self.touch_origin = None
+        self.lookalike_touches = 0
+        self.identity_handoffs = 0
         self.unconfirmed_candidates = 0
         self.events = []
         self.unconfirmed_events = []
@@ -336,6 +354,8 @@ class PassDetector:
             "conductions": self.conductions,
             "wall_passes": self.wall_passes,
             "short_touch_passes": self.short_touch_passes,
+            "lookalike_touches": self.lookalike_touches,
+            "identity_handoffs": self.identity_handoffs,
             "unconfirmed_candidates": self.unconfirmed_candidates,
             "pass_score_threshold": self.score_threshold,
             "events": list(self.events),
@@ -554,14 +574,14 @@ class PassDetector:
             # The confirmed possessor standing on the ball is possession, not a
             # one-touch. A passer-by does not replace a touch already released.
             if self.touch is not None and int(self.touch["frames"]) >= TOUCH_MIN_OBSERVED:
-                self._release_touch(frame_number)
+                self._release_touch(frame_number, ball_point)
             else:
                 self.touch = None
             return
         touch = self.touch
         if touch is None or int(touch["id"]) != int(leader["id"]):
             if touch is not None and int(touch["frames"]) >= TOUCH_MIN_OBSERVED:
-                self._release_touch(frame_number)
+                self._release_touch(frame_number, ball_point)
             if self.touch_origin is not None:
                 self.touch = None
                 return
@@ -654,6 +674,9 @@ class PassDetector:
                     and after >= before + min_motion
                 ):
                     self.deflection = None
+                    if self._lookalike_exit(frame_number, ball_point, fps):
+                        self.lookalike_touches += 1
+                        return
                     self.first_time = dict(approach, seen=int(frame_number), fps=fps)
                     return
         last = self._last_ball
@@ -711,10 +734,14 @@ class PassDetector:
                 "rival": _duel_rival(players, ball_point, track_id, from_team, distance, radius),
             }
 
-    def _release_touch(self, frame_number):
+    def _release_touch(self, frame_number, ball_point=None):
         touch = self.touch
         self.touch = None
         if touch is None or int(touch["frames"]) < TOUCH_MIN_OBSERVED:
+            return
+        if ball_point is not None and self._lookalike_exit(frame_number, ball_point, self._fps):
+            # The ball never was at that foot: no touch, no pass origin.
+            self.lookalike_touches += 1
             return
         if touch.get("team") not in {"Team 0", "Team 1"} or self.touch_origin is not None:
             return
@@ -725,6 +752,72 @@ class PassDetector:
             "from_frame": int(touch["first_frame"]),
             "release_frame": int(frame_number),
         }
+
+    def _lookalike_exit(self, frame_number, ball_point, fps):
+        """The ball sat still, then reappeared back where it came from too fast.
+
+        The still run is the observed balls before this frame that stay within a
+        few pixels of the last one. The exit is the step from that last still
+        ball to this one, at a pace no kick gives a resting ball, and it lands
+        closer to the ball seen before the still run than to the still spot.
+        """
+        space = ball_point["space"]
+        observed = []
+        for entry in self.flight_log:
+            if entry["frame"] >= frame_number or entry["ball"] is None:
+                continue
+            point = _point_from_logged(entry["ball"])
+            if point is not None and point["space"] == space:
+                observed.append((int(entry["frame"]), point))
+        if len(observed) < LOOKALIKE_MIN_STILL_FRAMES + 1:
+            return False
+        still = LOOKALIKE_STILL_PX if space == "pixel" else LOOKALIKE_STILL_CM
+        last_frame, last = observed[-1]
+        index = len(observed) - 2
+        run = 1
+        while index >= 0 and _plain_distance(observed[index][1], last) <= still:
+            run += 1
+            index -= 1
+        if run < LOOKALIKE_MIN_STILL_FRAMES or index < 0:
+            return False
+        before = observed[index][1]
+        gap = max(1, int(frame_number) - last_frame)
+        if space == "pixel":
+            limit = LOOKALIKE_EXIT_PX_PER_FRAME * gap
+        else:
+            limit = PASS_MAX_BALL_SPEED_CM_S * gap / max(1.0, float(fps))
+        exit_step = _plain_distance(ball_point, last)
+        if exit_step < limit:
+            return False
+        return _plain_distance(ball_point, before) < exit_step
+
+    def _identity_handoff(self, from_id, to_id):
+        """The receiver's id was born where the passer had just vanished."""
+        born = None
+        for entry in self.flight_log:
+            if to_id in entry["players"]:
+                born = entry
+                break
+        if born is None or born is self.flight_log[0]:
+            # Already there when the log starts: not a new id.
+            return False
+        born_frame = int(born["frame"])
+        if from_id in born["players"]:
+            return False
+        last_seen = None
+        for entry in self.flight_log:
+            if entry["frame"] >= born_frame:
+                break
+            if from_id in entry["players"]:
+                last_seen = entry
+        if last_seen is None or born_frame - int(last_seen["frame"]) > HANDOFF_MAX_GAP_FRAMES:
+            return False
+        before = _point_from_logged(last_seen["players"][from_id]["points"])
+        after = _point_from_logged(born["players"][to_id]["points"])
+        if before is None or after is None or before["space"] != after["space"]:
+            return False
+        radius = HANDOFF_RADIUS_PX if before["space"] == "pixel" else HANDOFF_RADIUS_CM
+        return _plain_distance(before, after) <= radius
 
     def _claim_short_touch(self, to_id, to_team, from_id):
         """Use a released one-touch as the pass origin when the receiver is a teammate."""
@@ -765,6 +858,17 @@ class PassDetector:
 
         from_id = int(pending["from_id"])
         to_id = int(possessor_id)
+        teams_differ = (
+            pending.get("from_team") in {"Team 0", "Team 1"}
+            and possessor_team in {"Team 0", "Team 1"}
+            and pending.get("from_team") != possessor_team
+        )
+        if not teams_differ and self._identity_handoff(from_id, to_id):
+            # Same player under a new number: the ball never left him.
+            self.identity_handoffs += 1
+            self.conductions += 1
+            self.touch_origin = None
+            return
         gained_frame = int(frame_number)
         lost_frame = int(pending["lost_frame"])
         gap_seconds = max(0, gained_frame - lost_frame) / fps
@@ -1326,6 +1430,10 @@ class PassDetector:
         if (motion_x * to_receiver_x) + (motion_y * to_receiver_y) >= 0.0:
             return "compatible"
         return "incompatible"
+
+
+def _plain_distance(point_a, point_b):
+    return math.hypot(point_a["x"] - point_b["x"], point_a["y"] - point_b["y"])
 
 
 def _within_control(entry, track_id):

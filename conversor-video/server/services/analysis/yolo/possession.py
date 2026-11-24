@@ -192,6 +192,8 @@ class PossessionEngine:
         self.losses = 0
         self.switches = 0
         self.passing_ball_refusals = 0
+        self.team_changes_held = 0
+        self._held_change = None
         self.frame_index = 0
         self.ball_history = []
         # Last observed ball was inside the hold radius. A predicted point must
@@ -212,6 +214,7 @@ class PossessionEngine:
             "losses": self.losses,
             "switches": self.switches,
             "passing_ball_refusals": self.passing_ball_refusals,
+            "team_changes_held": self.team_changes_held,
         }
 
     def update(self, players, ball):
@@ -458,11 +461,24 @@ class PossessionEngine:
         self.observed_hold = True
 
     def _refresh_possessor_team(self):
+        """Give the possession the shirt of its player once it is known.
+
+        A possession keeps the team it first had. When the shirt under the same
+        track id changes while that id holds the ball, the tracker has moved the
+        id onto another person at a crossing (Spain v Cape Verde, 43.5 s: Spain's
+        20 dribbled through and his id slid onto the defender beside him), and
+        the ball has not changed team.
+        """
         if self.possessor_id is None:
             return
         team_id = self.last_team_by_track.get(self.possessor_id)
-        if team_id is not None:
+        if team_id is None:
+            return
+        if self.possessor_team_id is None:
             self.possessor_team_id = team_id
+        elif team_id != self.possessor_team_id and self._held_change != (self.possessor_id, team_id):
+            self._held_change = (self.possessor_id, team_id)
+            self.team_changes_held += 1
 
     def _reset_pending(self):
         self.pending_id = None

@@ -219,6 +219,20 @@ def test_switch_requires_consecutive_clear_leader():
     assert_equal(snapshot.current_possession_team, "Team 1", "team became team 1")
 
 
+def test_a_shirt_change_under_the_holder_keeps_the_team():
+    engine = PossessionEngine()
+    holder = player(120, None, 100, 100)
+    for _ in range(POSSESSION_CONFIRM_FRAMES):
+        snapshot = engine.update([holder], ball("observed", field_x=100, field_y=100))
+    assert_equal(snapshot.current_possessor_track_id, 120, "unvoted holder confirmed")
+    assert_equal(snapshot.current_possession_team, None, "no shirt yet")
+    snapshot = engine.update([player(120, 0, 100, 100)], ball("observed", field_x=100, field_y=100))
+    assert_equal(snapshot.current_possession_team, "Team 0", "first shirt names the team")
+    snapshot = engine.update([player(120, 1, 100, 100)], ball("observed", field_x=100, field_y=100))
+    assert_equal(snapshot.current_possession_team, "Team 0", "id slid onto an opponent")
+    assert_equal(engine.metrics()["team_changes_held"], 1, "the change is counted")
+
+
 if __name__ == "__main__":
     test_confirms_after_consecutive_observed_frames()
     test_short_hole_does_not_erase_a_pending_confirmation()
@@ -232,4 +246,5 @@ if __name__ == "__main__":
     test_switch_requires_consecutive_clear_leader()
     test_a_fast_ball_is_taken_only_by_the_player_it_reaches()
     test_a_fast_ball_sixty_pixels_away_opens_no_possession()
+    test_a_shirt_change_under_the_holder_keeps_the_team()
     print("possession engine tests passed")
