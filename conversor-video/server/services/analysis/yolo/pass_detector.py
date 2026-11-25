@@ -104,6 +104,18 @@ LOOKALIKE_EXIT_PX_PER_FRAME = 40.0
 HANDOFF_MAX_GAP_FRAMES = 12
 HANDOFF_RADIUS_PX = 64.0
 HANDOFF_RADIUS_CM = 250.0
+# A pass that rolls past an opponent's feet without changing course.
+# Gremio x Cruzeiro, 5.4 s: Gremio's 8 passed to his 21 and the ball rolled
+# 21 px in front of Cruzeiro's 10. Possession gave the ball to 10, then 21
+# took it, and the pass read as two turnovers. The ball kept its line and its
+# pace across 10, and the move went on to the passer's own team.
+ROLL_PAST_MAX_SECONDS = 1.5
+ROLL_PAST_WINDOW_FRAMES = 6
+ROLL_PAST_MIN_SPEED_PX = 3.0
+ROLL_PAST_MIN_SPEED_CM = 25.0
+ROLL_PAST_MIN_COSINE = 0.8
+ROLL_PAST_MIN_SPEED_RATIO = 0.5
+ROLL_PAST_MIN_APPROACH_SHARE = 0.5
 TURNOVER_BASE_SCORE = 70
 TURNOVER_TRAJECTORY_BONUS = 10
 TURNOVER_TRAJECTORY_PENALTY = -10
@@ -328,6 +340,8 @@ class PassDetector:
         self.touch_origin = None
         self.lookalike_touches = 0
         self.identity_handoffs = 0
+        self.roll_past_turnovers = 0
+        self._last_turnover = None
         self.unconfirmed_candidates = 0
         self.events = []
         self.unconfirmed_events = []
@@ -358,6 +372,7 @@ class PassDetector:
             "short_touch_passes": self.short_touch_passes,
             "lookalike_touches": self.lookalike_touches,
             "identity_handoffs": self.identity_handoffs,
+            "roll_past_turnovers": self.roll_past_turnovers,
             "unconfirmed_candidates": self.unconfirmed_candidates,
             "pass_score_threshold": self.score_threshold,
             "events": list(self.events),
@@ -936,22 +951,24 @@ class PassDetector:
             return
 
         if from_team in {"Team 0", "Team 1"} and possessor_team in {"Team 0", "Team 1"} and from_team != possessor_team:
+            if self._undo_roll_past(from_id, to_id, possessor_team, possessor_pos, gained_frame, fps):
+                return
             confidence = _turnover_confidence(trajectory)
             self.turnovers += 1
-            self.turnover_events.append(
-                {
-                    "type": "turnover",
-                    "from_track_id": from_id,
-                    "to_track_id": to_id,
-                    "from_team": from_team,
-                    "to_team": possessor_team,
-                    "frame": gained_frame,
-                    "gap_seconds": float(gap_seconds),
-                    "distance_cm": None if distance_cm is None else float(distance_cm),
-                    "trajectory": trajectory,
-                    "confidence": confidence,
-                }
-            )
+            event = {
+                "type": "turnover",
+                "from_track_id": from_id,
+                "to_track_id": to_id,
+                "from_team": from_team,
+                "to_team": possessor_team,
+                "frame": gained_frame,
+                "gap_seconds": float(gap_seconds),
+                "distance_cm": None if distance_cm is None else float(distance_cm),
+                "trajectory": trajectory,
+                "confidence": confidence,
+            }
+            self.turnover_events.append(event)
+            self._last_turnover = {"event": event, "pending": dict(pending)}
             return
 
         if from_team not in {"Team 0", "Team 1"} or possessor_team not in {"Team 0", "Team 1"} or from_team != possessor_team:
@@ -972,6 +989,104 @@ class PassDetector:
             wall=False,
         )
         self._record_prepared(prepared, pending.get("ball_missing_frames"))
+
+    def _undo_roll_past(self, from_id, to_id, to_team, to_pos, gained_frame, fps):
+        """The last turnover went to a player the ball only rolled past.
+
+        from_id lost the ball to to_id, of the other team. If from_id got it
+        from the passer's team a moment ago, and the ball crossed from_id
+        without slowing down or turning, from_id never had it: the move is
+        one pass from the passer to to_id.
+        """
+        last = self._last_turnover
+        self._last_turnover = None
+        if last is None:
+            return False
+        earlier = last["event"]
+        pending = last["pending"]
+        passer_id = int(earlier["from_track_id"])
+        if int(earlier["to_track_id"]) != int(from_id) or earlier.get("from_team") != to_team:
+            return False
+        if passer_id == int(to_id) or earlier not in self.turnover_events:
+            return False
+        crossed_frame = int(earlier["frame"])
+        if int(gained_frame) - crossed_frame > ROLL_PAST_MAX_SECONDS * fps:
+            return False
+        if not self._ball_rolled_past(int(from_id), crossed_frame):
+            return False
+        self.turnover_events.remove(earlier)
+        self.turnovers -= 1
+        self.roll_past_turnovers += 1
+        prepared = self._prepare_pass(
+            passer_id,
+            int(to_id),
+            earlier.get("from_team"),
+            to_team,
+            pending.get("from_pos"),
+            to_pos,
+            int(pending["from_frame"]),
+            int(pending["lost_frame"]),
+            int(gained_frame),
+            fps,
+            wall=False,
+            rolled_past_id=int(from_id),
+        )
+        prepared["rolled_past_track_id"] = int(from_id)
+        self._record_prepared(prepared, pending.get("ball_missing_frames"))
+        return True
+
+    def _ball_rolled_past(self, track_id, crossed_frame):
+        """Same line and pace before and after the frame he got the ball."""
+        crossing = None
+        before = []
+        after = []
+        for entry in self.flight_log:
+            frame = int(entry["frame"])
+            if entry["ball"] is None or abs(frame - crossed_frame) > ROLL_PAST_WINDOW_FRAMES:
+                continue
+            point = _point_from_logged(entry["ball"])
+            if point is None:
+                continue
+            if frame < crossed_frame:
+                before.append((frame, point, entry["players"].get(track_id)))
+            elif frame > crossed_frame:
+                after.append((frame, point))
+            else:
+                crossing = (frame, point, entry["players"].get(track_id))
+        if crossing is None or crossing[2] is None or len(before) < 2 or len(after) < 2:
+            return False
+        frame, ball, player = crossing
+        space = ball["space"]
+        if any(item[1]["space"] != space for item in before + after):
+            return False
+        incoming = (ball["x"] - before[0][1]["x"], ball["y"] - before[0][1]["y"])
+        outgoing = (after[-1][1]["x"] - ball["x"], after[-1][1]["y"] - ball["y"])
+        speed_in = math.hypot(*incoming) / max(1, frame - before[0][0])
+        speed_out = math.hypot(*outgoing) / max(1, after[-1][0] - frame)
+        min_speed = ROLL_PAST_MIN_SPEED_PX if space == "pixel" else ROLL_PAST_MIN_SPEED_CM
+        if speed_in < min_speed or speed_out < min_speed:
+            return False
+        if speed_out < ROLL_PAST_MIN_SPEED_RATIO * speed_in:
+            return False
+        cosine = (incoming[0] * outgoing[0] + incoming[1] * outgoing[1]) / (
+            math.hypot(*incoming) * math.hypot(*outgoing)
+        )
+        if cosine < ROLL_PAST_MIN_COSINE:
+            return False
+        feet = _point_from_logged(player["points"])
+        if feet is None or feet["space"] != space:
+            return False
+        # The ball came to him from outside. A ball first seen at his feet and
+        # already moving away may have left his own foot (a duel he won).
+        first_frame, first_ball, first_player = before[0]
+        first_feet = _point_from_logged(first_player["points"]) if first_player else None
+        if first_feet is None or first_feet["space"] != space:
+            return False
+        approach = _plain_distance(first_ball, first_feet) - _plain_distance(ball, feet)
+        if approach < ROLL_PAST_MIN_APPROACH_SHARE * _min_motion(space):
+            return False
+        # The ball leaves him: no foot kept it.
+        return _plain_distance(after[-1][1], feet) >= _plain_distance(ball, feet) + _min_motion(space)
 
     def _apply_wall(self, frame_number, fps, possessor_team, possessor_pos):
         """Split a same-player return into two passes when a teammate was the wall."""
@@ -1126,6 +1241,7 @@ class PassDetector:
         fps,
         wall,
         short_touch=False,
+        rolled_past_id=None,
     ):
         gap_seconds = max(0, int(gained_frame) - int(lost_frame)) / fps
         flight = self._flight_evidence(from_id, to_id, int(from_frame), int(lost_frame), int(gained_frame), fps)
@@ -1195,7 +1311,7 @@ class PassDetector:
         if implied_speed is not None and implied_speed > PASS_MAX_BALL_SPEED_CM_S:
             event["_status"] = "implausible_speed"
             return event
-        interceptor = self._interceptor(from_team, flight, fps)
+        interceptor = self._interceptor(from_team, flight, fps, ignore_id=rolled_past_id)
         if interceptor is not None:
             event["interceptor_track_id"] = interceptor
             event["_status"] = "intercepted"
@@ -1372,13 +1488,18 @@ class PassDetector:
         frames = max(1, gained_frame - flight["release_frame"])
         return distance_cm / (frames / fps)
 
-    def _interceptor(self, from_team, flight, fps):
-        """Opponent that stayed alone on the ball during the flight, if any."""
+    def _interceptor(self, from_team, flight, fps, ignore_id=None):
+        """Opponent that stayed alone on the ball during the flight, if any.
+
+        ignore_id is a player the ball was already shown to roll past.
+        """
         needed = max(PASS_INTERCEPT_MIN_FRAMES, int(math.ceil(PASS_INTERCEPT_MIN_SECONDS * fps)))
         run_id = None
         run_length = 0
         for entry in self._entries(flight["release_frame"] + 1, flight["arrival_frame"] - 1):
             nearest_id, nearest_team = _nearest_within_contest(entry)
+            if ignore_id is not None and nearest_id == ignore_id:
+                nearest_id = None
             if nearest_id is not None and nearest_team in {"Team 0", "Team 1"} and nearest_team != from_team:
                 run_length = run_length + 1 if nearest_id == run_id else 1
                 run_id = nearest_id

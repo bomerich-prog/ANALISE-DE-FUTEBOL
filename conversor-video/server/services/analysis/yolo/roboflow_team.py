@@ -5,6 +5,10 @@ import numpy as np
 
 TEAM_LOCK_CONFIRM_STREAK = 3
 TEAM_LOCK_UNLOCK_STREAK = 3
+# Opposite votes before the lock count once per this many frames. One turn of
+# a striped shirt (white stripes and sleeves toward the camera) lasts a few
+# frames and used to give three opposite votes in a row.
+TEAM_SWITCH_VOTE_SPACING_FRAMES = 6
 TEAM_BLUE_ID = 0
 TEAM_RED_ID = 1
 TEAM_DARK_ID = 0
@@ -273,9 +277,12 @@ class TeamTrackLock:
         self,
         confirm_streak: int = TEAM_LOCK_CONFIRM_STREAK,
         unlock_streak: int = TEAM_LOCK_UNLOCK_STREAK,
+        switch_vote_spacing: int = TEAM_SWITCH_VOTE_SPACING_FRAMES,
     ):
         self.confirm_streak = max(1, int(confirm_streak))
         self.unlock_streak = max(2, int(unlock_streak))
+        self.switch_vote_spacing = max(1, int(switch_vote_spacing))
+        self.burst_votes_ignored = 0
         self.tracks = {}
         self.prelock_team_switches = 0
         self.refresh_checks = 0
@@ -319,6 +326,7 @@ class TeamTrackLock:
                 "locked": False,
                 "confirm_streak": 1,
                 "contradiction_streak": 0,
+                "last_contradiction_frame": None,
                 "last_checked_frame": frame_number,
             }
             if state["confirm_streak"] >= self.confirm_streak:
@@ -334,7 +342,17 @@ class TeamTrackLock:
             else:
                 # One opposite vote used to replace the team immediately, so a
                 # flickering edge crop never reached the lock.
+                last = state.get("last_contradiction_frame")
+                if (
+                    last is not None
+                    and state["contradiction_streak"] > 0
+                    and frame_number - int(last) < self.switch_vote_spacing
+                ):
+                    # Same pose a frame later: the same evidence, not a new vote.
+                    self.burst_votes_ignored += 1
+                    return int(state["team_id"])
                 state["contradiction_streak"] += 1
+                state["last_contradiction_frame"] = frame_number
                 if state["contradiction_streak"] >= self.confirm_streak:
                     self.prelock_team_switches += 1
                     state["team_id"] = predicted_team
@@ -394,6 +412,8 @@ class TeamTrackLock:
             "refresh_contradictions": self.refresh_contradictions,
             "unlocks": self.unlocks,
             "ignored_weak_votes": self.ignored_weak_votes,
+            "switch_vote_spacing_frames": self.switch_vote_spacing,
+            "burst_votes_ignored": self.burst_votes_ignored,
             "final_team_by_track": final_team_by_track,
         }
 

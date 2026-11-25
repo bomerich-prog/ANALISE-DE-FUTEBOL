@@ -119,11 +119,27 @@ def test_flicker_before_lock_keeps_the_first_clear_team():
 def test_three_opposite_votes_before_lock_can_correct_the_first_guess():
     lock = TeamTrackLock()
     assert_equal(lock.assign(31, 1, 1, verifying=False), 1, "first clear vote")
-    assert_equal(lock.assign(31, 0, 2, verifying=False), 1, "one opposite vote waits")
-    assert_equal(lock.assign(31, 0, 3, verifying=False), 1, "two opposite votes wait")
-    assert_equal(lock.assign(31, 0, 4, verifying=False), 0, "three opposite votes correct the guess")
+    assert_equal(lock.assign(31, 0, 8, verifying=False), 1, "one opposite vote waits")
+    assert_equal(lock.assign(31, 0, 15, verifying=False), 1, "two opposite votes wait")
+    assert_equal(lock.assign(31, 0, 22, verifying=False), 0, "three opposite votes correct the guess")
     assert_equal(lock.is_locked(31), True, "the corrected team locks")
-    assert_equal(lock.assign(31, 1, 5, verifying=True), 0, "the correction stays")
+    assert_equal(lock.assign(31, 1, 23, verifying=True), 0, "the correction stays")
+
+
+def test_a_burst_of_opposite_votes_counts_once():
+    # Gremio x Cruzeiro, track 8: one dark vote at frame 4, then the striped
+    # player turned and frames 23, 24 and 25 read light. The same pose three
+    # frames in a row moved him to Cruzeiro and locked it.
+    lock = TeamTrackLock()
+    assert_equal(lock.assign(8, 0, 4, verifying=False), 0, "first clear vote")
+    for frame in (23, 24, 25):
+        assert_equal(lock.assign(8, 1, frame, verifying=False), 0, "one turn of the shirt waits")
+    assert_equal(lock.metrics()["burst_votes_ignored"], 2, "two votes of the burst are repeats")
+    for frame in (33, 34):
+        lock.assign(8, 0, frame, verifying=False)
+    assert_equal(lock.is_locked(8), True, "the dark shirt locks")
+    assert_equal(lock.current_team(8), 0, "the striped player stays in his team")
+    assert_equal(lock.metrics()["prelock_team_switches"], 0, "the team never moved")
 
 
 def test_refresh_agreement_resets_contradiction_streak():
@@ -331,6 +347,7 @@ if __name__ == "__main__":
     test_lock_survives_a_run_of_opposite_votes()
     test_flicker_before_lock_keeps_the_first_clear_team()
     test_three_opposite_votes_before_lock_can_correct_the_first_guess()
+    test_a_burst_of_opposite_votes_counts_once()
     test_refresh_agreement_resets_contradiction_streak()
     test_light_shirt_and_dark_shirt_get_stable_teams()
     test_gradual_broadcast_shirts_still_split()
