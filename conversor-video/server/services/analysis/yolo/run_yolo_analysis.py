@@ -240,6 +240,12 @@ def suppress_duplicate_person_detections(detections):
     return kept, suppressed
 
 
+# Lines are thinner than this many pixels; anything wider is a lit patch.
+WHITE_LINE_TOPHAT_PX = 31
+# Brightness a line must have over the grass around it.
+WHITE_LINE_MIN_CONTRAST = 12
+
+
 def build_grass_support_mask(frame):
     height, width = frame.shape[:2]
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -283,6 +289,17 @@ def build_white_line_mask(frame, grass_mask):
         iterations=1,
     )
     white_mask = cv2.bitwise_and(white_mask, nearby_grass)
+    # A painted line is brighter than the grass right beside it. Sunlit,
+    # light-mown stripes far from the camera pass the white test too, but as
+    # wide patches: Gremio x Cruzeiro, 18 s to 31 s, they swallowed the far
+    # half of the centre circle and the map was lost for 13 s.
+    value = hsv[:, :, 2]
+    local_peak = cv2.morphologyEx(
+        value,
+        cv2.MORPH_TOPHAT,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (WHITE_LINE_TOPHAT_PX, WHITE_LINE_TOPHAT_PX)),
+    )
+    white_mask = cv2.bitwise_and(white_mask, ((local_peak > WHITE_LINE_MIN_CONTRAST) * 255).astype(np.uint8))
     white_mask = cv2.morphologyEx(
         white_mask,
         cv2.MORPH_OPEN,
