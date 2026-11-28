@@ -83,6 +83,18 @@ FIELD_PREDICTION_MAX_DELTA_PX = 180.0
 # The pitch homography stays measured, but a bad projection was handing
 # possession and passes to the wrong player. Decisions use image pixels.
 HOMOGRAPHY_FEEDS_DECISIONS = False
+
+
+def _map_every_frames(default=3):
+    try:
+        return max(1, int(os.getenv("MAP_EVERY_FRAMES", str(default))))
+    except ValueError:
+        return default
+
+
+# The 2D map is solved on one frame out of this many; the frames in between
+# follow the camera's turn. It was most of the analysis time when solved on every frame.
+MAP_EVERY_FRAMES = _map_every_frames()
 HYBRID_CONFIDENCE_BONUS_DISTANCE_PX = 40.0
 HYBRID_CONFIDENCE_BONUS_DELTA = 0.03
 PHYSICAL_BALL_VALIDATION_DEFAULT = os.getenv("PHYSICAL_BALL_VALIDATION", "on").strip().lower()
@@ -3275,7 +3287,7 @@ def analyze(args):
     possession_team_stats = PossessionTeamAccumulator(fps)
     player_stats = PlayerStatsAccumulator(fps, pitch=SOCCER_PITCH_CONFIGURATION)
     ball_heatmap = BallHeatmapAccumulator()
-    visible_pitch_map = VisiblePitchMap(pitch=SOCCER_PITCH_CONFIGURATION)
+    visible_pitch_map = VisiblePitchMap(pitch=SOCCER_PITCH_CONFIGURATION, every=MAP_EVERY_FRAMES)
     radar_smoother = RadarSmoother()
     # The radar holds a lost player for a short moment only (RADAR_HOLD_SECONDS).
     radar_memory = RadarMemory(hold_frames=max(1, int(round(float(fps) * RADAR_HOLD_SECONDS))))
@@ -3366,7 +3378,8 @@ def analyze(args):
 
         homography_stage_start = time.perf_counter()
         grass_mask = build_grass_support_mask(frame)
-        white_line_mask = build_white_line_mask(frame, grass_mask)
+        # Only a frame the map is solved on needs the painted lines.
+        white_line_mask = (lambda frame=frame, grass_mask=grass_mask: build_white_line_mask(frame, grass_mask))
         # No image-to-field matrix feeds the decisions. The map and the radar read the paint.
         view_transformer = None
         record_profile_stage(
@@ -4642,7 +4655,17 @@ def analyze(args):
             decision_transformer,
             detection_center,
         )
-        map_decision = visible_pitch_map.update(white_line_mask, frame, grass_mask)
+        map_decision = visible_pitch_map.update(
+            white_line_mask,
+            frame,
+            grass_mask,
+            people_boxes=[
+                detection.get("box")
+                for detection in list(accepted_player_detections)
+                + list(accepted_goalkeeper_detections)
+                + list(accepted_referee_detections)
+            ],
+        )
         for mapped_detections, anchor in (
             (accepted_player_detections, detection_foot_point),
             (accepted_goalkeeper_detections, detection_foot_point),

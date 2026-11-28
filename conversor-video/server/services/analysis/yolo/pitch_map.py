@@ -38,6 +38,7 @@ from pitch_homography import (
     fit_broadcast_penalty,
 )
 from pitch_camera import BroadcastCamera
+from pitch_motion import FrameMotion
 from pitch_centre import centre_holds, fit_centre_on_ink
 from pitch_radar import RADAR_LENGTH_CM, RADAR_WIDTH_CM, on_radar, to_radar
 
@@ -55,6 +56,9 @@ REFEREE_MARKER_BGR = (0, 255, 255)
 NEUTRAL_MARKER_BGR = (180, 180, 180)
 EDGE_TOLERANCE_CM = 100.0
 HOLD_FRAMES = 15
+# The map is solved on one frame out of this many. The frames in between follow
+# the camera's turn from the solved frame. 1 solves every frame.
+MAP_EVERY_FRAMES = 1
 # While the current arc still sits on the paint, a fit that moves the same
 # field points further than this is a rival, not a camera pan.
 MAX_FIELD_SHIFT_CM = 1200.0
@@ -1775,6 +1779,55 @@ def _polyline(frame, inverse, field_points, color):
         cv2.polylines(frame, [np.array(run, dtype=np.int32)], False, color, 2, cv2.LINE_AA)
 
 
+def _moved_point(turn, point):
+    moved = cv2.perspectiveTransform(np.array([[point]], dtype=np.float64), turn).reshape(2)
+    return (float(moved[0]), float(moved[1]))
+
+
+def carry_decision(decision, turn):
+    """A solved frame's decision on a later frame, after the camera turned by turn.
+
+    turn maps the solved picture onto this one. The matrices go from this
+    picture to the field through the solved picture. The painted corners,
+    sides and lines drawn in pixels move with the picture. A side drawn from a
+    corner along corner_perp becomes a segment of its own, so it bends with
+    the perspective like the rest.
+    """
+    carried = dict(decision)
+    turn = np.asarray(turn, dtype=np.float64)
+    back = np.linalg.inv(turn)
+    for key in ("matrix", "camera_matrix"):
+        if carried.get(key) is not None:
+            carried[key] = np.asarray(carried[key], dtype=np.float64) @ back
+    lines = [segment for segment in (decision.get("side_lines") or []) if segment is not None and len(segment) == 2]
+    moved_lines = [(_moved_point(turn, start), _moved_point(turn, end)) for start, end in lines]
+    corners = decision.get("corners")
+    if corners is not None and len(corners) == 2:
+        perp = decision.get("corner_perp")
+        side_px = decision.get("side_px")
+        if perp is not None and side_px is not None:
+            if isinstance(side_px, (tuple, list)) and len(side_px) == 2:
+                reaches = [max(0.0, float(value)) for value in side_px]
+            else:
+                reaches = [max(0.0, float(side_px))] * 2
+            for corner, reach in zip(corners, reaches):
+                covered = any(
+                    float(np.hypot(start[0] - corner[0], start[1] - corner[1])) < 30.0 for start, _ in lines
+                )
+                if covered or reach <= 1.0:
+                    continue
+                end = np.asarray(corner, dtype=np.float64) + np.asarray(perp, dtype=np.float64) * reach
+                moved_lines.append((_moved_point(turn, corner), _moved_point(turn, end)))
+            carried["side_px"] = 0.0
+        carried["corners"] = tuple(_moved_point(turn, corner) for corner in corners)
+    if decision.get("side_lines") is not None or moved_lines:
+        carried["side_lines"] = moved_lines
+    front = decision.get("front_line")
+    if front is not None and len(front) == 2:
+        carried["front_line"] = (_moved_point(turn, front[0]), _moved_point(turn, front[1]))
+    return carried
+
+
 class VisiblePitchMap:
     """The penalty in frame, replaced when the camera shows a different one.
 
@@ -1784,13 +1837,28 @@ class VisiblePitchMap:
     marks takes over, even if that moves the field by more than 12 m.
     """
 
-    def __init__(self, pitch=None, hold_frames=HOLD_FRAMES, fixed_camera=True):
+    def __init__(self, pitch=None, hold_frames=HOLD_FRAMES, fixed_camera=True, every=MAP_EVERY_FRAMES):
         self.pitch = pitch or SoccerPitchConfiguration()
+        self.every = max(1, int(every))
+        # The holds count frames, whether they were solved or followed.
         self.hold_frames = int(hold_frames)
         self.matrix = None
         self.transformer = None
         # The main camera stands on the halfway line: every published matrix comes from it.
         self.camera = BroadcastCamera() if fixed_camera else None
+        self.motion = FrameMotion()
+        self._frame_count = 0
+        self._solved_at = None
+        # Frames since the last solve: a hold spends one per frame, solved or followed.
+        self._step = 1
+        self._anchor_frame = None
+        self._anchor_decision = None
+        # On a followed frame: this picture back to the solved one, and this frame's grass.
+        self._back_to_anchor = None
+        self._carry_grass = None
+        self.solved_frames = 0
+        self.carried_frames = 0
+        self.carry_failed_frames = 0
         self.camera_matrix = None
         self.positive_x = None
         self.region = None
@@ -1823,9 +1891,75 @@ class VisiblePitchMap:
         self.rejected_frames = 0
         self.reasons = Counter()
 
-    def update(self, white_line_mask, frame=None, grass_mask=None):
+    def update(self, white_line_mask, frame=None, grass_mask=None, people_boxes=None):
+        """This frame's map. white_line_mask may be a function that builds it.
+
+        With every > 1 the map is solved on one frame out of every while there
+        is one. The frames in between reuse that map, moved by the camera's turn
+        since then. With no map, every frame is solved, so a fit that lands on
+        one frame alone is not missed. When the turn cannot be read, the frame
+        is solved too. The holds still count frames: a matrix bridged over a
+        gap lasts as long as when every frame is solved.
+        """
+        self._frame_count += 1
+        self._back_to_anchor = None
+        self._carry_grass = None
+        if (
+            self.every > 1
+            and frame is not None
+            and self._anchor_decision is not None
+            and self._frame_count - self._anchor_frame < self.every
+        ):
+            carried = self._carry(frame, grass_mask)
+            if carried is not None:
+                return carried
+            self.carry_failed_frames += 1
+            self.reasons["carry_failed"] += 1
+        if callable(white_line_mask):
+            white_line_mask = white_line_mask()
+        self._step = 1 if self._solved_at is None else max(1, self._frame_count - self._solved_at)
+        self._solved_at = self._frame_count
+        if self.camera is not None:
+            self.camera.step = self._step
         decision = self._update_fit(white_line_mask, frame, grass_mask)
-        return self._through_camera(decision, frame, grass_mask)
+        decision = self._through_camera(decision, frame, grass_mask)
+        self.solved_frames += 1
+        if self.every > 1 and frame is not None:
+            self._anchor_frame = self._frame_count
+            self._anchor_decision = None
+            self.motion.clear()
+            if decision.get("accepted") and self.transformer is not None and self.motion.anchor(
+                frame, grass_mask, people_boxes
+            ):
+                self._anchor_decision = decision
+        return decision
+
+    def _carry(self, frame, grass_mask):
+        """The solved frame's map on this frame, or None when it has to be solved again."""
+        anchor = self._anchor_decision
+        if self.transformer is None:
+            return None
+        turn = self.motion.since_anchor(frame)
+        if turn is None:
+            return None
+        try:
+            back = np.linalg.inv(turn)
+        except np.linalg.LinAlgError:
+            return None
+        self._back_to_anchor = back
+        self._carry_grass = grass_mask
+        self.carried_frames += 1
+        self.reasons["carried"] += 1
+        decision = carry_decision(anchor, turn)
+        decision["reason"] = "carried"
+        return decision
+
+    def _to_anchor(self, points):
+        """Image points of a followed frame, in the solved frame's picture."""
+        if self._back_to_anchor is None:
+            return points
+        moved = cv2.perspectiveTransform(points.reshape(-1, 1, 2).astype(np.float64), self._back_to_anchor)
+        return moved.reshape(-1, 2).astype(np.float32)
 
     def _through_camera(self, decision, frame, grass_mask):
         """The published matrix re-solved with the camera on the halfway line.
@@ -1965,7 +2099,7 @@ class VisiblePitchMap:
             return self._publish(self._decision(True, True, "held"), white_line_mask, frame)
         # A few bad frames keep the last good matrix. The counter does not refill.
         if self.matrix is not None and self.hold_left > 0:
-            self.hold_left -= 1
+            self.hold_left -= self._step
             self.held_frames += 1
             self.reasons["bridge"] += 1
             return self._publish(self._decision(True, True, "held"), white_line_mask, frame)
@@ -1985,10 +2119,11 @@ class VisiblePitchMap:
         array = np.asarray(points, dtype=np.float32)
         if array.size == 0:
             return []
-        transformed = self.transformer.transform_points(array.reshape(-1, 2))
+        array = self._to_anchor(array.reshape(-1, 2))
+        transformed = self.transformer.transform_points(array)
         mapped = []
         center = float(self.pitch.width) / 2.0
-        for (image_x, image_y), (x, y) in zip(array.reshape(-1, 2), transformed):
+        for (image_x, image_y), (x, y) in zip(array, transformed):
             # The camera matrix is a true perspective: the width needs no correction.
             corrected = None if self.camera_matrix is not None else self._field_y(
                 float(image_x), float(image_y), float(y), center
@@ -2021,6 +2156,7 @@ class VisiblePitchMap:
         array = np.asarray(points, dtype=np.float32).reshape(-1, 2)
         if array.size == 0:
             return []
+        array = self._to_anchor(array)
         transformed = self.transformer.transform_points(array)
         center = float(self.pitch.width) / 2.0
         region = self.region or "penalty"
@@ -2044,10 +2180,11 @@ class VisiblePitchMap:
 
     def radar_view(self, frame_shape):
         """The grass the camera sees, as a polygon in radar centimetres, or None."""
-        if self.transformer is None or self.positive_x is None or self.grass is None:
+        grass = self._carry_grass if self._back_to_anchor is not None and self._carry_grass is not None else self.grass
+        if self.transformer is None or self.positive_x is None or grass is None:
             return None
         height, width = frame_shape[:2]
-        has = self.grass > 0
+        has = grass > 0
         top_rows = np.where(has.any(axis=0), has.argmax(axis=0), height - 1)
         columns = np.linspace(0, width - 1, 25).astype(int)
         top = [(float(column), float(max(top_rows[column], height * CROWD_BAND))) for column in columns]
@@ -2057,7 +2194,7 @@ class VisiblePitchMap:
         border += [(width - 1.0, right_top + (height - 1.0 - right_top) * t) for t in np.linspace(0, 1, 8)[1:]]
         border += [(float(column), height - 1.0) for column in columns[::-1][1:]]
         border += [(0.0, height - 1.0 + (left_top - height + 1.0) * t) for t in np.linspace(0, 1, 8)[1:-1]]
-        transformed = self.transformer.transform_points(np.array(border, dtype=np.float32))
+        transformed = self.transformer.transform_points(self._to_anchor(np.array(border, dtype=np.float32)))
         region = self.region or "penalty"
         outline = []
         for x, y in transformed:
@@ -2085,10 +2222,14 @@ class VisiblePitchMap:
             "toward_goal_cm": self.toward_goal_cm,
             "toward_arc_cm": self.toward_arc_cm,
             "feeds_events": False,
-            "frames_with_map": self.accepted_frames + self.held_frames,
+            "frames_with_map": self.accepted_frames + self.held_frames + self.carried_frames,
             "frames_without_map": self.rejected_frames,
             "accepted_frames": self.accepted_frames,
             "held_frames": self.held_frames,
+            "map_every_frames": self.every,
+            "solved_frames": self.solved_frames,
+            "carried_frames": self.carried_frames,
+            "carry_failed_frames": self.carry_failed_frames,
             "boxed_frames": int(self.reasons.get("boxed", 0)),
             "centre_on_ink_frames": int(self.reasons.get("centre_on_ink", 0)),
             "visible_third_cm": VISIBLE_THIRD_CM,
@@ -2335,7 +2476,7 @@ class VisiblePitchMap:
         if generation != self.generation or left <= 0:
             self._side_memory = None
             return None
-        self._side_memory = (turn, generation, left - 1)
+        self._side_memory = (turn, generation, left - self._step)
         cos, sin = float(np.cos(turn)), float(np.sin(turn))
         return np.array(
             [along[0] * cos - along[1] * sin, along[0] * sin + along[1] * cos],

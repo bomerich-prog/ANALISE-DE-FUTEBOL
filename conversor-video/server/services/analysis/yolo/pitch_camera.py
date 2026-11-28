@@ -301,6 +301,8 @@ class BroadcastCamera:
         self._motion = None
         self._shape = None
         self._missed = 0
+        # Frames since the last solve; the map sets it when it solves one frame in a few.
+        self.step = 1
         self.solved_frames = 0
         self.held_frames = 0
         self.missed_frames = 0
@@ -470,7 +472,7 @@ class BroadcastCamera:
             self.missed_frames += 1
         if self._params is None or self.centre is None or self._missed >= self.hold_frames:
             return None
-        self._missed += 1
+        self._missed += max(1, int(self.step))
         self.held_frames += 1
         return self._image_to_field(region, positive_x)
 
